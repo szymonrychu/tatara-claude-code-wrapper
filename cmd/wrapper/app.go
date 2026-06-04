@@ -135,7 +135,7 @@ func claudeEnv(cfg config) []string {
 
 func gitRunner(dir string) bootstrap.GitRunner {
 	return func(args ...string) error {
-		cmd := exec.Command("git", args...)
+		cmd := exec.Command("git", args...) //nolint:gosec // git is a fixed binary; args are operator-supplied config, not user input
 		cmd.Dir = dir
 		out, err := cmd.CombinedOutput()
 		if err != nil {
