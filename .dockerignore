@@ -1,0 +1,6 @@
+.git
+bin
+dist
+charts
+docs
+*.md
