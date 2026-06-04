@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"sync"
 	"time"
@@ -22,10 +21,6 @@ var DefaultSubmitSeq = SubmitSequence{PasteStart: "\x1b[200~", PasteEnd: "\x1b[2
 
 type SubmitSequence struct{ PasteStart, PasteEnd, Submit string }
 
-func (s SubmitSequence) encode(text string) []byte {
-	return []byte(s.PasteStart + text + s.PasteEnd + s.Submit)
-}
-
 var ErrBusy = errors.New("session busy")
 
 type Config struct {
@@ -35,14 +30,15 @@ type Config struct {
 	Model       string
 	TurnTimeout time.Duration
 	BootTimeout time.Duration
+	SubmitDelay time.Duration // pause between the paste and the submit keystroke
 	SubmitSeq   SubmitSequence
 }
 
-// claudeArgs builds the interactive launch flags. Per the Task-1 spike, we
-// pass NO --permission-mode / --dangerously-skip-permissions flag: bypass is
-// configured via settings.defaultMode (bootstrap), and the flag would trigger
-// an extra "Bypass Permissions" warning dialog. MCP comes from the cwd
-// .mcp.json + enableAllProjectMcpServers, so no --mcp-config flag either.
+// claudeArgs builds the interactive launch flags. Per the Task-1 spike we pass
+// NO permission flag: bypass is configured via settings.defaultMode
+// (bootstrap). The "Bypass Permissions" warning dialog still appears at boot
+// regardless and is accepted by bootWait. MCP comes from the cwd .mcp.json +
+// enableAllProjectMcpServers, so no --mcp-config flag either.
 func (c Config) claudeArgs() []string {
 	args := []string{}
 	if c.Model != "" {
@@ -89,6 +85,7 @@ type Manager struct {
 	mu             sync.Mutex
 	w              ptyWriter
 	proc           *claudeProc
+	ring           *ringBuffer
 	state          State
 	current        string // in-flight turn id, "" when idle
 	currentStarted time.Time
@@ -101,7 +98,10 @@ func New(cfg Config, store *turn.Store, m *metrics.Metrics, log *slog.Logger, no
 	if cfg.BootTimeout <= 0 {
 		cfg.BootTimeout = 60 * time.Second
 	}
-	return &Manager{cfg: cfg, store: store, m: m, log: log, now: now, newID: newID, state: Booting}
+	if cfg.SubmitDelay <= 0 {
+		cfg.SubmitDelay = 400 * time.Millisecond
+	}
+	return &Manager{cfg: cfg, store: store, m: m, log: log, now: now, newID: newID, state: Booting, ring: newRing()}
 }
 
 // SetWriterForTest injects a writer and marks the session READY. Test-only.
@@ -112,7 +112,8 @@ func (mgr *Manager) SetWriterForTest(w ptyWriter) {
 	mgr.state = Ready
 }
 
-// Start spawns claude, drains its PTY output, and marks READY after boot.
+// Start spawns claude, reads its PTY into the ring buffer, navigates the boot
+// dialogs, and marks READY once the TUI settles.
 func (mgr *Manager) Start(ctx context.Context) error {
 	proc, err := spawnClaude(mgr.cfg)
 	if err != nil {
@@ -122,18 +123,94 @@ func (mgr *Manager) Start(ctx context.Context) error {
 	mgr.proc, mgr.w = proc, proc
 	mgr.mu.Unlock()
 
-	go func() { _, _ = io.Copy(io.Discard, proc.ptmx) }() // drain TUI; debug ring buffer is a later enhancement
+	go mgr.readPTY(proc)
 	go mgr.watch(proc)
 
-	// Readiness: spike-confirmed heuristic. Provisional: bounded boot delay.
-	time.Sleep(minDuration(2*time.Second, mgr.cfg.BootTimeout))
+	mgr.bootWait()
+	return nil
+}
+
+// readPTY copies the interactive TUI's output into the ring buffer. It is the
+// only window into the session: bootWait reads it for dialogs and watch logs
+// its tail on exit.
+func (mgr *Manager) readPTY(proc *claudeProc) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := proc.ptmx.Read(buf)
+		if n > 0 {
+			_, _ = mgr.ring.Write(buf[:n])
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// bootWait accepts the (non-seedable) "Bypass Permissions" warning dialog that
+// claude shows on every boot, then waits for the TUI to quiesce before marking
+// the session READY. Without accepting the warning, the first turn's submit
+// keystroke lands on the dialog and exits claude. Sequence confirmed against
+// the real binary in docs/spike-findings.md. Uses real wall-clock (not the
+// injected clock) since it polls live output.
+func (mgr *Manager) bootWait() {
+	const (
+		minBoot   = 4 * time.Second
+		idleReady = 1500 * time.Millisecond
+		poll      = 150 * time.Millisecond
+	)
+	start := time.Now()
+	deadline := start.Add(mgr.cfg.BootTimeout)
+	lastWritten := mgr.ring.written()
+	lastChange := start
+	acceptedBypass := false
+	for {
+		if mgr.isDead() {
+			return
+		}
+		now := time.Now()
+		if !now.Before(deadline) {
+			break
+		}
+		if !acceptedBypass && mgr.ring.contains("Bypass Permissions mode") {
+			time.Sleep(600 * time.Millisecond)
+			mgr.writeRaw("\x1b[B") // down arrow -> "Yes, I accept"
+			time.Sleep(250 * time.Millisecond)
+			mgr.writeRaw("\r")
+			acceptedBypass = true
+			mgr.log.Info("accepted bypass-permissions warning")
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		if w := mgr.ring.written(); w != lastWritten {
+			lastWritten = w
+			lastChange = now
+		}
+		if now.Sub(start) >= minBoot && now.Sub(lastChange) >= idleReady {
+			break
+		}
+		time.Sleep(poll)
+	}
 	mgr.mu.Lock()
 	if mgr.state == Booting {
 		mgr.state = Ready
 	}
 	mgr.mu.Unlock()
-	mgr.log.Info("session ready")
-	return nil
+	mgr.log.Info("session ready", "boot_ms", time.Since(start).Milliseconds(), "accepted_bypass", acceptedBypass)
+}
+
+func (mgr *Manager) isDead() bool {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	return mgr.state == Dead
+}
+
+func (mgr *Manager) writeRaw(s string) {
+	mgr.mu.Lock()
+	w := mgr.w
+	mgr.mu.Unlock()
+	if w != nil {
+		_, _ = w.Write([]byte(s))
+	}
 }
 
 func (mgr *Manager) watch(proc *claudeProc) {
@@ -142,7 +219,7 @@ func (mgr *Manager) watch(proc *claudeProc) {
 	mgr.state = Dead
 	mgr.mu.Unlock()
 	mgr.m.ClaudeRestarts.Inc()
-	mgr.log.Error("claude exited", "err", err)
+	mgr.log.Error("claude exited", "err", err, "pty_tail", mgr.ring.tail(800))
 }
 
 func (mgr *Manager) Submit(text, callbackURL string) (string, error) {
@@ -160,9 +237,18 @@ func (mgr *Manager) Submit(text, callbackURL string) (string, error) {
 	id := mgr.newID()
 	now := mgr.now()
 	mgr.store.Create(id, text, callbackURL, now)
-	if _, err := mgr.w.Write(mgr.cfg.SubmitSeq.encode(text)); err != nil {
+	// Two writes: paste the text, pause, then submit. A single concatenated
+	// write does not submit reliably (spike). The pause is held under the lock
+	// (turns are sequential, so nothing else is writing).
+	seq := mgr.cfg.SubmitSeq
+	if _, err := mgr.w.Write([]byte(seq.PasteStart + text + seq.PasteEnd)); err != nil {
 		_ = mgr.store.Fail(id, fmt.Sprintf("write pty: %v", err), now)
-		return "", fmt.Errorf("write pty: %w", err)
+		return "", fmt.Errorf("write pty paste: %w", err)
+	}
+	time.Sleep(mgr.cfg.SubmitDelay)
+	if _, err := mgr.w.Write([]byte(seq.Submit)); err != nil {
+		_ = mgr.store.Fail(id, fmt.Sprintf("write pty: %v", err), now)
+		return "", fmt.Errorf("write pty submit: %w", err)
 	}
 	mgr.current, mgr.currentStarted, mgr.state = id, now, Busy
 	mgr.m.TurnInFlight.Set(1)
@@ -259,11 +345,4 @@ func (mgr *Manager) Shutdown(ctx context.Context) error {
 		_ = proc.cmd.Process.Kill()
 	}
 	return nil
-}
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
 }
