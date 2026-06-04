@@ -1,0 +1,14 @@
+{
+  "session_id": "a70a2699-6ed9-430e-836e-9932ce70209e",
+  "transcript_path": "/workspace/.claude/projects/-workspace/SESSION.jsonl",
+  "cwd": "/workspace",
+  "permission_mode": "bypassPermissions",
+  "effort": {
+    "level": "high"
+  },
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "PONG",
+  "background_tasks": [],
+  "session_crons": []
+}
