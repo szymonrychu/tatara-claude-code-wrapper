@@ -1,0 +1,77 @@
+suite: deployment wiring
+templates:
+  - deployment.yaml
+  - configmap.yaml
+  - configmap-files.yaml
+  - secret.yaml
+release:
+  name: ccw
+  namespace: tatara
+tests:
+  - it: mounts files and injects ANTHROPIC_API_KEY
+    asserts:
+      - template: deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: files
+            mountPath: /etc/wrapper
+      - template: deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ANTHROPIC_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: tatara-claude-code-wrapper
+                key: anthropic-api-key
+  - it: defaults workspace to emptyDir
+    asserts:
+      - template: deployment.yaml
+        exists:
+          path: "spec.template.spec.volumes[?(@.name=='workspace')].emptyDir"
+  - it: envFrom references the scalar configmap and the secret
+    asserts:
+      - template: deployment.yaml
+        equal:
+          path: spec.template.spec.containers[0].envFrom[0].configMapRef.name
+          value: ccw-tatara-claude-code-wrapper
+      - template: deployment.yaml
+        equal:
+          path: spec.template.spec.containers[0].envFrom[1].secretRef.name
+          value: ccw-tatara-claude-code-wrapper
+  - it: uses existingSecret name when provided
+    set:
+      existingSecret: external-secret
+    asserts:
+      - template: deployment.yaml
+        equal:
+          path: spec.template.spec.containers[0].envFrom[1].secretRef.name
+          value: external-secret
+  - it: readiness probe targets /readyz with generous initialDelay
+    asserts:
+      - template: deployment.yaml
+        equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /readyz
+      - template: deployment.yaml
+        equal:
+          path: spec.template.spec.containers[0].readinessProbe.initialDelaySeconds
+          value: 5
+  - it: liveness probe targets /healthz with initialDelay >= 15
+    asserts:
+      - template: deployment.yaml
+        equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.path
+          value: /healthz
+      - template: deployment.yaml
+        equal:
+          path: spec.template.spec.containers[0].livenessProbe.initialDelaySeconds
+          value: 15
+  - it: enables PVC when persistence is enabled
+    set:
+      persistence.enabled: true
+    asserts:
+      - template: deployment.yaml
+        exists:
+          path: "spec.template.spec.volumes[?(@.name=='workspace')].persistentVolumeClaim"

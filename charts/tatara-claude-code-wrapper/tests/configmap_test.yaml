@@ -1,0 +1,34 @@
+suite: configmap env keys are UPPER_SNAKE
+templates:
+  - configmap.yaml
+release:
+  name: ccw
+  namespace: tatara
+tests:
+  - it: renders UPPER_SNAKE scalar keys
+    asserts:
+      - isKind:
+          of: ConfigMap
+      - matchRegex:
+          path: "data.OIDC_AUDIENCE"
+          pattern: "tatara-claude-code-wrapper"
+      - exists:
+          path: "data.TURN_TIMEOUT_SECONDS"
+      - exists:
+          path: "data.HTTP_ADDR"
+      - exists:
+          path: "data.INTERNAL_ADDR"
+      - exists:
+          path: "data.LOG_LEVEL"
+      - exists:
+          path: "data.PERMISSION_MODE"
+      - exists:
+          path: "data.GLOBAL_CLAUDE_MD_PATH"
+      - exists:
+          path: "data.ALLOWED_TOOLS_PATH"
+      - notExists:
+          path: "data.allowedTools"
+      - notExists:
+          path: "data.extraMcpServers"
+      - notExists:
+          path: "data.baseMcp"

@@ -1,0 +1,62 @@
+image:
+  repository: harbor.szymonrichert.pl/containers/tatara-claude-code-wrapper
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets:
+  - name: regcred
+replicaCount: 1
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+httpAddr: ":8080"
+internalAddr: "127.0.0.1:8090"
+oidcIssuer: "https://auth.szymonrichert.pl/realms/master"
+oidcAudience: "tatara-claude-code-wrapper"
+logLevel: "info"
+model: ""
+permissionMode: "bypassPermissions"
+repoUrl: ""
+repoBranch: ""
+defaultCallbackUrl: ""
+turnTimeoutSeconds: 1800
+bootTimeoutSeconds: 60
+webhookRetries: 3
+
+# file-shaped inputs rendered into the files ConfigMap, mounted at /etc/wrapper
+globalClaudeMd: ""
+projectClaudeMd: ""
+allowedTools: []
+extraMcpServers: {}
+baseMcp: |
+  {"mcpServers":{"tatara-memory":{"type":"stdio","command":"tatara","args":["mcp"]}}}
+
+# secrets via external Secret (sops); set existingSecret to override
+existingSecret: ""
+anthropicApiKeySecret: "tatara-claude-code-wrapper"
+anthropicApiKeyKey: "anthropic-api-key"
+
+service:
+  type: ClusterIP
+  port: 8080
+
+serviceMonitor:
+  enabled: true
+  interval: "30s"
+  scrapeTimeout: "10s"
+
+networkPolicy:
+  enabled: true
+  callerNamespace: "tatara"
+
+resources: {}
+
+persistence:
+  enabled: false
+  size: 5Gi
+  storageClass: "rook-ceph-block"

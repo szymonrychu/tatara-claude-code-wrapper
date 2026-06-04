@@ -1,0 +1,30 @@
+suite: render all templates
+templates:
+  - configmap.yaml
+  - configmap-files.yaml
+  - secret.yaml
+  - serviceaccount.yaml
+  - service.yaml
+  - deployment.yaml
+  - servicemonitor.yaml
+  - networkpolicy.yaml
+  - pvc.yaml
+release:
+  name: ccw
+  namespace: tatara
+tests:
+  - it: every template renders without error with all features enabled
+    set:
+      serviceMonitor.enabled: true
+      networkPolicy.enabled: true
+      image.tag: "0.1.0"
+    asserts:
+      - template: configmap.yaml
+        isKind:
+          of: ConfigMap
+      - template: service.yaml
+        isKind:
+          of: Service
+      - template: deployment.yaml
+        isKind:
+          of: Deployment

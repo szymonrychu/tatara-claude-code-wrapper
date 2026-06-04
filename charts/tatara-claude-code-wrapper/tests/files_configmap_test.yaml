@@ -1,0 +1,34 @@
+suite: file-shaped config never leaks into env configmap
+templates:
+  - configmap-files.yaml
+release:
+  name: ccw
+  namespace: tatara
+tests:
+  - it: renders extra mcp servers as mcp.d files
+    set:
+      extraMcpServers:
+        tasks:
+          type: stdio
+          command: /bin/tasks
+    asserts:
+      - isKind:
+          of: ConfigMap
+      - isNotEmpty:
+          path: "data['mcp.d__tasks.json']"
+  - it: renders mcp-base.json file key
+    asserts:
+      - isKind:
+          of: ConfigMap
+      - isNotEmpty:
+          path: "data['mcp-base.json']"
+  - it: has global-claude.md and project-claude.md keys
+    asserts:
+      - exists:
+          path: "data['global-claude.md']"
+      - exists:
+          path: "data['project-claude.md']"
+  - it: has allowed-tools.txt key
+    asserts:
+      - exists:
+          path: "data['allowed-tools.txt']"

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: tatara-claude-code-wrapper
+description: Single-session Claude Code supervisor (interactive PTY + Stop-hook API)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
