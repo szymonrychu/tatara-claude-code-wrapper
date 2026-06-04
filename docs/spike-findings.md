@@ -11,18 +11,28 @@ One long-lived interactive `claude` process handled multiple sequential user
 turns (PONG, then PING), each firing its own Stop hook, with no respawn.
 `-p`/`--print` was never used. The architecture holds.
 
-## 2. Submit sequence: CONFIRMED
+## 2. Submit sequence: CONFIRMED (TWO writes, not one)
 
-To submit one user turn, write to the PTY master:
+To submit one user turn, write to the PTY master as **two separate writes**:
 
 ```
-ESC[200~   <message text>   ESC[201~        (bracketed paste)
-<300-400ms pause>
-\r                                          (carriage return submits)
+write 1:  ESC[200~  <message text>  ESC[201~     (bracketed paste)
+<~400ms pause>
+write 2:  \r                                     (carriage return submits)
 ```
 
-`session.DefaultSubmitSeq{PasteStart:"\x1b[200~", PasteEnd:"\x1b[201~", Submit:"\r"}`
-is correct. Bracketed paste keeps embedded newlines from submitting early.
+`session.DefaultSubmitSeq{PasteStart:"\x1b[200~", PasteEnd:"\x1b[201~", Submit:"\r"}`,
+written as two calls with `SubmitDelay` (default 400ms) between them. A SINGLE
+concatenated write (`paste+text+paste+\r`) does NOT submit - claude leaves the
+text in the input box unsent. Bracketed paste keeps embedded newlines from
+submitting early.
+
+## 2b. Readiness: output quiescence after accepting the bypass dialog
+
+`bootWait` marks READY when, after handling the bypass warning, PTY output has
+been idle for >1.5s (with a ~4s floor, capped by `BootTimeout`). A fixed short
+delay is wrong: claude renders its first frame in ~2s but is still doing
+background init; submitting that early kills it.
 
 ## 3. Boot dialogs: the critical finding
 
@@ -39,7 +49,18 @@ Dialogs and their seed keys (all in `~/.claude.json`):
 | First-run onboarding (theme/login) | empty `~/.claude.json` | `"hasCompletedOnboarding": true` |
 | Folder trust ("trust this folder?") | new cwd | `projects["<cwd>"].hasTrustDialogAccepted: true` |
 | Custom API key ("use this API key?") | `ANTHROPIC_API_KEY` set | `customApiKeyResponses.approved: ["<last 20 chars of key>"]` |
-| Bypass Permissions WARNING | the `--dangerously-skip-permissions` FLAG | do NOT pass the flag; use settings `permissions.defaultMode: bypassPermissions` instead (no seed needed, warning never shows) |
+| Bypass Permissions WARNING | `bypassPermissions` mode (settings OR flag) | NOT seedable - appears on EVERY boot. The wrapper accepts it at boot over the PTY (see "Correction" below). |
+
+> **Correction (validated during implementation, supersedes an earlier
+> claim):** the "Bypass Permissions mode" warning appears on EVERY boot when
+> `bypassPermissions` is active, including via `settings.defaultMode` (not just
+> the `--dangerously-skip-permissions` flag). It is not persisted to
+> `~/.claude.json` and cannot be seeded away. The wrapper's `bootWait` detects
+> it in the PTY ring buffer (whitespace-normalized match, since the TUI
+> separates words with cursor-move escapes) and accepts it with Down+Enter
+> ("Yes, I accept"). If unaccepted, the first turn's submit CR lands on the
+> dialog (default "No, exit") and claude exits status 1. The PTY MUST be
+> ring-buffered, not discarded, or this is invisible.
 
 The custom-API-key approved entry is the **last 20 characters of the API key**
 verbatim (e.g. key ending `...EentiTPHC9Q-62Rz1wAA` -> approved entry
