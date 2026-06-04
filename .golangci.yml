@@ -11,10 +11,11 @@ formatters:
 
   settings:
     goimports:
-      local-prefixes: github.com/szymonrychu/tatara-claude-code-wrapper
+      local-prefixes:
+        - github.com/szymonrychu/tatara-claude-code-wrapper
 
 linters:
-  disable-all: true
+  default: none
   enable:
     - errcheck
     - gosec
@@ -30,9 +31,10 @@ linters:
       rules:
         - name: exported
           disabled: true
-
-issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - gosec
+    gosec:
+      # G301/G304/G306 are expected in bootstrap (config file rendering) and tests.
+      # Non-test files suppress inline; test files suppress here to avoid noisy annotations.
+      excludes:
+        - G301
+        - G304
+        - G306
