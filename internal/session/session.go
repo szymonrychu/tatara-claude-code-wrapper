@@ -49,11 +49,12 @@ func (c Config) claudeArgs() []string {
 
 // HookResult is the payload cc-stop-hook POSTs to the internal endpoint.
 type HookResult struct {
-	SessionID  string          `json:"sessionId"`
-	FinalText  string          `json:"finalText"`
-	ResultJSON json.RawMessage `json:"resultJson,omitempty"`
-	Usage      json.RawMessage `json:"usage,omitempty"`
-	StopReason string          `json:"stopReason"`
+	SessionID      string          `json:"sessionId"`
+	FinalText      string          `json:"finalText"`
+	ResultJSON     json.RawMessage `json:"resultJson,omitempty"`
+	Usage          json.RawMessage `json:"usage,omitempty"`
+	StopReason     string          `json:"stopReason"`
+	TranscriptPath string          `json:"transcriptPath,omitempty"`
 }
 
 type State string
@@ -86,6 +87,7 @@ type Manager struct {
 	w              ptyWriter
 	proc           *claudeProc
 	ring           *ringBuffer
+	stopping       bool
 	state          State
 	current        string // in-flight turn id, "" when idle
 	currentStarted time.Time
@@ -216,8 +218,13 @@ func (mgr *Manager) writeRaw(s string) {
 func (mgr *Manager) watch(proc *claudeProc) {
 	err := proc.cmd.Wait()
 	mgr.mu.Lock()
+	stopping := mgr.stopping
 	mgr.state = Dead
 	mgr.mu.Unlock()
+	if stopping {
+		mgr.log.Info("claude stopped (shutdown)")
+		return
+	}
 	mgr.m.ClaudeRestarts.Inc()
 	mgr.log.Error("claude exited", "err", err, "pty_tail", mgr.ring.tail(800))
 }
@@ -270,6 +277,9 @@ func (mgr *Manager) Complete(r HookResult) error {
 	}
 	now := mgr.now()
 	started := mgr.currentStarted // capture before clearCurrentLocked resets state
+	if r.TranscriptPath != "" {
+		mgr.transcriptPath = r.TranscriptPath
+	}
 	_ = mgr.store.Complete(id, r.FinalText, r.ResultJSON, r.Usage, r.StopReason, now)
 	mgr.clearCurrentLocked()
 	mgr.m.HookReceived.Inc()
@@ -280,7 +290,7 @@ func (mgr *Manager) Complete(r HookResult) error {
 	}
 	rec, _ := mgr.store.Get(id)
 	mgr.mu.Unlock()
-	mgr.log.Info("turn complete", "turn_id", id, "duration_ms", now.Sub(rec.StartedAt).Milliseconds())
+	mgr.log.Info("turn complete", "turn_id", id, "duration_ms", now.Sub(started).Milliseconds())
 	mgr.fireDone(rec)
 	return nil
 }
@@ -335,6 +345,7 @@ func (mgr *Manager) TranscriptPath() string {
 func (mgr *Manager) Shutdown(ctx context.Context) error {
 	mgr.mu.Lock()
 	w, proc := mgr.w, mgr.proc
+	mgr.stopping = true
 	mgr.state = Dead
 	mgr.mu.Unlock()
 	if w != nil {

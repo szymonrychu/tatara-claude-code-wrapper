@@ -26,7 +26,7 @@ func buildResult(payload []byte, resultJSONPath string) (session.HookResult, err
 	if err := json.Unmarshal(payload, &hp); err != nil {
 		return session.HookResult{}, fmt.Errorf("parse hook payload: %w", err)
 	}
-	res := session.HookResult{SessionID: hp.SessionID, FinalText: hp.LastAssistantMessage}
+	res := session.HookResult{SessionID: hp.SessionID, FinalText: hp.LastAssistantMessage, TranscriptPath: hp.TranscriptPath}
 	if hp.TranscriptPath != "" {
 		if text, usage, err := lastAssistantText(hp.TranscriptPath); err == nil {
 			res.Usage = usage

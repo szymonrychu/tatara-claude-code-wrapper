@@ -75,13 +75,14 @@ func TestComplete_MarksDoneAndFiresCallback(t *testing.T) {
 	m.OnTurnDone = func(r *turn.Record) { got = r }
 
 	_, _ = m.Submit("hi", "https://cb/x")
-	require.NoError(t, m.Complete(session.HookResult{FinalText: "PONG", StopReason: "end_turn"}))
+	require.NoError(t, m.Complete(session.HookResult{FinalText: "PONG", StopReason: "end_turn", TranscriptPath: "/workspace/.claude/projects/-workspace/s.jsonl"}))
 
 	rec, _ := store.Get("turn-1")
 	require.Equal(t, turn.Complete, rec.State)
 	require.Equal(t, "PONG", rec.FinalText)
 	require.NotNil(t, got)
 	require.Equal(t, "https://cb/x", got.CallbackURL)
+	require.Equal(t, "/workspace/.claude/projects/-workspace/s.jsonl", m.TranscriptPath()) // H1: recorded from hook
 
 	// now idle again -> next submit allowed
 	_, err := m.Submit("next", "")

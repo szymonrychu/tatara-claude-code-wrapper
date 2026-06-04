@@ -28,7 +28,7 @@ func writeClaudeJSON(p Params) error {
 	if err != nil {
 		return fmt.Errorf("marshal claude.json: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(p.HomeDir, ".claude.json"), b, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(p.HomeDir, ".claude.json"), b, 0o600); err != nil {
 		return fmt.Errorf("write claude.json: %w", err)
 	}
 	return nil

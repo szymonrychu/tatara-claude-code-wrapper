@@ -26,3 +26,13 @@ dialog navigation, Stop-hook result capture, helm chart, modular Dockerfile.
 - **Bedrock / Vertex auth** passthrough (currently `ANTHROPIC_API_KEY` only).
 - **PTY ring-buffer debug endpoint** (expose `tail` over the API for live
   troubleshooting; currently only logged on claude exit).
+
+## Known hardening (deferred from v0.1.0 code review, low impact)
+
+- **Submit holds the lock during the ~400ms SubmitDelay** (`session.Submit`).
+  Fine for single-session sequential turns, but it briefly blocks `readyz`/
+  `Snapshot`/`Shutdown`. Decouple with a `submitting` guard if it ever matters.
+- **Webhook retries use `context.Background()`** and are not cancelled on
+  shutdown (`app.go` OnTurnDone). Best-effort with poll fallback, so a dropped
+  delivery is recoverable; thread an app-owned cancellable context for a clean
+  shutdown.
