@@ -5,6 +5,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 )
 

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
 )
 
