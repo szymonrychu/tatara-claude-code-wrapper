@@ -7,6 +7,12 @@ exposes it through an OIDC-gated HTTP API with webhook-or-poll delivery.
 
 Part of the [tatara](https://github.com/szymonrychu/tatara) platform (phase 4).
 
+**Docs:** [`docs/architecture.md`](docs/architecture.md) - full how-it-works
+(boot sequence, turn lifecycle, state machine, config, observability,
+deployment, local dev). [`docs/spike-findings.md`](docs/spike-findings.md) -
+the empirical claude-binary behavior the design rests on. [`MEMORY.md`](MEMORY.md)
+- decisions and dead-ends.
+
 ## Why a PTY, not `-p`
 
 The point is that claude runs in its **real interactive harness** - the same
