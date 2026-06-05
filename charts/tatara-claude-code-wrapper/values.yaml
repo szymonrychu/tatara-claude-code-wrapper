@@ -2,8 +2,8 @@ image:
   repository: harbor.szymonrichert.pl/containers/tatara-claude-code-wrapper
   tag: ""
   pullPolicy: IfNotPresent
-imagePullSecrets:
-  - name: regcred
+# imagePullSecrets are cluster-specific; the deploying helmfile supplies them.
+imagePullSecrets: []
 replicaCount: 1
 
 nameOverride: ""
@@ -59,4 +59,6 @@ resources: {}
 persistence:
   enabled: false
   size: 5Gi
-  storageClass: "rook-ceph-block"
+  # storageClass is cluster-specific; empty uses the cluster default, or the
+  # deploying helmfile sets it explicitly.
+  storageClass: ""
