@@ -6,6 +6,16 @@ unless the rationale is non-obvious. Per-platform decisions live in the parent
 
 ---
 
+- 2026-06-08 (0.1.1) - **Bootstrap now configures git creds + identity before
+  clone.** The agent pod clones the target repo and the agent later pushes its
+  branch, but bootstrap ran a bare `git clone` -> private repos failed
+  `could not read Username for 'https://github.com'`. The operator already
+  injects `GIT_TOKEN`; the wrapper ignored it. `configureGit` sets a global
+  commit identity and a credential helper that reads `$GIT_TOKEN` at invocation
+  (never written to disk), so clone AND the agent push authenticate. Surfaced on
+  the first live operator->wrapper task (dogfood), the first real exercise of the
+  spawned-agent path. Each git config is gated on a non-empty value.
+
 - 2026-06-04 - **Drives the REAL interactive claude TUI over a PTY, never
   `-p`.** The whole point is that claude sees the same harness a human gets
   (skills, slash commands, normal hook/permission UX). `-p`/print mode is a
@@ -69,6 +79,8 @@ unless the rationale is non-obvious. Per-platform decisions live in the parent
   two writes with a pause.
 - 2026-06-04 - **Fixed short boot delay for readiness.** Too early; input
   during background init exits claude. Use output quiescence.
+
+- 2026-06-07 - **First image push (0.1.0)** built with `--build-arg TATARA_CLI_VERSION=0.4.0`. The tatara-cli base image must be pushed first (wrapper `COPY --from=tatara-cli` pulls from Harbor). GO_VERSION=1.25 matched wrapper go.mod `go 1.25.0` without bumping. claude@latest resolved to a 2-package install (no issues); claude binary lands at `/usr/local/bin/claude`. All four binaries confirmed present: tatara, claude, wrapper, git.
 
 ## Open questions
 
