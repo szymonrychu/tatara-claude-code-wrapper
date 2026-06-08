@@ -46,6 +46,9 @@ func Render(p Params, git GitRunner) error {
 				return err
 			}
 		}
+		if err := excludeWorkspaceConfig(p.Workspace); err != nil {
+			return err
+		}
 	}
 	if err := writeIfSet(filepath.Join(p.Workspace, "CLAUDE.md"), p.ProjectClaudeMd); err != nil {
 		return err
