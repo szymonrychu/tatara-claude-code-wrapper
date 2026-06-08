@@ -6,6 +6,17 @@ unless the rationale is non-obvious. Per-platform decisions live in the parent
 
 ---
 
+- 2026-06-08 (0.1.3) - **Clean PRs + superpowers on the agent.** (1) `git add -A`
+  in the per-turn CommitAndPush swept the wrapper-injected `.mcp.json`/`.claude/`
+  into the agent's PR. Fix: after clone, append those to the repo's
+  `.git/info/exclude` (`internal/bootstrap/exclude.go`) so only the agent's real
+  edits are committed. (2) Baked the full superpowers skill set into
+  `templates/skills/` (alongside handoff) so spawned agents have brainstorming,
+  writing-plans, TDD, systematic-debugging, requesting-code-review,
+  verification, etc. Pairs with operator 0.2.7 (plan turn now lets the agent
+  implement directly).
+- 2026-06-08 (0.1.2) - enforce-push (see git log `feat(bootstrap): wrapper
+  enforces branch checkout + commit/push per turn`).
 - 2026-06-08 (0.1.1) - **Bootstrap now configures git creds + identity before
   clone.** The agent pod clones the target repo and the agent later pushes its
   branch, but bootstrap ran a bare `git clone` -> private repos failed
