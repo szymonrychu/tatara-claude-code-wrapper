@@ -18,6 +18,8 @@ type Params struct {
 	PermissionMode                  string
 	AnthropicAPIKey                 string // used to seed customApiKeyResponses (last 20 chars)
 	RepoURL, RepoBranch             string
+	GitToken                        string // private-repo auth for clone + the agent's push (read from $GIT_TOKEN at runtime, never written to disk)
+	GitUserName, GitUserEmail       string // commit identity for the agent
 }
 
 // GitRunner runs a git subcommand; injected for testability.
@@ -32,6 +34,9 @@ func Render(p Params, git GitRunner) error {
 		return fmt.Errorf("mkdir workspace: %w", err)
 	}
 	if p.RepoURL != "" {
+		if err := configureGit(p, git); err != nil {
+			return err
+		}
 		if err := cloneRepo(p, git); err != nil {
 			return err
 		}

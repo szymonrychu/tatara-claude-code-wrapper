@@ -109,6 +109,9 @@ func buildBootstrapParams(cfg config) bootstrap.Params {
 		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
 		RepoURL:         cfg.RepoURL,
 		RepoBranch:      cfg.RepoBranch,
+		GitToken:        cfg.GitToken,
+		GitUserName:     cfg.GitUserName,
+		GitUserEmail:    cfg.GitUserEmail,
 	}
 }
 

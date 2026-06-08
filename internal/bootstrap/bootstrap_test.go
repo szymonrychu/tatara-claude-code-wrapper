@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -80,4 +81,42 @@ func TestRender_ClonesRepoWhenURLSet(t *testing.T) {
 	require.Contains(t, gitCalls[0], "clone")
 	require.Contains(t, gitCalls[0], "https://github.com/x/y")
 	require.Contains(t, gitCalls[0], "main")
+}
+
+func TestRender_ConfiguresGitCredentialsAndIdentityBeforeClone(t *testing.T) {
+	var gitCalls [][]string
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: t.TempDir(),
+		BaseMCP:      []byte(`{"mcpServers":{}}`),
+		RepoURL:      "https://github.com/x/y",
+		RepoBranch:   "main",
+		GitToken:     "ghp_supersecret",
+		GitUserName:  "tatara-agent",
+		GitUserEmail: "tatara-agent@szymonrichert.pl",
+		HookCommand:  "/usr/local/bin/cc-stop-hook", PermissionMode: "bypassPermissions",
+	}
+	require.NoError(t, bootstrap.Render(p, func(a ...string) error { gitCalls = append(gitCalls, a); return nil }))
+
+	var credIdx, nameIdx, emailIdx, cloneIdx = -1, -1, -1, -1
+	for i, c := range gitCalls {
+		j := strings.Join(c, " ")
+		switch {
+		case strings.Contains(j, "credential.helper"):
+			credIdx = i
+			// helper reads the token from the env, never embeds it literally.
+			require.Contains(t, j, "GIT_TOKEN")
+			require.NotContains(t, j, "ghp_supersecret")
+		case strings.Contains(j, "user.name"):
+			nameIdx = i
+		case strings.Contains(j, "user.email"):
+			emailIdx = i
+		case strings.Contains(j, "clone"):
+			cloneIdx = i
+		}
+	}
+	require.GreaterOrEqual(t, credIdx, 0, "credential.helper not configured")
+	require.GreaterOrEqual(t, nameIdx, 0, "user.name not configured")
+	require.GreaterOrEqual(t, emailIdx, 0, "user.email not configured")
+	require.GreaterOrEqual(t, cloneIdx, 0, "repo not cloned")
+	require.Less(t, credIdx, cloneIdx, "credentials must be set before clone")
 }

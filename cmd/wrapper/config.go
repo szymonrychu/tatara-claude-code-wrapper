@@ -17,6 +17,9 @@ type config struct {
 	PermissionMode      string
 	RepoURL             string
 	RepoBranch          string
+	GitToken            string
+	GitUserName         string
+	GitUserEmail        string
 	DefaultCallbackURL  string
 	TurnTimeoutSeconds  int
 	BootTimeoutSeconds  int
@@ -56,6 +59,9 @@ func loadConfig(args []string) (config, error) {
 		PermissionMode:      envOr("PERMISSION_MODE", "bypassPermissions"),
 		RepoURL:             envOr("REPO_URL", ""),
 		RepoBranch:          envOr("REPO_BRANCH", ""),
+		GitToken:            envOr("GIT_TOKEN", ""),
+		GitUserName:         envOr("GIT_USER_NAME", "tatara-agent"),
+		GitUserEmail:        envOr("GIT_USER_EMAIL", "tatara-agent@szymonrichert.pl"),
 		DefaultCallbackURL:  envOr("DEFAULT_CALLBACK_URL", ""),
 		TurnTimeoutSeconds:  ti,
 		BootTimeoutSeconds:  bt,
