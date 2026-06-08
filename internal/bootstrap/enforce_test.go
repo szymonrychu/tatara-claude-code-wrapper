@@ -2,6 +2,8 @@ package bootstrap_test
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -9,6 +11,26 @@ import (
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
 )
+
+func TestRender_ExcludesWrapperConfigFromGit(t *testing.T) {
+	ws := t.TempDir()
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: ws,
+		BaseMCP:     []byte(`{"mcpServers":{}}`),
+		RepoURL:     "https://github.com/x/y",
+		RepoBranch:  "main",
+		HookCommand: "/usr/local/bin/cc-stop-hook", PermissionMode: "bypassPermissions",
+	}
+	require.NoError(t, bootstrap.Render(p, func(a ...string) error { return nil }))
+
+	// Wrapper-injected session files must be excluded so the agent's commit
+	// carries only its real edits, not .mcp.json / .claude/ scaffolding.
+	b, err := os.ReadFile(filepath.Join(ws, ".git", "info", "exclude"))
+	require.NoError(t, err, "git exclude not written")
+	got := string(b)
+	require.Contains(t, got, ".mcp.json")
+	require.Contains(t, got, ".claude/")
+}
 
 func TestRender_ChecksOutTaskBranchAfterClone(t *testing.T) {
 	var calls [][]string
