@@ -6,6 +6,12 @@ unless the rationale is non-obvious. Per-platform decisions live in the parent
 
 ---
 
+- 2026-06-09 (0.1.4) - Corrected build: the 0.1.3 IMAGE was built from main BEFORE
+  the exclude+skills branch was merged (a merge slip), so it shipped neither the
+  `.git/info/exclude` fix nor the superpowers skills - PRs still leaked scaffolding
+  and the agent had no superpowers. 0.1.4 is the same intended change, built after
+  the merge. Lesson: build/deploy ONLY after merging the feature branch to main
+  (rule 10) - verify `git ls-files` shows the new files before `docker build`.
 - 2026-06-08 (0.1.3) - **Clean PRs + superpowers on the agent.** (1) `git add -A`
   in the per-turn CommitAndPush swept the wrapper-injected `.mcp.json`/`.claude/`
   into the agent's PR. Fix: after clone, append those to the repo's
