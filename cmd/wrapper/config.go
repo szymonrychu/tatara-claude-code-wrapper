@@ -20,6 +20,7 @@ type config struct {
 	GitToken            string
 	GitUserName         string
 	GitUserEmail        string
+	TaskBranch          string
 	DefaultCallbackURL  string
 	TurnTimeoutSeconds  int
 	BootTimeoutSeconds  int
@@ -62,6 +63,7 @@ func loadConfig(args []string) (config, error) {
 		GitToken:            envOr("GIT_TOKEN", ""),
 		GitUserName:         envOr("GIT_USER_NAME", "tatara-agent"),
 		GitUserEmail:        envOr("GIT_USER_EMAIL", "tatara-agent@szymonrichert.pl"),
+		TaskBranch:          envOr("TASK_BRANCH", ""),
 		DefaultCallbackURL:  envOr("DEFAULT_CALLBACK_URL", ""),
 		TurnTimeoutSeconds:  ti,
 		BootTimeoutSeconds:  bt,

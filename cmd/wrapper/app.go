@@ -51,6 +51,14 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	sender := webhook.New(webhook.Config{Retries: cfg.WebhookRetries}, m, log)
 	defaultCB := cfg.DefaultCallbackURL
 	sess.OnTurnDone = func(rec *turn.Record) {
+		// Enforce the branch+commit+push contract the agent is asked to follow
+		// but does not reliably perform, so the operator's write-back finds the
+		// branch. Best-effort: a failure here must not drop the turn callback.
+		if cfg.TaskBranch != "" {
+			if err := bootstrap.CommitAndPush(cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner(cfg.Workspace)); err != nil {
+				log.Error("commit/push task branch failed", "branch", cfg.TaskBranch, "error", err)
+			}
+		}
 		url := rec.CallbackURL
 		if url == "" {
 			url = defaultCB
@@ -112,6 +120,7 @@ func buildBootstrapParams(cfg config) bootstrap.Params {
 		GitToken:        cfg.GitToken,
 		GitUserName:     cfg.GitUserName,
 		GitUserEmail:    cfg.GitUserEmail,
+		TaskBranch:      cfg.TaskBranch,
 	}
 }
 

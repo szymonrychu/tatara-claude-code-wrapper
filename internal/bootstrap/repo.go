@@ -24,6 +24,23 @@ func configureGit(p Params, git GitRunner) error {
 	return nil
 }
 
+// CommitAndPush stages all changes, commits them when something is staged, and
+// pushes branch to origin. It enforces the branch+commit+push the agent is
+// asked to do but does not reliably perform, so the operator's write-back finds
+// the branch. Push runs even with nothing new so the remote branch exists.
+func CommitAndPush(branch, message string, git GitRunner) error {
+	if err := git("add", "-A"); err != nil {
+		return err
+	}
+	// `diff --cached --quiet` exits non-zero when there are staged changes.
+	if git("diff", "--cached", "--quiet") != nil {
+		if err := git("commit", "-m", message); err != nil {
+			return err
+		}
+	}
+	return git("push", "-u", "origin", branch)
+}
+
 // cloneRepo shallow-clones RepoURL@RepoBranch into the workspace.
 func cloneRepo(p Params, git GitRunner) error {
 	args := []string{"clone", "--depth", "1"}

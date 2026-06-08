@@ -20,6 +20,7 @@ type Params struct {
 	RepoURL, RepoBranch             string
 	GitToken                        string // private-repo auth for clone + the agent's push (read from $GIT_TOKEN at runtime, never written to disk)
 	GitUserName, GitUserEmail       string // commit identity for the agent
+	TaskBranch                      string // work branch the operator opens the PR from; checked out after clone
 }
 
 // GitRunner runs a git subcommand; injected for testability.
@@ -39,6 +40,11 @@ func Render(p Params, git GitRunner) error {
 		}
 		if err := cloneRepo(p, git); err != nil {
 			return err
+		}
+		if p.TaskBranch != "" {
+			if err := git("checkout", "-b", p.TaskBranch); err != nil {
+				return err
+			}
 		}
 	}
 	if err := writeIfSet(filepath.Join(p.Workspace, "CLAUDE.md"), p.ProjectClaudeMd); err != nil {
