@@ -103,9 +103,9 @@ func TestRender_MultiRepo_SkipsEmptyNamespacePath(t *testing.T) {
 	}
 
 	p := bootstrap.Params{
-		HomeDir:   t.TempDir(),
-		Workspace: ws,
-		BaseMCP:   []byte(`{"mcpServers":{}}`),
+		HomeDir:        t.TempDir(),
+		Workspace:      ws,
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
 		HookCommand:    "/usr/local/bin/cc-stop-hook",
 		PermissionMode: "bypassPermissions",
 		// Primary repo has a valid URL.
