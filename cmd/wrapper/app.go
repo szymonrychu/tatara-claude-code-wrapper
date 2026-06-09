@@ -36,6 +36,13 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	if err := bootstrap.Render(buildBootstrapParams(cfg), gitRunner()); err != nil {
 		return nil, err
 	}
+	if os.Getenv("TATARA_MEMORY_URL") != "" {
+		if _, lookErr := exec.LookPath("tatara"); lookErr == nil {
+			if err := bootstrap.RegisterTataraMCP(cfg.Workspace, execRunner(log)); err != nil {
+				log.Error("tatara mcp-config failed", "error", err)
+			}
+		}
+	}
 
 	store := turn.NewStore()
 	sess := session.New(session.Config{
@@ -160,6 +167,19 @@ func gitRunner() bootstrap.GitRunner {
 		if err != nil {
 			return fmt.Errorf("git -C %s %v: %v: %w", dir, args, string(out), err)
 		}
+		return nil
+	}
+}
+
+func execRunner(log *slog.Logger) bootstrap.CmdRunner {
+	return func(name string, args ...string) error {
+		cmd := exec.Command(name, args...) //nolint:gosec // name+args are controlled by bootstrap (tatara mcp-config), not user input
+		cmd.Env = os.Environ()
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%s %v: %s: %w", name, args, string(out), err)
+		}
+		log.Info("mcp-config registered tatara server", "cmd", name, "args", args)
 		return nil
 	}
 }

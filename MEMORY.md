@@ -6,6 +6,7 @@ unless the rationale is non-obvious. Per-platform decisions live in the parent
 
 ---
 
+- 2026-06-09 (0.1.6) - **Tatara MCP server registered at bootstrap.** After `bootstrap.Render` writes `.mcp.json`, wrapper runs `tatara mcp-config <workspace>` via an injected `CmdRunner` (`bootstrap.RegisterTataraMCP`). Gated on `TATARA_MEMORY_URL != ""` and `tatara` binary on PATH so dev/test without the CLI is unaffected. Non-fatal: `log.Error` then continues. `execRunner` passes `os.Environ()` so `tatara` finds its OIDC/memory env. Design: spec/2026-06-09-agent-native-tatara-tools-design.md A3.
 - 2026-06-09 (0.1.5) - **Cross-repo agent support.** `TATARA_REPOS` (JSON array env) parsed into `[]bootstrap.RepoSpec`; `Render` clones each repo into `/workspace/<name>` and checks out `TASK_BRANCH` in each. `GitRunner` is now dir-parameterized (`func(dir string, args ...string) error`). `CommitAndPushAll` loops over repos on every `OnTurnDone`. Session config (`.mcp.json`, `.claude/`) stays in `/workspace` parent, outside all repos - retiring the `.git/info/exclude` hack. Primary repo clone failure is fatal; non-primary is best-effort (log + skip).
 - 2026-06-09 (0.1.4) - Corrected build: the 0.1.3 IMAGE was built from main BEFORE
   the exclude+skills branch was merged (a merge slip), so it shipped neither the
