@@ -2,6 +2,8 @@ package bootstrap_test
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -9,6 +11,42 @@ import (
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
 )
+
+func TestRender_ClonesEachRepoIntoSubdirAndChecksOutBranch(t *testing.T) {
+	ws := t.TempDir()
+	var calls [][]string // dir + args
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: ws, BaseMCP: []byte(`{"mcpServers":{}}`),
+		TaskBranch: "tatara/task-x",
+		Repos: []bootstrap.RepoSpec{
+			{Name: "a", URL: "https://h/a", Branch: "main"},
+			{Name: "b", URL: "https://h/b", Branch: "dev"},
+		},
+		RepoURL: "https://h/a", HookCommand: "/x", PermissionMode: "bypassPermissions",
+	}
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error {
+		calls = append(calls, append([]string{dir}, a...))
+		return nil
+	}))
+	joined := func() string {
+		var s []string
+		for _, c := range calls {
+			s = append(s, strings.Join(c, " "))
+		}
+		return strings.Join(s, "|")
+	}()
+	require.Contains(t, joined, "clone")
+	require.Contains(t, joined, "https://h/a")
+	require.Contains(t, joined, filepath.Join(ws, "a"))
+	require.Contains(t, joined, "https://h/b")
+	require.Contains(t, joined, filepath.Join(ws, "b"))
+	// checkout the task branch inside each repo dir
+	require.Contains(t, joined, filepath.Join(ws, "a")+" checkout -b tatara/task-x")
+	require.Contains(t, joined, filepath.Join(ws, "b")+" checkout -b tatara/task-x")
+	// session config lives in the workspace, not inside a repo
+	b, _ := os.ReadFile(filepath.Join(ws, ".mcp.json"))
+	require.NotEmpty(t, b)
+}
 
 func TestRender_ChecksOutTaskBranchAfterClone(t *testing.T) {
 	var calls [][]string

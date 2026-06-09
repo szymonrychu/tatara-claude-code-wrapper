@@ -42,7 +42,32 @@ func Render(p Params, git GitRunner) error {
 	if err := os.MkdirAll(p.Workspace, 0o755); err != nil {
 		return fmt.Errorf("mkdir workspace: %w", err)
 	}
-	if p.RepoURL != "" && len(p.Repos) == 0 {
+	if len(p.Repos) > 0 {
+		if err := configureGit(p, git); err != nil {
+			return err
+		}
+		for _, r := range p.Repos {
+			dest := filepath.Join(p.Workspace, r.Name)
+			args := []string{"clone", "--depth", "1"}
+			if r.Branch != "" {
+				args = append(args, "--branch", r.Branch)
+			}
+			args = append(args, r.URL, dest)
+			if err := git(p.Workspace, args...); err != nil {
+				if r.URL == p.RepoURL {
+					return fmt.Errorf("clone primary repo %s: %w", r.Name, err)
+				}
+				continue // non-primary clone failure: skip
+			}
+			if p.TaskBranch != "" {
+				if err := git(dest, "checkout", "-b", p.TaskBranch); err != nil {
+					if r.URL == p.RepoURL {
+						return err
+					}
+				}
+			}
+		}
+	} else if p.RepoURL != "" {
 		if err := configureGit(p, git); err != nil {
 			return err
 		}
