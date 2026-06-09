@@ -9,6 +9,8 @@ HTTP API, webhook-or-poll turn delivery, bootstrap seeding (CLAUDE.md global+
 project, merged MCP, skills, `~/.claude.json` no-dialog seed, settings), boot
 dialog navigation, Stop-hook result capture, helm chart, modular Dockerfile.
 
+- SHIPPED 2026-06-09 - SCM-projects MCP tools (propose_issue/review_verdict/pr_outcome) reach agents via the re-pinned baked tatara-cli 0.5.0; flow-through asserted by mcp_flowthrough_test.go.
+
 ## v0.2 candidates
 
 - **`claude --resume` after crash.** On claude exit, restart and resume from
