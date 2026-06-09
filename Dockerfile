@@ -3,7 +3,7 @@
 ARG GO_VERSION=1.25
 ARG NODE_VERSION=22
 ARG CLAUDE_CODE_VERSION=latest
-ARG TATARA_CLI_VERSION=latest
+ARG TATARA_CLI_VERSION=0.5.0
 
 # Stage 1: build the Go binaries (cached independently of the claude layer).
 FROM golang:${GO_VERSION}-alpine AS go-build
