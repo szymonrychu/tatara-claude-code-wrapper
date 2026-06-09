@@ -143,3 +143,27 @@ func TestCommitAndPush_SkipsCommitWhenClean(t *testing.T) {
 	require.False(t, committed, "must not commit when nothing is staged")
 	require.True(t, pushed, "branch must still be pushed so write-back can open the PR")
 }
+
+func TestRender_SessionConfigStaysAtWorkspaceRootWithNamespaceClones(t *testing.T) {
+	ws := t.TempDir()
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: ws, BaseMCP: []byte(`{"mcpServers":{}}`),
+		ProjectClaudeMd: "PROJECT RULES",
+		TaskBranch:      "tatara/task-x",
+		Repos: []bootstrap.RepoSpec{
+			{Name: "tatara-cli", URL: "https://github.com/szymonrychu/tatara-cli.git", Branch: "main"},
+		},
+		RepoURL: "https://github.com/szymonrychu/tatara-cli.git", HookCommand: "/x", PermissionMode: "bypassPermissions",
+	}
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { return nil }))
+
+	// config at workspace root
+	require.FileExists(t, filepath.Join(ws, ".mcp.json"))
+	require.FileExists(t, filepath.Join(ws, "CLAUDE.md"))
+	b, _ := os.ReadFile(filepath.Join(ws, "CLAUDE.md"))
+	require.Equal(t, "PROJECT RULES", string(b))
+
+	// config is NOT duplicated inside the repo namespace subdir
+	require.NoFileExists(t, filepath.Join(ws, "szymonrychu", "tatara-cli", ".mcp.json"))
+	require.NoFileExists(t, filepath.Join(ws, "szymonrychu", "tatara-cli", "CLAUDE.md"))
+}
