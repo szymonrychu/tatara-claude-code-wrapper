@@ -75,6 +75,26 @@ func TestRender_ChecksOutTaskBranchAfterClone(t *testing.T) {
 	require.Less(t, cloneIdx, coIdx, "checkout must run after clone")
 }
 
+func TestCommitAndPushAll_PushesEachRepoOnItsDir(t *testing.T) {
+	var calls [][]string
+	git := func(dir string, a ...string) error {
+		calls = append(calls, append([]string{dir}, a...))
+		if len(a) >= 3 && a[0] == "diff" && a[1] == "--cached" && a[2] == "--quiet" {
+			return errors.New("changes")
+		}
+		return nil
+	}
+	repos := []bootstrap.RepoSpec{{Name: "a"}, {Name: "b"}}
+	require.NoError(t, bootstrap.CommitAndPushAll("/ws", repos, "tatara/task-x", "msg", git))
+	var s []string
+	for _, c := range calls {
+		s = append(s, strings.Join(c, " "))
+	}
+	all := strings.Join(s, "|")
+	require.Contains(t, all, "/ws/a push -u origin tatara/task-x")
+	require.Contains(t, all, "/ws/b push -u origin tatara/task-x")
+}
+
 func TestCommitAndPush_CommitsWhenDirtyThenPushes(t *testing.T) {
 	var calls [][]string
 	git := func(dir string, a ...string) error {

@@ -55,8 +55,14 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		// but does not reliably perform, so the operator's write-back finds the
 		// branch. Best-effort: a failure here must not drop the turn callback.
 		if cfg.TaskBranch != "" {
-			if err := bootstrap.CommitAndPush(cfg.Workspace, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner()); err != nil {
-				log.Error("commit/push task branch failed", "branch", cfg.TaskBranch, "error", err)
+			if len(cfg.Repos) > 0 {
+				if err := bootstrap.CommitAndPushAll(cfg.Workspace, cfg.Repos, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner()); err != nil {
+					log.Error("commit/push failed", "error", err)
+				}
+			} else {
+				if err := bootstrap.CommitAndPush(cfg.Workspace, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner()); err != nil {
+					log.Error("commit/push task branch failed", "branch", cfg.TaskBranch, "error", err)
+				}
 			}
 		}
 		url := rec.CallbackURL

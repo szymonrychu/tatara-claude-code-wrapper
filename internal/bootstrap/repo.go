@@ -1,5 +1,10 @@
 package bootstrap
 
+import (
+	"fmt"
+	"path/filepath"
+)
+
 // configureGit sets the global commit identity and, when a token is present, a
 // credential helper so both the clone and the agent's later push authenticate
 // against a private repo. The helper reads $GIT_TOKEN at invocation time, so the
@@ -39,6 +44,16 @@ func CommitAndPush(dir, branch, message string, git GitRunner) error {
 		}
 	}
 	return git(dir, "push", "-u", "origin", branch)
+}
+
+// CommitAndPushAll runs CommitAndPush in each repo dir under workspace.
+func CommitAndPushAll(workspace string, repos []RepoSpec, branch, message string, git GitRunner) error {
+	for _, r := range repos {
+		if err := CommitAndPush(filepath.Join(workspace, r.Name), branch, message, git); err != nil {
+			return fmt.Errorf("commit/push %s: %w", r.Name, err)
+		}
+	}
+	return nil
 }
 
 // cloneRepo shallow-clones RepoURL@RepoBranch into the workspace.
