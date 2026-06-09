@@ -83,7 +83,7 @@ func TestRender_ChecksOutTaskBranchAfterClone(t *testing.T) {
 	require.Less(t, cloneIdx, coIdx, "checkout must run after clone")
 }
 
-func TestCommitAndPushAll_PushesEachRepoOnItsDir(t *testing.T) {
+func TestCommitAndPushAll_PushesEachRepoOnItsNamespaceDir(t *testing.T) {
 	var calls [][]string
 	git := func(dir string, a ...string) error {
 		calls = append(calls, append([]string{dir}, a...))
@@ -92,15 +92,18 @@ func TestCommitAndPushAll_PushesEachRepoOnItsDir(t *testing.T) {
 		}
 		return nil
 	}
-	repos := []bootstrap.RepoSpec{{Name: "a"}, {Name: "b"}}
+	repos := []bootstrap.RepoSpec{
+		{Name: "tatara-cli", URL: "https://github.com/szymonrychu/tatara-cli.git"},
+		{Name: "helmfile", URL: "https://gitlab.com/szymonrychu/infra/helmfile.git"},
+	}
 	require.NoError(t, bootstrap.CommitAndPushAll("/ws", repos, "tatara/task-x", "msg", git))
 	var s []string
 	for _, c := range calls {
 		s = append(s, strings.Join(c, " "))
 	}
 	all := strings.Join(s, "|")
-	require.Contains(t, all, "/ws/a push -u origin tatara/task-x")
-	require.Contains(t, all, "/ws/b push -u origin tatara/task-x")
+	require.Contains(t, all, "/ws/szymonrychu/tatara-cli push -u origin tatara/task-x")
+	require.Contains(t, all, "/ws/szymonrychu/infra/helmfile push -u origin tatara/task-x")
 }
 
 func TestCommitAndPush_CommitsWhenDirtyThenPushes(t *testing.T) {
