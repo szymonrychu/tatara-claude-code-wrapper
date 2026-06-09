@@ -6,6 +6,13 @@ import (
 	"path/filepath"
 )
 
+// RepoSpec is one Project repo to clone into the workspace.
+type RepoSpec struct {
+	Name   string `json:"name"`
+	URL    string `json:"url"`
+	Branch string `json:"branch"`
+}
+
 type Params struct {
 	HomeDir, Workspace              string
 	GlobalClaudeMd, ProjectClaudeMd string
@@ -21,6 +28,7 @@ type Params struct {
 	GitToken                        string // private-repo auth for clone + the agent's push (read from $GIT_TOKEN at runtime, never written to disk)
 	GitUserName, GitUserEmail       string // commit identity for the agent
 	TaskBranch                      string // work branch the operator opens the PR from; checked out after clone
+	Repos                           []RepoSpec
 }
 
 // GitRunner runs a git subcommand; injected for testability.

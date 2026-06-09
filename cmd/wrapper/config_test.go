@@ -25,3 +25,13 @@ func TestLoadConfig_EnvOverride(t *testing.T) {
 	require.Equal(t, ":9000", cfg.HTTPAddr)
 	require.Equal(t, 42, cfg.TurnTimeoutSeconds)
 }
+
+func TestLoadConfig_ParsesTataraRepos(t *testing.T) {
+	t.Setenv("TATARA_REPOS", `[{"name":"a","url":"https://h/a","branch":"main"},{"name":"b","url":"https://h/b","branch":"dev"}]`)
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Len(t, cfg.Repos, 2)
+	require.Equal(t, "a", cfg.Repos[0].Name)
+	require.Equal(t, "https://h/b", cfg.Repos[1].URL)
+	require.Equal(t, "dev", cfg.Repos[1].Branch)
+}

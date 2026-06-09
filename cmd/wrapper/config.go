@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"strconv"
+
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
 )
 
 type config struct {
@@ -35,6 +38,7 @@ type config struct {
 	MCPOverlayDir       string
 	SkillsSrcDirs       string // colon-separated
 	AllowedToolsPath    string
+	Repos               []bootstrap.RepoSpec
 }
 
 func loadConfig(args []string) (config, error) {
@@ -78,6 +82,11 @@ func loadConfig(args []string) (config, error) {
 		MCPOverlayDir:       envOr("MCP_OVERLAY_DIR", "/etc/wrapper/mcp.d"),
 		SkillsSrcDirs:       envOr("SKILLS_SRC_DIRS", "/templates/skills:/etc/wrapper/skills"),
 		AllowedToolsPath:    envOr("ALLOWED_TOOLS_PATH", "/etc/wrapper/allowed-tools.txt"),
+	}
+	if raw := os.Getenv("TATARA_REPOS"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &cfg.Repos); err != nil {
+			return config{}, fmt.Errorf("parse TATARA_REPOS: %w", err)
+		}
 	}
 	fs := flag.NewFlagSet("wrapper", flag.ContinueOnError)
 	fs.StringVar(&cfg.HTTPAddr, "http-addr", cfg.HTTPAddr, "public HTTP listen address")
