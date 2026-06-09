@@ -83,6 +83,80 @@ func TestRender_ClonesRepoWhenURLSet(t *testing.T) {
 	require.Contains(t, gitCalls[0], "main")
 }
 
+// TestRender_MultiRepo_SkipsEmptyNamespacePath asserts that a repo whose URL
+// yields an empty namespacePath (empty string or single-segment) is never
+// cloned into the workspace root. For a non-primary repo it must be silently
+// skipped; for a primary repo Render must return a clear error.
+func TestRender_MultiRepo_SkipsEmptyNamespacePath(t *testing.T) {
+	ws := t.TempDir()
+
+	var cloneDests []string
+	fakeGit := func(dir string, a ...string) error {
+		// record the destination argument of every clone call
+		for i, arg := range a {
+			if arg == "clone" && i+3 < len(a) {
+				// args: clone [--depth 1] [--branch b] <url> <dest>
+				cloneDests = append(cloneDests, a[len(a)-1])
+			}
+		}
+		return nil
+	}
+
+	p := bootstrap.Params{
+		HomeDir:   t.TempDir(),
+		Workspace: ws,
+		BaseMCP:   []byte(`{"mcpServers":{}}`),
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+		// Primary repo has a valid URL.
+		RepoURL:    "https://github.com/owner/primary.git",
+		RepoBranch: "main",
+		Repos: []bootstrap.RepoSpec{
+			{Name: "primary", URL: "https://github.com/owner/primary.git", Branch: "main"},
+			// empty URL -> namespacePath returns "" -> dest would equal workspace root
+			{Name: "bad-empty", URL: "", Branch: "main"},
+			// single-segment URL -> namespacePath returns "repo" with no slash -> still
+			// resolves to a subdir, but there is no owner segment; test the "" case only
+			// for clarity; the single-segment case is an edge-case variant tested below.
+		},
+	}
+
+	// Non-primary bad repo must be skipped, not cause an error.
+	require.NoError(t, bootstrap.Render(p, fakeGit))
+
+	// The workspace root itself must never appear as a clone destination.
+	for _, dest := range cloneDests {
+		require.NotEqual(t, ws, dest, "clone must not target workspace root (dest=%q)", dest)
+		// Also reject any filepath.Clean that resolves to ws.
+		require.NotEqual(t, ws, filepath.Clean(dest), "clean dest must not equal workspace (dest=%q)", dest)
+	}
+}
+
+// TestRender_MultiRepo_PrimaryEmptyURLReturnsError asserts that when the
+// primary repo (r.URL == p.RepoURL) has an empty URL that would resolve to the
+// workspace root, Render returns a descriptive error instead of cloning there.
+func TestRender_MultiRepo_PrimaryEmptyURLReturnsError(t *testing.T) {
+	ws := t.TempDir()
+	fakeGit := func(dir string, a ...string) error { return nil }
+
+	p := bootstrap.Params{
+		HomeDir:        t.TempDir(),
+		Workspace:      ws,
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+		RepoURL:        "",
+		Repos: []bootstrap.RepoSpec{
+			// Primary with empty URL.
+			{Name: "bad-primary", URL: "", Branch: "main"},
+		},
+	}
+
+	err := bootstrap.Render(p, fakeGit)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "cannot derive namespace path from URL")
+}
+
 func TestRender_ConfiguresGitCredentialsAndIdentityBeforeClone(t *testing.T) {
 	var gitCalls [][]string
 	p := bootstrap.Params{

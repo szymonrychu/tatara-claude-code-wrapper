@@ -47,7 +47,16 @@ func Render(p Params, git GitRunner) error {
 			return err
 		}
 		for _, r := range p.Repos {
-			dest := filepath.Join(p.Workspace, namespacePath(r.URL))
+			ns := namespacePath(r.URL)
+			// Guard: an empty namespace path would resolve to the workspace root,
+			// overwriting session config files (.mcp.json, CLAUDE.md, settings).
+			if ns == "" || filepath.Clean(filepath.Join(p.Workspace, ns)) == filepath.Clean(p.Workspace) {
+				if r.URL == p.RepoURL {
+					return fmt.Errorf("cannot derive namespace path from URL %q: would clone into workspace root", r.URL)
+				}
+				continue // non-primary: skip silently
+			}
+			dest := filepath.Join(p.Workspace, ns)
 			if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 				if r.URL == p.RepoURL {
 					return fmt.Errorf("mkdir parent for primary repo %s: %w", r.Name, err)
