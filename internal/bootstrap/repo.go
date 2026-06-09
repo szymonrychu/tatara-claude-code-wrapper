@@ -49,7 +49,8 @@ func CommitAndPush(dir, branch, message string, git GitRunner) error {
 // CommitAndPushAll runs CommitAndPush in each repo dir under workspace.
 func CommitAndPushAll(workspace string, repos []RepoSpec, branch, message string, git GitRunner) error {
 	for _, r := range repos {
-		if err := CommitAndPush(filepath.Join(workspace, r.Name), branch, message, git); err != nil {
+		dir := filepath.Join(workspace, namespacePath(r.URL))
+		if err := CommitAndPush(dir, branch, message, git); err != nil {
 			return fmt.Errorf("commit/push %s: %w", r.Name, err)
 		}
 	}
