@@ -12,17 +12,17 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
 )
 
-func TestRender_ClonesEachRepoIntoSubdirAndChecksOutBranch(t *testing.T) {
+func TestRender_ClonesEachRepoIntoNamespaceSubdirAndChecksOutBranch(t *testing.T) {
 	ws := t.TempDir()
 	var calls [][]string // dir + args
 	p := bootstrap.Params{
 		HomeDir: t.TempDir(), Workspace: ws, BaseMCP: []byte(`{"mcpServers":{}}`),
 		TaskBranch: "tatara/task-x",
 		Repos: []bootstrap.RepoSpec{
-			{Name: "a", URL: "https://h/a", Branch: "main"},
-			{Name: "b", URL: "https://h/b", Branch: "dev"},
+			{Name: "tatara-cli", URL: "https://github.com/szymonrychu/tatara-cli.git", Branch: "main"},
+			{Name: "helmfile", URL: "https://gitlab.com/szymonrychu/infra/helmfile.git", Branch: "dev"},
 		},
-		RepoURL: "https://h/a", HookCommand: "/x", PermissionMode: "bypassPermissions",
+		RepoURL: "https://github.com/szymonrychu/tatara-cli.git", HookCommand: "/x", PermissionMode: "bypassPermissions",
 	}
 	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error {
 		calls = append(calls, append([]string{dir}, a...))
@@ -35,15 +35,23 @@ func TestRender_ClonesEachRepoIntoSubdirAndChecksOutBranch(t *testing.T) {
 		}
 		return strings.Join(s, "|")
 	}()
+
+	destA := filepath.Join(ws, "szymonrychu", "tatara-cli")
+	destB := filepath.Join(ws, "szymonrychu", "infra", "helmfile")
+
+	// cloned into the namespace-preserving destinations
 	require.Contains(t, joined, "clone")
-	require.Contains(t, joined, "https://h/a")
-	require.Contains(t, joined, filepath.Join(ws, "a"))
-	require.Contains(t, joined, "https://h/b")
-	require.Contains(t, joined, filepath.Join(ws, "b"))
-	// checkout the task branch inside each repo dir
-	require.Contains(t, joined, filepath.Join(ws, "a")+" checkout -b tatara/task-x")
-	require.Contains(t, joined, filepath.Join(ws, "b")+" checkout -b tatara/task-x")
-	// session config lives in the workspace, not inside a repo
+	require.Contains(t, joined, "https://github.com/szymonrychu/tatara-cli.git")
+	require.Contains(t, joined, destA)
+	require.Contains(t, joined, "https://gitlab.com/szymonrychu/infra/helmfile.git")
+	require.Contains(t, joined, destB)
+	// checkout the task branch inside each namespace dir
+	require.Contains(t, joined, destA+" checkout -b tatara/task-x")
+	require.Contains(t, joined, destB+" checkout -b tatara/task-x")
+	// parent dirs of the namespace destinations were created
+	require.DirExists(t, filepath.Join(ws, "szymonrychu"))
+	require.DirExists(t, filepath.Join(ws, "szymonrychu", "infra"))
+	// session config lives in the workspace root, not inside a repo
 	b, _ := os.ReadFile(filepath.Join(ws, ".mcp.json"))
 	require.NotEmpty(t, b)
 }

@@ -47,7 +47,13 @@ func Render(p Params, git GitRunner) error {
 			return err
 		}
 		for _, r := range p.Repos {
-			dest := filepath.Join(p.Workspace, r.Name)
+			dest := filepath.Join(p.Workspace, namespacePath(r.URL))
+			if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+				if r.URL == p.RepoURL {
+					return fmt.Errorf("mkdir parent for primary repo %s: %w", r.Name, err)
+				}
+				continue // non-primary parent-dir failure: skip
+			}
 			args := []string{"clone", "--depth", "1"}
 			if r.Branch != "" {
 				args = append(args, "--branch", r.Branch)
