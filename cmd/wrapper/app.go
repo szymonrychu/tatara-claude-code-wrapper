@@ -33,7 +33,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	reg := obs.PromRegistry()
 	m := metrics.New(reg)
 
-	if err := bootstrap.Render(buildBootstrapParams(cfg), gitRunner(cfg.Workspace)); err != nil {
+	if err := bootstrap.Render(buildBootstrapParams(cfg), gitRunner()); err != nil {
 		return nil, err
 	}
 
@@ -55,7 +55,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		// but does not reliably perform, so the operator's write-back finds the
 		// branch. Best-effort: a failure here must not drop the turn callback.
 		if cfg.TaskBranch != "" {
-			if err := bootstrap.CommitAndPush(cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner(cfg.Workspace)); err != nil {
+			if err := bootstrap.CommitAndPush(cfg.Workspace, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner()); err != nil {
 				log.Error("commit/push task branch failed", "branch", cfg.TaskBranch, "error", err)
 			}
 		}
@@ -121,6 +121,7 @@ func buildBootstrapParams(cfg config) bootstrap.Params {
 		GitUserName:     cfg.GitUserName,
 		GitUserEmail:    cfg.GitUserEmail,
 		TaskBranch:      cfg.TaskBranch,
+		Repos:           cfg.Repos,
 	}
 }
 
@@ -145,13 +146,13 @@ func claudeEnv(cfg config) []string {
 	return env
 }
 
-func gitRunner(dir string) bootstrap.GitRunner {
-	return func(args ...string) error {
+func gitRunner() bootstrap.GitRunner {
+	return func(dir string, args ...string) error {
 		cmd := exec.Command("git", args...) //nolint:gosec // git is a fixed binary; args are operator-supplied config, not user input
 		cmd.Dir = dir
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("git %v: %v: %w", args, string(out), err)
+			return fmt.Errorf("git -C %s %v: %v: %w", dir, args, string(out), err)
 		}
 		return nil
 	}

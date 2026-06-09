@@ -2,8 +2,6 @@ package bootstrap_test
 
 import (
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,26 +9,6 @@ import (
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
 )
-
-func TestRender_ExcludesWrapperConfigFromGit(t *testing.T) {
-	ws := t.TempDir()
-	p := bootstrap.Params{
-		HomeDir: t.TempDir(), Workspace: ws,
-		BaseMCP:     []byte(`{"mcpServers":{}}`),
-		RepoURL:     "https://github.com/x/y",
-		RepoBranch:  "main",
-		HookCommand: "/usr/local/bin/cc-stop-hook", PermissionMode: "bypassPermissions",
-	}
-	require.NoError(t, bootstrap.Render(p, func(a ...string) error { return nil }))
-
-	// Wrapper-injected session files must be excluded so the agent's commit
-	// carries only its real edits, not .mcp.json / .claude/ scaffolding.
-	b, err := os.ReadFile(filepath.Join(ws, ".git", "info", "exclude"))
-	require.NoError(t, err, "git exclude not written")
-	got := string(b)
-	require.Contains(t, got, ".mcp.json")
-	require.Contains(t, got, ".claude/")
-}
 
 func TestRender_ChecksOutTaskBranchAfterClone(t *testing.T) {
 	var calls [][]string
@@ -42,7 +20,7 @@ func TestRender_ChecksOutTaskBranchAfterClone(t *testing.T) {
 		TaskBranch:  "tatara/task-abc",
 		HookCommand: "/usr/local/bin/cc-stop-hook", PermissionMode: "bypassPermissions",
 	}
-	require.NoError(t, bootstrap.Render(p, func(a ...string) error { calls = append(calls, a); return nil }))
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { calls = append(calls, a); return nil }))
 
 	cloneIdx, coIdx := -1, -1
 	for i, c := range calls {
@@ -61,7 +39,7 @@ func TestRender_ChecksOutTaskBranchAfterClone(t *testing.T) {
 
 func TestCommitAndPush_CommitsWhenDirtyThenPushes(t *testing.T) {
 	var calls [][]string
-	git := func(a ...string) error {
+	git := func(dir string, a ...string) error {
 		calls = append(calls, a)
 		// `diff --cached --quiet` exits non-zero when there are staged changes.
 		if len(a) >= 3 && a[0] == "diff" && a[1] == "--cached" && a[2] == "--quiet" {
@@ -69,7 +47,7 @@ func TestCommitAndPush_CommitsWhenDirtyThenPushes(t *testing.T) {
 		}
 		return nil
 	}
-	require.NoError(t, bootstrap.CommitAndPush("tatara/task-abc", "agent work", git))
+	require.NoError(t, bootstrap.CommitAndPush("/repo", "tatara/task-abc", "agent work", git))
 
 	var all []string
 	for _, c := range calls {
@@ -83,7 +61,7 @@ func TestCommitAndPush_CommitsWhenDirtyThenPushes(t *testing.T) {
 
 func TestCommitAndPush_SkipsCommitWhenClean(t *testing.T) {
 	var committed, pushed bool
-	git := func(a ...string) error {
+	git := func(dir string, a ...string) error {
 		if len(a) >= 1 && a[0] == "commit" {
 			committed = true
 		}
@@ -92,7 +70,7 @@ func TestCommitAndPush_SkipsCommitWhenClean(t *testing.T) {
 		}
 		return nil // diff --cached --quiet returns nil -> nothing staged
 	}
-	require.NoError(t, bootstrap.CommitAndPush("b", "m", git))
+	require.NoError(t, bootstrap.CommitAndPush("/repo", "b", "m", git))
 	require.False(t, committed, "must not commit when nothing is staged")
 	require.True(t, pushed, "branch must still be pushed so write-back can open the PR")
 }

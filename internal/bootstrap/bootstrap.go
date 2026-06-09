@@ -31,8 +31,8 @@ type Params struct {
 	Repos                           []RepoSpec
 }
 
-// GitRunner runs a git subcommand; injected for testability.
-type GitRunner func(args ...string) error
+// GitRunner runs a git subcommand in dir; injected for testability.
+type GitRunner func(dir string, args ...string) error
 
 func Render(p Params, git GitRunner) error {
 	claudeHome := filepath.Join(p.HomeDir, ".claude")
@@ -42,7 +42,7 @@ func Render(p Params, git GitRunner) error {
 	if err := os.MkdirAll(p.Workspace, 0o755); err != nil {
 		return fmt.Errorf("mkdir workspace: %w", err)
 	}
-	if p.RepoURL != "" {
+	if p.RepoURL != "" && len(p.Repos) == 0 {
 		if err := configureGit(p, git); err != nil {
 			return err
 		}
@@ -50,7 +50,7 @@ func Render(p Params, git GitRunner) error {
 			return err
 		}
 		if p.TaskBranch != "" {
-			if err := git("checkout", "-b", p.TaskBranch); err != nil {
+			if err := git(p.Workspace, "checkout", "-b", p.TaskBranch); err != nil {
 				return err
 			}
 		}

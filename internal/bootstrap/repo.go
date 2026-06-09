@@ -6,18 +6,18 @@ package bootstrap
 // token is never written into .gitconfig or a remote URL.
 func configureGit(p Params, git GitRunner) error {
 	if p.GitUserName != "" {
-		if err := git("config", "--global", "user.name", p.GitUserName); err != nil {
+		if err := git("", "config", "--global", "user.name", p.GitUserName); err != nil {
 			return err
 		}
 	}
 	if p.GitUserEmail != "" {
-		if err := git("config", "--global", "user.email", p.GitUserEmail); err != nil {
+		if err := git("", "config", "--global", "user.email", p.GitUserEmail); err != nil {
 			return err
 		}
 	}
 	if p.GitToken != "" {
 		helper := `!f() { echo username=x-access-token; echo "password=$GIT_TOKEN"; }; f`
-		if err := git("config", "--global", "credential.helper", helper); err != nil {
+		if err := git("", "config", "--global", "credential.helper", helper); err != nil {
 			return err
 		}
 	}
@@ -28,17 +28,17 @@ func configureGit(p Params, git GitRunner) error {
 // pushes branch to origin. It enforces the branch+commit+push the agent is
 // asked to do but does not reliably perform, so the operator's write-back finds
 // the branch. Push runs even with nothing new so the remote branch exists.
-func CommitAndPush(branch, message string, git GitRunner) error {
-	if err := git("add", "-A"); err != nil {
+func CommitAndPush(dir, branch, message string, git GitRunner) error {
+	if err := git(dir, "add", "-A"); err != nil {
 		return err
 	}
 	// `diff --cached --quiet` exits non-zero when there are staged changes.
-	if git("diff", "--cached", "--quiet") != nil {
-		if err := git("commit", "-m", message); err != nil {
+	if git(dir, "diff", "--cached", "--quiet") != nil {
+		if err := git(dir, "commit", "-m", message); err != nil {
 			return err
 		}
 	}
-	return git("push", "-u", "origin", branch)
+	return git(dir, "push", "-u", "origin", branch)
 }
 
 // cloneRepo shallow-clones RepoURL@RepoBranch into the workspace.
@@ -48,7 +48,7 @@ func cloneRepo(p Params, git GitRunner) error {
 		args = append(args, "--branch", p.RepoBranch)
 	}
 	args = append(args, p.RepoURL, p.Workspace)
-	if err := git(args...); err != nil {
+	if err := git(p.Workspace, args...); err != nil {
 		return err
 	}
 	return nil

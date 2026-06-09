@@ -38,7 +38,7 @@ func TestRender_WritesClaudeMdSettingsSkillsAndMergesMCP(t *testing.T) {
 		EnableAllMCP:    true,
 		PermissionMode:  "bypassPermissions",
 	}
-	require.NoError(t, bootstrap.Render(p, func(a ...string) error { gitCalls = append(gitCalls, a); return nil }))
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { gitCalls = append(gitCalls, a); return nil }))
 
 	// global + project CLAUDE.md
 	b, _ := os.ReadFile(filepath.Join(home, ".claude", "CLAUDE.md"))
@@ -76,7 +76,7 @@ func TestRender_ClonesRepoWhenURLSet(t *testing.T) {
 		RepoURL: "https://github.com/x/y", RepoBranch: "main",
 		HookCommand: "/usr/local/bin/cc-stop-hook", PermissionMode: "bypassPermissions",
 	}
-	require.NoError(t, bootstrap.Render(p, func(a ...string) error { gitCalls = append(gitCalls, a); return nil }))
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { gitCalls = append(gitCalls, a); return nil }))
 	require.Len(t, gitCalls, 1)
 	require.Contains(t, gitCalls[0], "clone")
 	require.Contains(t, gitCalls[0], "https://github.com/x/y")
@@ -95,7 +95,7 @@ func TestRender_ConfiguresGitCredentialsAndIdentityBeforeClone(t *testing.T) {
 		GitUserEmail: "tatara-agent@szymonrichert.pl",
 		HookCommand:  "/usr/local/bin/cc-stop-hook", PermissionMode: "bypassPermissions",
 	}
-	require.NoError(t, bootstrap.Render(p, func(a ...string) error { gitCalls = append(gitCalls, a); return nil }))
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { gitCalls = append(gitCalls, a); return nil }))
 
 	var credIdx, nameIdx, emailIdx, cloneIdx = -1, -1, -1, -1
 	for i, c := range gitCalls {
