@@ -10,6 +10,7 @@ project, merged MCP, skills, `~/.claude.json` no-dialog seed, settings), boot
 dialog navigation, Stop-hook result capture, helm chart, modular Dockerfile.
 
 - SHIPPED 2026-06-09 - SCM-projects MCP tools (propose_issue/review_verdict/pr_outcome) reach agents via the re-pinned baked tatara-cli 0.5.0; flow-through asserted by mcp_flowthrough_test.go.
+- SHIPPED 2026-06-11 - autonomous-cron: issue_outcome MCP tool flows through after cli bump 0.5.0 -> 0.6.0; guard extended; chart 0.1.9/appVersion 0.1.8.
 
 ## v0.2 candidates
 
