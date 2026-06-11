@@ -8,10 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/transcript"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
 )
 
@@ -94,6 +97,12 @@ type Manager struct {
 	timer          *time.Timer
 	turnsCompleted int
 	transcriptPath string
+
+	// tailer goroutine
+	tailer        *transcript.Tailer
+	tailerCtx     context.Context
+	tailerCancel  context.CancelFunc
+	tailerStarted bool
 }
 
 func New(cfg Config, store *turn.Store, m *metrics.Metrics, log *slog.Logger, now func() time.Time, newID func() string) *Manager {
@@ -104,6 +113,69 @@ func New(cfg Config, store *turn.Store, m *metrics.Metrics, log *slog.Logger, no
 		cfg.SubmitDelay = 400 * time.Millisecond
 	}
 	return &Manager{cfg: cfg, store: store, m: m, log: log, now: now, newID: newID, state: Booting, ring: newRing()}
+}
+
+// StartTailer sets up the transcript tailer goroutine. It must be called before
+// the first Complete() that supplies a transcript path. ctx governs tailer
+// lifetime; cancel it (or let it expire) to stop the tailer. Calling
+// StartTailer is a no-op when CCW_LOG_TRANSCRIPT=false.
+func (mgr *Manager) StartTailer(ctx context.Context) {
+	if !logTranscriptEnabled() {
+		return
+	}
+	redactor := transcript.NewRedactor(secretsFromEnv())
+	tailer := transcript.NewTailer(mgr.log, redactor, mgr.currentTurnID)
+	tailer.WithCounter(mgr.m.StreamEventsTotal)
+	tailerCtx, cancel := context.WithCancel(ctx)
+	mgr.mu.Lock()
+	mgr.tailer = tailer
+	mgr.tailerCtx = tailerCtx
+	mgr.tailerCancel = cancel
+	mgr.mu.Unlock()
+}
+
+func (mgr *Manager) currentTurnID() string {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	return mgr.current
+}
+
+// logTranscriptEnabled returns true unless CCW_LOG_TRANSCRIPT is explicitly "false".
+func logTranscriptEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("CCW_LOG_TRANSCRIPT")))
+	return v != "false"
+}
+
+// secretsFromEnv collects secret values from the process environment whose key
+// matches common secret-bearing patterns. Values shorter than 8 chars are
+// filtered by the Redactor itself.
+func secretsFromEnv() map[string]string {
+	patterns := []string{"_TOKEN", "_SECRET", "_KEY", "_PASSWORD"}
+	explicit := []string{
+		"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
+		"OPENAI_API_KEY", "GIT_TOKEN",
+	}
+	out := make(map[string]string)
+	for _, kv := range os.Environ() {
+		eq := strings.IndexByte(kv, '=')
+		if eq < 0 {
+			continue
+		}
+		k, v := kv[:eq], kv[eq+1:]
+		ku := strings.ToUpper(k)
+		for _, pat := range patterns {
+			if strings.HasSuffix(ku, pat) {
+				out[k] = v
+				break
+			}
+		}
+	}
+	for _, k := range explicit {
+		if v, ok := os.LookupEnv(k); ok {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // SetWriterForTest injects a writer and marks the session READY. Test-only.
@@ -279,6 +351,17 @@ func (mgr *Manager) Complete(r HookResult) error {
 	started := mgr.currentStarted // capture before clearCurrentLocked resets state
 	if r.TranscriptPath != "" {
 		mgr.transcriptPath = r.TranscriptPath
+		if mgr.tailer != nil && !mgr.tailerStarted {
+			mgr.tailerStarted = true
+			path := mgr.transcriptPath
+			tailer := mgr.tailer
+			tailerCtx := mgr.tailerCtx
+			go func() {
+				if err := tailer.Follow(tailerCtx, path); err != nil && tailerCtx.Err() == nil {
+					mgr.log.Error("transcript tailer error", "err", err)
+				}
+			}()
+		}
 	}
 	_ = mgr.store.Complete(id, r.FinalText, r.ResultJSON, r.Usage, r.StopReason, now)
 	mgr.clearCurrentLocked()
@@ -347,7 +430,11 @@ func (mgr *Manager) Shutdown(ctx context.Context) error {
 	w, proc := mgr.w, mgr.proc
 	mgr.stopping = true
 	mgr.state = Dead
+	cancel := mgr.tailerCancel
 	mgr.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	if w != nil {
 		_, _ = w.Write([]byte("\x03")) // Ctrl-C
 		_ = w.Close()

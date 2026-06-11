@@ -1,9 +1,13 @@
 package session_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -104,6 +108,120 @@ func TestTurnTimeout_FailsAndFiresCallback(t *testing.T) {
 	}
 	rec, _ := store.Get("turn-1")
 	require.Equal(t, turn.Failed, rec.State)
+}
+
+func TestTailer_StartedOnCompleteWithTranscriptPath(t *testing.T) {
+	// Verify that after Complete() with a transcript path, the tailer emits
+	// agent_stream log events for lines in that file.
+	dir := t.TempDir()
+	transcriptPath := filepath.Join(dir, "session.jsonl")
+
+	// Write a line to the transcript file that the tailer will pick up
+	line := `{"type":"assistant","uuid":"uuid-tail-test","sessionId":"sess-tail","timestamp":"2026-06-11T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"tailer works"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}}`
+	f, err := os.Create(transcriptPath)
+	require.NoError(t, err)
+	_, err = f.WriteString(line + "\n")
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	store := turn.NewStore()
+	ids := []string{"turn-1"}
+	idx := 0
+	m := session.New(
+		session.Config{TurnTimeout: 50 * time.Millisecond, SubmitSeq: session.DefaultSubmitSeq},
+		store,
+		metrics.New(prometheus.NewRegistry()),
+		log,
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { s := ids[idx]; idx++; return s },
+	)
+	m.SetWriterForTest(&fakePTY{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	m.StartTailer(ctx)
+
+	_, err = m.Submit("hi", "")
+	require.NoError(t, err)
+	require.NoError(t, m.Complete(session.HookResult{
+		FinalText:      "ok",
+		StopReason:     "end_turn",
+		TranscriptPath: transcriptPath,
+	}))
+
+	// Give tailer time to process the file
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		data := buf.Bytes()
+		lines := bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
+		for _, ln := range lines {
+			var rec map[string]any
+			if json.Unmarshal(ln, &rec) == nil && rec["action"] == "agent_stream" && rec["stream_type"] == "text" {
+				cancel()
+				return // success
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("tailer did not emit agent_stream text event within timeout")
+}
+
+func TestTailer_DisabledWhenEnvFalse(t *testing.T) {
+	// When CCW_LOG_TRANSCRIPT=false, no agent_stream events should be emitted.
+	t.Setenv("CCW_LOG_TRANSCRIPT", "false")
+
+	dir := t.TempDir()
+	transcriptPath := filepath.Join(dir, "session.jsonl")
+	line := `{"type":"assistant","uuid":"uuid-no-tail","sessionId":"sess-no","timestamp":"2026-06-11T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"should not appear"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}}`
+	f, err := os.Create(transcriptPath)
+	require.NoError(t, err)
+	_, err = f.WriteString(line + "\n")
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	store := turn.NewStore()
+	ids := []string{"turn-1"}
+	idx := 0
+	m := session.New(
+		session.Config{TurnTimeout: 50 * time.Millisecond, SubmitSeq: session.DefaultSubmitSeq},
+		store,
+		metrics.New(prometheus.NewRegistry()),
+		log,
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { s := ids[idx]; idx++; return s },
+	)
+	m.SetWriterForTest(&fakePTY{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	m.StartTailer(ctx)
+
+	_, err = m.Submit("hi", "")
+	require.NoError(t, err)
+	require.NoError(t, m.Complete(session.HookResult{
+		FinalText:      "ok",
+		StopReason:     "end_turn",
+		TranscriptPath: transcriptPath,
+	}))
+
+	// Wait a bit, verify no agent_stream events appear
+	time.Sleep(600 * time.Millisecond)
+	cancel()
+
+	data := buf.Bytes()
+	lines := bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
+	for _, ln := range lines {
+		var rec map[string]any
+		if json.Unmarshal(ln, &rec) == nil && rec["action"] == "agent_stream" {
+			t.Fatalf("got unexpected agent_stream event when CCW_LOG_TRANSCRIPT=false: %v", rec)
+		}
+	}
 }
 
 func TestStart_RealPTYWithCat(t *testing.T) {

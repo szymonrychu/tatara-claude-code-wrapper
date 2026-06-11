@@ -34,3 +34,30 @@ func TestNew_RegistersAllCollectors(t *testing.T) {
 		require.True(t, names[want], "missing %s", want)
 	}
 }
+
+func TestMetrics_StreamEventsTotal(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	m.StreamEventsTotal.WithLabelValues("text").Inc()
+	m.StreamEventsTotal.WithLabelValues("tool_use").Inc()
+	m.StreamEventsTotal.WithLabelValues("tool_use").Inc()
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() == "ccw_stream_events_total" {
+			vals := map[string]float64{}
+			for _, metric := range mf.GetMetric() {
+				for _, lp := range metric.GetLabel() {
+					if lp.GetName() == "stream_type" {
+						vals[lp.GetValue()] = metric.GetCounter().GetValue()
+					}
+				}
+			}
+			require.Equal(t, float64(1), vals["text"], "text count")
+			require.Equal(t, float64(2), vals["tool_use"], "tool_use count")
+			return
+		}
+	}
+	t.Fatal("ccw_stream_events_total not found")
+}
