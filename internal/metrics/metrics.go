@@ -4,12 +4,13 @@ package metrics
 import "github.com/prometheus/client_golang/prometheus"
 
 type Metrics struct {
-	TurnsTotal      *prometheus.CounterVec
-	TurnDuration    prometheus.Histogram
-	TurnInFlight    prometheus.Gauge
-	ClaudeRestarts  prometheus.Counter
-	WebhookDelivery *prometheus.CounterVec
-	HookReceived    prometheus.Counter
+	TurnsTotal        *prometheus.CounterVec
+	TurnDuration      prometheus.Histogram
+	TurnInFlight      prometheus.Gauge
+	ClaudeRestarts    prometheus.Counter
+	WebhookDelivery   *prometheus.CounterVec
+	HookReceived      prometheus.Counter
+	StreamEventsTotal *prometheus.CounterVec
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -27,8 +28,10 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_webhook_delivery_total", Help: "Webhook deliveries by result."}, []string{"result"}),
 		HookReceived: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "ccw_hook_received_total", Help: "Stop-hook callbacks received."}),
+		StreamEventsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_stream_events_total", Help: "Transcript stream events emitted by stream_type."}, []string{"stream_type"}),
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
-		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived)
+		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal)
 	return m
 }

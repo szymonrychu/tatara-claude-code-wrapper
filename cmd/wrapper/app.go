@@ -79,6 +79,8 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		sender.Deliver(context.Background(), url, rec)
 	}
 
+	sess.StartTailer(ctx)
+
 	if err := sess.Start(ctx); err != nil {
 		return nil, err
 	}

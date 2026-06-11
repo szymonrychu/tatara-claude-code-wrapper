@@ -1,5 +1,7 @@
 # MEMORY.md - tatara-claude-code-wrapper
 
+- 2026-06-11 (0.1.13) - **Transcript streaming.** New `internal/transcript` package: Tailer (JSONL follow, inode-change reopen, 200ms poll) + Redactor (longest-first, >=8 char values, env key pattern match). One slog INFO `action=agent_stream` event per content block (text/thinking/tool_use/tool_result/message_end/raw). Counter `ccw_stream_events_total{stream_type}`. Wired via `Manager.StartTailer(ctx)` called in app.go before `sess.Start`; tailer goroutine starts on first `Complete()` that supplies a transcript path. Disabled by `CCW_LOG_TRANSCRIPT=false`. Spec: docs/superpowers/specs/2026-06-11-wrapper-transcript-streaming-design.md.
+
 Cross-session decisions and hard-won findings. Newest first. One line each
 unless the rationale is non-obvious. Per-platform decisions live in the parent
 `tatara` repo's MEMORY.md.
