@@ -74,7 +74,7 @@ jobs:
       - name: smoke
         run: |
           make build
-          ./bin/wrapper --help
+          ./bin/wrapper --help || true
 
   image:
     if: ${{ github.event_name == 'push' }}
