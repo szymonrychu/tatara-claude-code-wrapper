@@ -26,6 +26,7 @@ type app struct {
 	pub      *http.Server
 	internal *http.Server
 	sess     *session.Manager
+	sender   *webhook.Sender
 }
 
 func newApp(ctx context.Context, cfg config) (*app, error) {
@@ -76,7 +77,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		if url == "" {
 			url = defaultCB
 		}
-		sender.Deliver(context.Background(), url, rec)
+		sender.Deliver(url, rec)
 	}
 
 	sess.StartTailer(ctx)
@@ -98,6 +99,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	return &app{
 		log:      log,
 		sess:     sess,
+		sender:   sender,
 		pub:      &http.Server{Addr: cfg.HTTPAddr, Handler: api.Router(), ReadHeaderTimeout: 10 * time.Second},
 		internal: &http.Server{Addr: cfg.InternalAddr, Handler: api.InternalRouter(), ReadHeaderTimeout: 10 * time.Second},
 	}, nil
@@ -112,6 +114,11 @@ func (a *app) run() error {
 
 func (a *app) shutdown(ctx context.Context) error {
 	_ = a.sess.Shutdown(ctx)
+	// Drain in-flight webhook deliveries within a bounded window so retries
+	// either complete or log a clean abort instead of being orphaned at exit.
+	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	a.sender.Shutdown(drainCtx)
+	cancel()
 	_ = a.internal.Shutdown(ctx)
 	return a.pub.Shutdown(ctx)
 }

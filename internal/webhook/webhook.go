@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
@@ -24,18 +25,24 @@ type Sender struct {
 	client *http.Client
 	m      *metrics.Metrics
 	log    *slog.Logger
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 func New(cfg Config, m *metrics.Metrics, log *slog.Logger) *Sender {
 	if cfg.Backoff <= 0 {
 		cfg.Backoff = time.Second
 	}
-	return &Sender{cfg: cfg, client: &http.Client{Timeout: 30 * time.Second}, m: m, log: log}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Sender{cfg: cfg, client: &http.Client{Timeout: 30 * time.Second}, m: m, log: log, ctx: ctx, cancel: cancel}
 }
 
 // Deliver posts the record to url asynchronously, retrying with exponential
-// backoff. A blank url is a no-op (poll-only callers).
-func (s *Sender) Deliver(ctx context.Context, url string, rec *turn.Record) {
+// backoff. A blank url is a no-op (poll-only callers). Delivery runs under the
+// sender's own context and is tracked so Shutdown can drain or abort it.
+func (s *Sender) Deliver(url string, rec *turn.Record) {
 	if url == "" {
 		return
 	}
@@ -44,7 +51,27 @@ func (s *Sender) Deliver(ctx context.Context, url string, rec *turn.Record) {
 		s.log.Error("webhook: marshal", "err", err, "turn_id", rec.ID)
 		return
 	}
-	go s.deliver(ctx, url, rec.ID, body)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.deliver(s.ctx, url, rec.ID, body)
+	}()
+}
+
+// Shutdown drains in-flight deliveries. It waits for tracked goroutines to
+// finish their retries cleanly until ctx's deadline; if that bounded drain
+// window elapses first, it cancels in-flight retries (which log a clean abort
+// and record a "dropped" outcome) and joins the goroutines before returning.
+func (s *Sender) Shutdown(ctx context.Context) {
+	done := make(chan struct{})
+	go func() { s.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		s.cancel()
+		<-done
+	}
+	s.cancel() // release the context regardless of which branch won
 }
 
 func (s *Sender) deliver(ctx context.Context, url, turnID string, body []byte) {
@@ -55,6 +82,7 @@ func (s *Sender) deliver(ctx context.Context, url, turnID string, body []byte) {
 			select {
 			case <-ctx.Done():
 				s.m.WebhookDelivery.WithLabelValues("dropped").Inc()
+				s.log.Warn("webhook: aborted on shutdown", "turn_id", turnID, "url", url, "attempt", attempt)
 				return
 			case <-time.After(backoff):
 			}
