@@ -36,7 +36,7 @@ dialog navigation, Stop-hook result capture, helm chart, modular Dockerfile.
 - **Submit holds the lock during the ~400ms SubmitDelay** (`session.Submit`).
   Fine for single-session sequential turns, but it briefly blocks `readyz`/
   `Snapshot`/`Shutdown`. Decouple with a `submitting` guard if it ever matters.
-- **Webhook retries use `context.Background()`** and are not cancelled on
-  shutdown (`app.go` OnTurnDone). Best-effort with poll fallback, so a dropped
-  delivery is recoverable; thread an app-owned cancellable context for a clean
-  shutdown.
+- ~~**Webhook retries use `context.Background()`** and are not cancelled on
+  shutdown.~~ Fixed: the sender owns a cancellable context and a `WaitGroup`;
+  `app.shutdown` drains in-flight deliveries within a bounded window, then
+  cancels retries (which log a clean abort) and joins the goroutines.
