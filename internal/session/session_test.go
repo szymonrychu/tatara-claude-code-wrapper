@@ -110,6 +110,25 @@ func TestTurnTimeout_FailsAndFiresCallback(t *testing.T) {
 	require.Equal(t, turn.Failed, rec.State)
 }
 
+// syncBuffer is a concurrency-safe slog sink: the tailer writes from its own
+// goroutine while the test reads, so a plain bytes.Buffer would data-race.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
 func TestTailer_StartedOnCompleteWithTranscriptPath(t *testing.T) {
 	// Verify that after Complete() with a transcript path, the tailer emits
 	// agent_stream log events for lines in that file.
@@ -124,8 +143,8 @@ func TestTailer_StartedOnCompleteWithTranscriptPath(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	var buf bytes.Buffer
-	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	buf := &syncBuffer{}
+	log := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	store := turn.NewStore()
 	ids := []string{"turn-1"}
@@ -182,8 +201,8 @@ func TestTailer_DisabledWhenEnvFalse(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	var buf bytes.Buffer
-	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	buf := &syncBuffer{}
+	log := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	store := turn.NewStore()
 	ids := []string{"turn-1"}
