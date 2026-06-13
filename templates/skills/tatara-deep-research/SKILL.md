@@ -23,15 +23,24 @@ bot identity.
   newest stable Go; JSON slog + INFO business logging + /metrics.
 - Communication only via `tatara` MCP tools.
 
+The `tatara` tools auto-scope to your current task and project from the pod
+environment. Do NOT try to pass an environment variable as an argument
+(you cannot expand it) - omit the `task`/`project` args and the tool fills
+them in. The repo slug and project name you need are printed in your turn
+prompt; the memory `code_*`/`query` tools take an explicit `repo=<slug>`.
+
 ## Workflow
 
 Create a TodoWrite item per numbered step.
 
-1. **Orient on goals.** Read the on-disk `ROADMAP.md`, `MEMORY.md`, and
-   `CLAUDE.md` of the task's repo (the platform goal, the repo charter,
-   the hard rules). Then use the memory MCP tools for the wider picture:
-   `query` (mode global or hybrid) for "tatara platform goal" and "open
-   roadmap themes"; `describe` for an overview of the target repo.
+1. **Orient on goals.** The Project's repos are cloned under
+   `/workspace/<owner>/<repo>` (e.g. `/workspace/szymonrychu/tatara-operator`);
+   run `ls /workspace/*/` to list them. Your turn prompt names the target
+   repo. Read that repo's on-disk `ROADMAP.md`, `MEMORY.md`, and `CLAUDE.md`
+   (the platform goal, the repo charter, the hard rules). Then use the
+   memory MCP tools for the wider picture: `query` (mode global or hybrid)
+   for "tatara platform goal" and "open roadmap themes"; `describe` for an
+   overview of the target repo.
 
 2. **Map current state.** Use the code-graph tools to find where the
    system is fragile or under-optimized, repo-scoped where useful:

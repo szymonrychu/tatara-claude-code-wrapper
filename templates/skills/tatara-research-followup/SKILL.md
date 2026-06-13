@@ -19,24 +19,30 @@ server. You never use git or gh.
   new to add, post nothing and let the conversation idle.
 - One focused turn. Communication only via `tatara` MCP tools.
 
+The `tatara` tools auto-scope to your current task and project from the pod
+environment. Do NOT try to pass an environment variable as an argument
+(you cannot expand it) - just omit the `task`/`project` args and the tool
+fills them in. The few tools that require an id accept the names printed in
+your turn prompt.
+
 ## Workflow
 
 Create a TodoWrite item per numbered step.
 
-1. **Load context.** Call `task_get` (task=env `TATARA_TASK`) for the task
-   status and lifecycle state. Read the issue body and the full comment
-   thread (the turn prompt includes the thread). Extract: open questions,
-   maintainer asks, unresolved design decisions, and whether a human has
-   engaged.
+1. **Load context.** Your turn prompt already contains the issue title,
+   body, and the full conversation thread - read it. Extract: open
+   questions, maintainer asks, unresolved design decisions, and whether a
+   human has engaged. (For extra task status you may call `task_get`, but
+   the thread in the prompt is the primary source.)
 
 2. **Research the gaps.** Use the memory MCP tools (`query`, `describe`,
-   and the `code_*` family incl. `code_cross_repo`) plus the on-disk code
-   to answer the specific questions raised and to deepen any thin part of
-   the proposal. The pod has one repo on disk; use the graph for
-   cross-repo facts.
+   and the `code_*` family incl. `code_cross_repo`, passing `repo=<slug>`)
+   plus the on-disk code to answer the specific questions raised and to
+   deepen any thin part of the proposal. The pod has one repo on disk; use
+   the graph for cross-repo facts.
 
-3. **Respond in-thread** with the `comment` MCP tool (task=env
-   `TATARA_TASK`, body=...). Post focused comments, not one wall of text:
+3. **Respond in-thread** with the `comment` MCP tool (just `body=...`; the
+   task is resolved for you). Post focused comments, not one wall of text:
    - Answer each maintainer question with evidence (`file:line`, graph
      findings).
    - Refine the proposal into a concrete design: architecture,
