@@ -36,3 +36,23 @@ func TestDiscoverySkillsPresentAndValid(t *testing.T) {
 		}
 	}
 }
+
+func TestInstallSkills_CopiesDeployHarness(t *testing.T) {
+	src := t.TempDir()
+	// mimic the baked layout: <src>/tatara-deploy-harness/SKILL.md
+	skillDir := filepath.Join(src, "tatara-deploy-harness")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: tatara-deploy-harness\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ws := t.TempDir()
+	if err := installSkills(Params{Workspace: ws, SkillsSrc: []string{src}}); err != nil {
+		t.Fatalf("installSkills: %v", err)
+	}
+	got := filepath.Join(ws, ".claude", "skills", "tatara-deploy-harness", "SKILL.md")
+	if _, err := os.Stat(got); err != nil {
+		t.Fatalf("expected baked skill at %s: %v", got, err)
+	}
+}
