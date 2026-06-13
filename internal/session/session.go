@@ -31,6 +31,7 @@ type Config struct {
 	Workspace   string
 	Env         []string
 	Model       string
+	Repo        string // primary repository URL the pod is bound to ("" if none)
 	TurnTimeout time.Duration
 	BootTimeout time.Duration
 	SubmitDelay time.Duration // pause between the paste and the submit keystroke
@@ -410,7 +411,7 @@ func (mgr *Manager) fireDone(rec *turn.Record) {
 func (mgr *Manager) Snapshot() Snapshot {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
-	return Snapshot{State: mgr.state, TurnsCompleted: mgr.turnsCompleted, Model: mgr.cfg.Model, Repo: ""}
+	return Snapshot{State: mgr.state, TurnsCompleted: mgr.turnsCompleted, Model: mgr.cfg.Model, Repo: mgr.cfg.Repo}
 }
 
 func (mgr *Manager) Alive() bool {

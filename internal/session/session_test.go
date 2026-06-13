@@ -53,6 +53,32 @@ func newMgr(t *testing.T, fp *fakePTY) (*session.Manager, *turn.Store) {
 	return m, store
 }
 
+func TestSnapshot_ReportsConfiguredRepo(t *testing.T) {
+	store := turn.NewStore()
+	m := session.New(
+		session.Config{Model: "claude", Repo: "https://github.com/szymonrychu/tatara-claude-code-wrapper", SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return "turn-1" })
+
+	snap := m.Snapshot()
+	require.Equal(t, "https://github.com/szymonrychu/tatara-claude-code-wrapper", snap.Repo)
+	require.Equal(t, "claude", snap.Model)
+}
+
+func TestSnapshot_EmptyRepoWhenUnconfigured(t *testing.T) {
+	store := turn.NewStore()
+	m := session.New(
+		session.Config{SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return "turn-1" })
+
+	require.Equal(t, "", m.Snapshot().Repo)
+}
+
 func TestSubmit_WritesPasteAndSubmit_ThenBusy(t *testing.T) {
 	fp := &fakePTY{}
 	m, store := newMgr(t, fp)
