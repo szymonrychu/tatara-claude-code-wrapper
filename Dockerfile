@@ -3,7 +3,7 @@
 ARG GO_VERSION=1.25
 ARG NODE_VERSION=22
 ARG CLAUDE_CODE_VERSION=latest
-ARG TATARA_CLI_VERSION=0.7.0
+ARG TATARA_CLI_VERSION=c0e2835
 
 # Stage 1: build the Go binaries (cached independently of the claude layer).
 FROM golang:${GO_VERSION}-alpine AS go-build
@@ -26,7 +26,7 @@ FROM harbor.szymonrichert.pl/containers/tatara-cli:${TATARA_CLI_VERSION} AS tata
 # Stage 3: guard -- verify the baked cli still advertises the tools the wrapper relies on.
 # This stage runs `go test ./internal/bootstrap -run TestTataraMCP_AdvertisesScmProjectTools`
 # with /usr/local/bin/tatara from the tatara-cli stage on PATH.  The image build FAILS if
-# the pinned cli dropped propose_issue / review_verdict / pr_outcome / issue_outcome.
+# the pinned cli dropped propose_issue / review_verdict / pr_outcome / issue_outcome / comment.
 FROM golang:${GO_VERSION}-alpine AS test-guard
 RUN apk add --no-cache git ca-certificates
 COPY --from=tatara-cli /usr/local/bin/tatara /usr/local/bin/tatara
