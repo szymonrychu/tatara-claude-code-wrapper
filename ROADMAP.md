@@ -12,6 +12,7 @@ dialog navigation, Stop-hook result capture, helm chart, modular Dockerfile.
 - SHIPPED 2026-06-09 - SCM-projects MCP tools (propose_issue/review_verdict/pr_outcome) reach agents via the re-pinned baked tatara-cli 0.5.0; flow-through asserted by mcp_flowthrough_test.go.
 - SHIPPED 2026-06-11 - autonomous-cron: issue_outcome MCP tool flows through after cli bump 0.5.0 -> 0.6.0; guard extended; chart 0.1.9/appVersion 0.1.8.
 - SHIPPED 2026-06-11 - transcript streaming: Tailer+Redactor in internal/transcript; one agent_stream slog event per content block; ccw_stream_events_total counter; CCW_LOG_TRANSCRIPT=false disables; chart 0.1.13.
+- SHIPPED 2026-06-13 - PTY ring-buffer debug endpoint: `GET /v1/pty` returns the de-ANSI'd ring-buffer tail (`?bytes=N`, default 4096, capped at 64 KiB) for live boot/wedge troubleshooting, instead of only logging it on claude exit.
 
 ## v0.2 candidates
 
@@ -28,8 +29,6 @@ dialog navigation, Stop-hook result capture, helm chart, modular Dockerfile.
   per pod; external routing and pod lifecycle orchestration are out of scope.
 - **SSE live streaming** of in-progress turn output (currently result-only).
 - **Bedrock / Vertex auth** passthrough (currently `ANTHROPIC_API_KEY` only).
-- **PTY ring-buffer debug endpoint** (expose `tail` over the API for live
-  troubleshooting; currently only logged on claude exit).
 
 ## Known hardening (deferred from v0.1.0 code review, low impact)
 

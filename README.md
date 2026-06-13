@@ -36,6 +36,7 @@ ingress.
 | GET | `/v1/messages/{turnId}` | Full turn result `{state, finalText, resultJson?, usage, stopReason, error?}` (poll / missed-callback path). |
 | GET | `/v1/session` | `{state, turnsCompleted, model, repo}`. |
 | GET | `/v1/transcript` | Full JSONL session transcript (debug). |
+| GET | `/v1/pty` | De-ANSI'd tail of the PTY ring buffer for live boot/wedge troubleshooting; `?bytes=N` (default 4096, capped at 64 KiB) (debug). |
 | DELETE | `/v1/session` | Graceful shutdown, pod exits. |
 | GET | `/healthz` `/readyz` `/metrics` | Operator endpoints. |
 

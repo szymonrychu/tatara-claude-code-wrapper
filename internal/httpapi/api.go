@@ -22,6 +22,7 @@ type SessionController interface {
 	Complete(session.HookResult) error
 	Snapshot() session.Snapshot
 	TranscriptPath() string
+	Tail(n int) string
 	Alive() bool
 	Shutdown(context.Context) error
 }
@@ -80,6 +81,7 @@ func (a *API) mountV1(r chi.Router) {
 	r.Get("/v1/messages/{turnID}", a.getMessage)
 	r.Get("/v1/session", a.getSession)
 	r.Get("/v1/transcript", a.getTranscript)
+	r.Get("/v1/pty", a.getPTY)
 	r.Delete("/v1/session", a.deleteSession)
 }
 

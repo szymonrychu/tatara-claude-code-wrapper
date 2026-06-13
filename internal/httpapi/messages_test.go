@@ -21,12 +21,15 @@ type fakeCtl struct {
 	submitID  string
 	submitErr error
 	completed session.HookResult
+	tailOut   string
+	tailN     int
 }
 
 func (f *fakeCtl) Submit(text, cb string) (string, error) { return f.submitID, f.submitErr }
 func (f *fakeCtl) Complete(r session.HookResult) error    { f.completed = r; return nil }
 func (f *fakeCtl) Snapshot() session.Snapshot             { return session.Snapshot{State: session.Ready} }
 func (f *fakeCtl) TranscriptPath() string                 { return "" }
+func (f *fakeCtl) Tail(n int) string                      { f.tailN = n; return f.tailOut }
 func (f *fakeCtl) Alive() bool                            { return true }
 func (f *fakeCtl) Shutdown(context.Context) error         { return nil }
 
@@ -51,6 +54,33 @@ func TestPostMessage_409WhenBusy(t *testing.T) {
 	rec := httptest.NewRecorder()
 	api.TestRouter().ServeHTTP(rec, req)
 	require.Equal(t, http.StatusConflict, rec.Code)
+}
+
+func TestGetPTY(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+		wantN int
+	}{
+		{"default", "/v1/pty", 4096},
+		{"explicit bytes", "/v1/pty?bytes=128", 128},
+		{"clamped to max", "/v1/pty?bytes=999999", 64 * 1024},
+		{"non-numeric falls back", "/v1/pty?bytes=abc", 4096},
+		{"non-positive falls back", "/v1/pty?bytes=0", 4096},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctl := &fakeCtl{tailOut: "TUI output"}
+			api := newAPI(ctl, turn.NewStore())
+			req := httptest.NewRequest(http.MethodGet, tc.query, nil)
+			rec := httptest.NewRecorder()
+			api.TestRouter().ServeHTTP(rec, req)
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.Equal(t, "text/plain; charset=utf-8", rec.Header().Get("Content-Type"))
+			require.Equal(t, "TUI output", rec.Body.String())
+			require.Equal(t, tc.wantN, ctl.tailN)
+		})
+	}
 }
 
 func TestGetMessage_404Then200(t *testing.T) {

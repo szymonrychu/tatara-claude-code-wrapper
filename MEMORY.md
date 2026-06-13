@@ -1,5 +1,6 @@
 # MEMORY.md - tatara-claude-code-wrapper
 
+- 2026-06-13 - **PTY ring-buffer debug endpoint.** `GET /v1/pty` (OIDC-gated, like `/v1/transcript`) returns the de-ANSI'd ring-buffer tail as `text/plain`; `?bytes=N` clamps (default 4096, max 64 KiB = ring capacity, non-numeric/<=0 falls back to default). Exposed `ringBuffer.tail` via a new `Manager.Tail(n int) string`; added `Tail` to the `httpapi.SessionController` interface. Point-in-time only - SSE live streaming stays a separate ROADMAP item. Gives operators a live window into a boot/wedge that previously only surfaced in the on-exit debug log line.
 - 2026-06-11 (0.1.13) - **Transcript streaming.** New `internal/transcript` package: Tailer (JSONL follow, inode-change reopen, 200ms poll) + Redactor (longest-first, >=8 char values, env key pattern match). One slog INFO `action=agent_stream` event per content block (text/thinking/tool_use/tool_result/message_end/raw). Counter `ccw_stream_events_total{stream_type}`. Wired via `Manager.StartTailer(ctx)` called in app.go before `sess.Start`; tailer goroutine starts on first `Complete()` that supplies a transcript path. Disabled by `CCW_LOG_TRANSCRIPT=false`. Spec: docs/superpowers/specs/2026-06-11-wrapper-transcript-streaming-design.md.
 
 Cross-session decisions and hard-won findings. Newest first. One line each

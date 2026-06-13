@@ -425,6 +425,12 @@ func (mgr *Manager) TranscriptPath() string {
 	return mgr.transcriptPath
 }
 
+// Tail returns up to n trailing bytes of the PTY ring buffer, de-ANSI'd. It is
+// the live window into the interactive TUI for boot/wedge troubleshooting.
+func (mgr *Manager) Tail(n int) string {
+	return mgr.ring.tail(n)
+}
+
 func (mgr *Manager) Shutdown(ctx context.Context) error {
 	mgr.mu.Lock()
 	w, proc := mgr.w, mgr.proc
