@@ -45,12 +45,20 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		}
 	}
 
+	// Primary repo the pod is bound to: first entry in cross-repo mode
+	// (TATARA_REPOS), otherwise the single REPO_URL.
+	repo := cfg.RepoURL
+	if len(cfg.Repos) > 0 {
+		repo = cfg.Repos[0].URL
+	}
+
 	store := turn.NewStore()
 	sess := session.New(session.Config{
 		ClaudePath:  cfg.ClaudePath,
 		Workspace:   cfg.Workspace,
 		Env:         claudeEnv(cfg),
 		Model:       cfg.Model,
+		Repo:        repo,
 		TurnTimeout: time.Duration(cfg.TurnTimeoutSeconds) * time.Second,
 		BootTimeout: time.Duration(cfg.BootTimeoutSeconds) * time.Second,
 		SubmitSeq:   session.DefaultSubmitSeq,
