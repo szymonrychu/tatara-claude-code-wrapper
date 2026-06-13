@@ -12,6 +12,7 @@ dialog navigation, Stop-hook result capture, helm chart, modular Dockerfile.
 - SHIPPED 2026-06-09 - SCM-projects MCP tools (propose_issue/review_verdict/pr_outcome) reach agents via the re-pinned baked tatara-cli 0.5.0; flow-through asserted by mcp_flowthrough_test.go.
 - SHIPPED 2026-06-11 - autonomous-cron: issue_outcome MCP tool flows through after cli bump 0.5.0 -> 0.6.0; guard extended; chart 0.1.9/appVersion 0.1.8.
 - SHIPPED 2026-06-11 - transcript streaming: Tailer+Redactor in internal/transcript; one agent_stream slog event per content block; ccw_stream_events_total counter; CCW_LOG_TRANSCRIPT=false disables; chart 0.1.13.
+- SHIPPED 2026-06-13 - lifecycle notification params reach agents via re-pinned baked tatara-cli 0.6.0 -> 0.7.0 (change_summary gains mostProblematic, issue_outcome gains plan; cli also fixed change_summary's snake_case body keys to the operator's camelCase contract); chart 0.1.13 -> 0.1.14. mcp_flowthrough_test.go still passes unchanged (it asserts tool presence, not params; issue_outcome/pr_outcome remain). Pairs with tatara-operator 0.4.3 (issue#6).
 
 ## v0.2 candidates
 
