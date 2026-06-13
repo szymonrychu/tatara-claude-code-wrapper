@@ -51,6 +51,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		Workspace:   cfg.Workspace,
 		Env:         claudeEnv(cfg),
 		Model:       cfg.Model,
+		Repo:        cfg.RepoURL,
 		TurnTimeout: time.Duration(cfg.TurnTimeoutSeconds) * time.Second,
 		BootTimeout: time.Duration(cfg.BootTimeoutSeconds) * time.Second,
 		SubmitSeq:   session.DefaultSubmitSeq,

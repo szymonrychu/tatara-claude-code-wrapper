@@ -53,6 +53,19 @@ func newMgr(t *testing.T, fp *fakePTY) (*session.Manager, *turn.Store) {
 	return m, store
 }
 
+func TestSnapshot_ExposesConfiguredRepo(t *testing.T) {
+	store := turn.NewStore()
+	m := session.New(
+		session.Config{Repo: "https://github.com/szymonrychu/tatara-cli", Model: "claude-opus-4-8", SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		time.Now, func() string { return "t" })
+
+	snap := m.Snapshot()
+	require.Equal(t, "https://github.com/szymonrychu/tatara-cli", snap.Repo)
+	require.Equal(t, "claude-opus-4-8", snap.Model)
+}
+
 func TestSubmit_WritesPasteAndSubmit_ThenBusy(t *testing.T) {
 	fp := &fakePTY{}
 	m, store := newMgr(t, fp)
