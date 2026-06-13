@@ -63,6 +63,11 @@ skip work already done:
 Mark each comment you post with an HTML marker (`<!-- harness:S2 -->`) so the
 re-entry grep is exact.
 
+On a cold restart you will not remember `<branch>`. Recover it BEFORE any
+branch-keyed check: `gh pr list --repo szymonrychu/<repo> --state open --json
+headRefName -q '.[0].headRefName'` (or read it from your `<!-- harness:S3 -->`
+issue comment).
+
 ## Handoff checkpointing
 
 At every state boundary, if context is tight, REQUIRED SUB-SKILL: invoke
@@ -148,16 +153,15 @@ Work in the `tatara-helmfile` clone (`/workspace/szymonrychu/tatara-helmfile`).
 REQUIRED SUB-SKILL: superpowers:using-git-worktrees - branch off `tatara-helmfile`
 `main` for the bump.
 
-1. Bump the release to the version S6 produced:
-   - Image tag pin lives in `values/<release>/common.yaml` (e.g.
-     `values/tatara-operator/common.yaml` carries `image.tag`). To bump it,
-     REQUIRED SUB-SKILL: invoke `bump-container-usage` against the
-     `tatara-helmfile` clone (it rewrites image references).
-   - Chart version bumps: REQUIRED SUB-SKILL: invoke `bump-chart-usage`
-     against the `tatara-helmfile` clone (it updates the release's chart version
-     in `helmfile.yaml.gotmpl`).
-   - If a skill does not fit the exact field, edit the value directly (KISS) and
-     note why in the PR body.
+1. Bump the release to the version S6 produced. `tatara-helmfile` is a
+   flattened standalone repo: the image tag pin lives in
+   `values/<release>/common.yaml` (e.g. `values/tatara-operator/common.yaml`
+   carries `image.tag`), and the chart version lives in the release's block in
+   `helmfile.yaml.gotmpl`. Edit the value DIRECTLY (KISS) - that is the primary
+   path. `bump-container-usage` / `bump-chart-usage` are convenience wrappers
+   written for the infra-helmfile layout; use them ONLY if their path
+   assumptions match this repo, otherwise edit directly and note the new version
+   in the PR body.
 2. `gh pr create --repo szymonrychu/tatara-helmfile --base main --head <branch>
    --title "deploy: <release> <version>" --body "Delivers issue
    szymonrychu/<repo>#N"`.
@@ -179,8 +183,13 @@ REQUIRED SUB-SKILL: superpowers:using-git-worktrees - branch off `tatara-helmfil
 3. `gh run watch <id> --repo szymonrychu/tatara-helmfile --exit-status`.
 4. **On apply success:** GO TO S9.
 5. **On apply failure - ROLLBACK FIRST, then S3:**
-   a. In the `tatara-helmfile` clone on `main`: `git pull`, find the merge
-      commit: `git log --merges -1 --format=%H`.
+   a. Deepen history before reverting. The workspace clone is
+      `--depth 1 --single-branch` (bootstrap clones shallow), so the merge
+      commit's parents are NOT reachable and `git revert -m 1` would fail with
+      `could not parse object`. In the `tatara-helmfile` clone:
+      `git fetch --unshallow origin main 2>/dev/null || git fetch --depth=100 origin main`,
+      then `git checkout main && git pull --ff-only`. Now find the merge commit:
+      `git log --merges -1 --format=%H`.
    b. `git revert -m 1 --no-edit <merge-sha>` (revert the merge, keep main's
       first parent).
    c. Push the revert on a branch and open + merge a revert PR so the SAME
