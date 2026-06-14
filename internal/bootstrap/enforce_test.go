@@ -141,7 +141,7 @@ func TestCommitAndPush_SkipsCommitWhenClean(t *testing.T) {
 	}
 	require.NoError(t, bootstrap.CommitAndPush("/repo", "b", "m", git))
 	require.False(t, committed, "must not commit when nothing is staged")
-	require.True(t, pushed, "branch must still be pushed so write-back can open the PR")
+	require.False(t, pushed, "must not push on a clean tree (no empty branch created)")
 }
 
 func TestRender_SessionConfigStaysAtWorkspaceRootWithNamespaceClones(t *testing.T) {

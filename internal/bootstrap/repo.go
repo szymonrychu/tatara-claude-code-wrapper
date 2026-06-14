@@ -29,19 +29,19 @@ func configureGit(p Params, git GitRunner) error {
 	return nil
 }
 
-// CommitAndPush stages all changes, commits them when something is staged, and
-// pushes branch to origin. It enforces the branch+commit+push the agent is
-// asked to do but does not reliably perform, so the operator's write-back finds
-// the branch. Push runs even with nothing new so the remote branch exists.
+// CommitAndPush stages all changes, and when something is staged commits and
+// pushes the branch to origin. A clean tree is left untouched: nothing is
+// committed and nothing is pushed, so no empty remote branch is created.
 func CommitAndPush(dir, branch, message string, git GitRunner) error {
 	if err := git(dir, "add", "-A"); err != nil {
 		return err
 	}
-	// `diff --cached --quiet` exits non-zero when there are staged changes.
-	if git(dir, "diff", "--cached", "--quiet") != nil {
-		if err := git(dir, "commit", "-m", message); err != nil {
-			return err
-		}
+	// `diff --cached --quiet` exits zero (nil) when the tree is clean.
+	if git(dir, "diff", "--cached", "--quiet") == nil {
+		return nil
+	}
+	if err := git(dir, "commit", "-m", message); err != nil {
+		return err
 	}
 	return git(dir, "push", "-u", "origin", branch)
 }
