@@ -11,6 +11,7 @@ type Metrics struct {
 	WebhookDelivery   *prometheus.CounterVec
 	HookReceived      prometheus.Counter
 	StreamEventsTotal *prometheus.CounterVec
+	Interjections     prometheus.Counter
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -30,8 +31,10 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_hook_received_total", Help: "Stop-hook callbacks received."}),
 		StreamEventsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_stream_events_total", Help: "Transcript stream events emitted by stream_type."}, []string{"stream_type"}),
+		Interjections: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ccw_interjections_total", Help: "Mid-turn interjections injected into the live session."}),
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
-		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal)
+		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal, m.Interjections)
 	return m
 }
