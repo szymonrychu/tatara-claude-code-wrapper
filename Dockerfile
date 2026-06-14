@@ -59,10 +59,15 @@ ENV HOME=/home/agent HOME_DIR=/home/agent WORKSPACE=/workspace
 
 # mise: per-user tool-version manager for the agent (matches the infra builder
 # pattern). Installed as `agent` so it lands in /home/agent/.local; never as root.
-# Each cloned repo pins its tools in a root .mise.toml; the agent runs
-# `mise install` per repo (no global tools baked here -- the image stays generic).
+# Each cloned repo pins its build tools in a root .mise.toml; the agent runs
+# `mise install` per repo. Python is the one GLOBAL tool baked here: pre-commit
+# (and its python hooks: end-of-file-fixer, yamllint, etc.) is a Python app and
+# the node:bookworm-slim base has no python3 -- without a global python `mise use
+# -g python`, `pre-commit install` fails with `/usr/bin/env: python3: not found`.
 ARG MISE_VERSION
 ENV MISE_VERSION=${MISE_VERSION}
+# renovate: repository=python/cpython
+ARG PYTHON_VERSION=3.13
 RUN curl https://mise.run | sh \
     && /home/agent/.local/bin/mise --version \
     && /home/agent/.local/bin/mise settings set plugin_autoupdate_last_check_duration "0" \
@@ -71,6 +76,8 @@ RUN curl https://mise.run | sh \
     && /home/agent/.local/bin/mise settings set task_run_auto_install "true" \
     && /home/agent/.local/bin/mise settings set experimental "true" \
     && /home/agent/.local/bin/mise settings set trusted_config_paths "/workspace" \
+    && /home/agent/.local/bin/mise use -g "python@${PYTHON_VERSION}" \
+    && /home/agent/.local/bin/mise exec -- python3 --version \
     && printf '%s\n' \
         'export PATH="$HOME/.local/bin:$PATH"' \
         'eval "$("$HOME/.local/bin/mise" activate bash)"' \
