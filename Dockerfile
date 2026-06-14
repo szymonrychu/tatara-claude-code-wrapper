@@ -4,6 +4,8 @@ ARG GO_VERSION=1.25
 ARG NODE_VERSION=22
 ARG CLAUDE_CODE_VERSION=latest
 ARG TATARA_CLI_VERSION=1f7f631
+# renovate: repository=jdx/mise
+ARG MISE_VERSION=v2026.6.3
 
 # Stage 1: build the Go binaries (cached independently of the claude layer).
 FROM golang:${GO_VERSION}-alpine AS go-build
@@ -38,7 +40,7 @@ RUN go test ./internal/bootstrap -run TestTataraMCP_AdvertisesScmProjectTools -c
 
 # Stage 4: runtime -- node + claude in their own layer for trivial bumps.
 FROM node:${NODE_VERSION}-bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 # claude lives in its OWN layer: bumping CLAUDE_CODE_VERSION rebuilds only this.
 ARG CLAUDE_CODE_VERSION
@@ -51,8 +53,35 @@ COPY templates/ /templates/
 
 # non-root, writable HOME + workspace
 RUN useradd -m -u 10001 agent && mkdir -p /workspace && chown -R agent:agent /workspace /templates
+
 USER agent
 ENV HOME=/home/agent HOME_DIR=/home/agent WORKSPACE=/workspace
+
+# mise: per-user tool-version manager for the agent (matches the infra builder
+# pattern). Installed as `agent` so it lands in /home/agent/.local; never as root.
+# Each cloned repo pins its tools in a root .mise.toml; the agent runs
+# `mise install` per repo (no global tools baked here -- the image stays generic).
+ARG MISE_VERSION
+ENV MISE_VERSION=${MISE_VERSION}
+RUN curl https://mise.run | sh \
+    && /home/agent/.local/bin/mise --version \
+    && /home/agent/.local/bin/mise settings set plugin_autoupdate_last_check_duration "0" \
+    && /home/agent/.local/bin/mise settings set not_found_auto_install "true" \
+    && /home/agent/.local/bin/mise settings set auto_install "true" \
+    && /home/agent/.local/bin/mise settings set task_run_auto_install "true" \
+    && /home/agent/.local/bin/mise settings set experimental "true" \
+    && /home/agent/.local/bin/mise settings set trusted_config_paths "/workspace" \
+    && printf '%s\n' \
+        'export PATH="$HOME/.local/bin:$PATH"' \
+        'eval "$("$HOME/.local/bin/mise" activate bash)"' \
+        >> /home/agent/.bash_profile
+
+# mise binary + shims on PATH so the wrapper-spawned claude process and its
+# non-interactive Bash tool calls resolve mise-managed tools. BASH_ENV covers
+# login-style shells that need full `mise activate` (env + `mise exec`).
+ENV PATH="/home/agent/.local/bin:/home/agent/.local/share/mise/shims:${PATH}"
+ENV BASH_ENV="/home/agent/.bash_profile"
+
 WORKDIR /workspace
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/wrapper"]
