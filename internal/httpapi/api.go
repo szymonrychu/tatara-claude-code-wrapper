@@ -19,6 +19,7 @@ import (
 // SessionController is the slice of session.Manager the API needs.
 type SessionController interface {
 	Submit(text, callbackURL string) (string, error)
+	Interject(text string) error
 	Complete(session.HookResult) error
 	Snapshot() session.Snapshot
 	TranscriptPath() string
@@ -76,6 +77,7 @@ func (a *API) TestRouter() http.Handler {
 
 func (a *API) mountV1(r chi.Router) {
 	r.Post("/v1/messages", a.postMessage)
+	r.Post("/v1/interject", a.postInterject)
 	r.Get("/v1/messages", a.listMessages)
 	r.Get("/v1/messages/{turnID}", a.getMessage)
 	r.Get("/v1/session", a.getSession)

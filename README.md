@@ -32,6 +32,7 @@ ingress.
 | Method | Path | Description |
 |---|---|---|
 | POST | `/v1/messages` | Submit a turn `{text, callbackUrl?}` -> `202 {turnId}` (or `409` if a turn is in flight). |
+| POST | `/v1/interject` | Inject `{text}` into the turn in flight (mid-session input) -> `202` (or `409` if no turn is running, `400` if no text). |
 | GET | `/v1/messages` | Turn history `[{turnId, state, startedAt, completedAt}]`. |
 | GET | `/v1/messages/{turnId}` | Full turn result `{state, finalText, resultJson?, usage, stopReason, error?}` (poll / missed-callback path). |
 | GET | `/v1/session` | `{state, turnsCompleted, model, repo}`. |

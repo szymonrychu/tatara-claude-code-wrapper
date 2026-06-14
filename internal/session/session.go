@@ -26,6 +26,10 @@ type SubmitSequence struct{ PasteStart, PasteEnd, Submit string }
 
 var ErrBusy = errors.New("session busy")
 
+// ErrNotBusy is returned by Interject when there is no in-flight turn to
+// inject into: an interjection only makes sense while a turn is running.
+var ErrNotBusy = errors.New("no in-flight turn to interject")
+
 type Config struct {
 	ClaudePath  string
 	Workspace   string
@@ -369,6 +373,37 @@ func (mgr *Manager) Submit(text, callbackURL string) (string, error) {
 	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.failTimeout(id) })
 	mgr.log.Info("turn submitted", "turn_id", id)
 	return id, nil
+}
+
+// Interject types `text` into the live claude session while a turn is already
+// in flight, exactly as a user adding new context mid-session would. It reuses
+// the paste+submit keystroke sequence but creates NO turn record and does not
+// touch the current turn id, state, or timeout: the running turn absorbs the
+// input and still completes with a single Stop hook. Returns ErrNotBusy when no
+// turn is in flight (callers should Submit a fresh turn instead).
+func (mgr *Manager) Interject(text string) error {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	switch mgr.state {
+	case Dead:
+		return fmt.Errorf("session dead")
+	case Booting:
+		return fmt.Errorf("session not ready")
+	}
+	if mgr.current == "" {
+		return ErrNotBusy
+	}
+	seq := mgr.cfg.SubmitSeq
+	if _, err := mgr.w.Write([]byte(seq.PasteStart + text + seq.PasteEnd)); err != nil {
+		return fmt.Errorf("write pty paste: %w", err)
+	}
+	time.Sleep(mgr.cfg.SubmitDelay)
+	if _, err := mgr.w.Write([]byte(seq.Submit)); err != nil {
+		return fmt.Errorf("write pty submit: %w", err)
+	}
+	mgr.m.Interjections.Inc()
+	mgr.log.Info("turn interjection", "action", "interject", "turn_id", mgr.current)
+	return nil
 }
 
 // Complete is invoked from the internal endpoint when a Stop hook fires.

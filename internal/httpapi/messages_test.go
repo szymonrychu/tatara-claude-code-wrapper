@@ -18,12 +18,15 @@ import (
 )
 
 type fakeCtl struct {
-	submitID  string
-	submitErr error
-	completed session.HookResult
+	submitID     string
+	submitErr    error
+	interjectErr error
+	interjected  string
+	completed    session.HookResult
 }
 
 func (f *fakeCtl) Submit(text, cb string) (string, error) { return f.submitID, f.submitErr }
+func (f *fakeCtl) Interject(text string) error            { f.interjected = text; return f.interjectErr }
 func (f *fakeCtl) Complete(r session.HookResult) error    { f.completed = r; return nil }
 func (f *fakeCtl) Snapshot() session.Snapshot             { return session.Snapshot{State: session.Ready} }
 func (f *fakeCtl) TranscriptPath() string                 { return "" }
@@ -48,6 +51,32 @@ func TestPostMessage_202(t *testing.T) {
 func TestPostMessage_409WhenBusy(t *testing.T) {
 	api := newAPI(&fakeCtl{submitErr: session.ErrBusy}, turn.NewStore())
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{"text":"x"}`)))
+	rec := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusConflict, rec.Code)
+}
+
+func TestPostInterject_202(t *testing.T) {
+	ctl := &fakeCtl{}
+	api := newAPI(ctl, turn.NewStore())
+	req := httptest.NewRequest(http.MethodPost, "/v1/interject", bytes.NewReader([]byte(`{"text":"new info"}`)))
+	rec := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	require.Equal(t, "new info", ctl.interjected)
+}
+
+func TestPostInterject_400WhenEmpty(t *testing.T) {
+	api := newAPI(&fakeCtl{}, turn.NewStore())
+	req := httptest.NewRequest(http.MethodPost, "/v1/interject", bytes.NewReader([]byte(`{"text":""}`)))
+	rec := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestPostInterject_409WhenNotBusy(t *testing.T) {
+	api := newAPI(&fakeCtl{interjectErr: session.ErrNotBusy}, turn.NewStore())
+	req := httptest.NewRequest(http.MethodPost, "/v1/interject", bytes.NewReader([]byte(`{"text":"x"}`)))
 	rec := httptest.NewRecorder()
 	api.TestRouter().ServeHTTP(rec, req)
 	require.Equal(t, http.StatusConflict, rec.Code)

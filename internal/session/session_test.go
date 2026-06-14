@@ -99,6 +99,53 @@ func TestSubmit_WritesPasteAndSubmit_ThenBusy(t *testing.T) {
 	require.ErrorIs(t, err, session.ErrBusy)
 }
 
+// newMgrLongTimeout builds a READY manager whose turn timeout is long enough
+// that an in-flight turn stays Busy for the duration of a test.
+func newMgrLongTimeout(t *testing.T, fp *fakePTY) *session.Manager {
+	t.Helper()
+	store := turn.NewStore()
+	ids := make(chan string, 8)
+	ids <- "turn-1"
+	ids <- "turn-2"
+	m := session.New(session.Config{TurnTimeout: 10 * time.Second, SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return <-ids })
+	m.SetWriterForTest(fp)
+	return m
+}
+
+func TestInterject_WritesToLivePTYWhenBusy(t *testing.T) {
+	fp := &fakePTY{}
+	m := newMgrLongTimeout(t, fp)
+
+	_, err := m.Submit("first", "")
+	require.NoError(t, err)
+
+	require.NoError(t, m.Interject("more context"))
+
+	w := string(fp.bytes())
+	require.Contains(t, w, "\x1b[200~more context\x1b[201~") // bracketed paste of the interjection
+	// A second submit while busy must still be rejected: Interject must not have
+	// cleared the in-flight turn.
+	_, err = m.Submit("again", "")
+	require.ErrorIs(t, err, session.ErrBusy)
+}
+
+func TestInterject_NotBusyReturnsErr(t *testing.T) {
+	fp := &fakePTY{}
+	m := newMgrLongTimeout(t, fp)
+	require.ErrorIs(t, m.Interject("nothing running"), session.ErrNotBusy)
+}
+
+func TestInterject_DeadReturnsErr(t *testing.T) {
+	fp := &fakePTY{}
+	m := newMgrLongTimeout(t, fp)
+	require.NoError(t, m.Shutdown(context.Background()))
+	require.Error(t, m.Interject("x"))
+}
+
 func TestComplete_MarksDoneAndFiresCallback(t *testing.T) {
 	fp := &fakePTY{}
 	m, store := newMgr(t, fp)
