@@ -25,8 +25,12 @@ type config struct {
 	GitUserEmail        string
 	TaskBranch          string
 	DefaultCallbackURL  string
+	OperatorPushURL     string
+	RunID               string
+	PodName             string
 	TurnTimeoutSeconds  int
 	BootTimeoutSeconds  int
+	PushIntervalSeconds int
 	WebhookRetries      int
 	Workspace           string
 	HomeDir             string
@@ -54,6 +58,10 @@ func loadConfig(args []string) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	pi, err := envIntOr("PUSH_INTERVAL_SECONDS", 15)
+	if err != nil {
+		return config{}, err
+	}
 	cfg := config{
 		HTTPAddr:            envOr("HTTP_ADDR", ":8080"),
 		InternalAddr:        envOr("INTERNAL_ADDR", "127.0.0.1:8090"),
@@ -69,8 +77,12 @@ func loadConfig(args []string) (config, error) {
 		GitUserEmail:        envOr("GIT_USER_EMAIL", "tatara-agent@szymonrichert.pl"),
 		TaskBranch:          envOr("TASK_BRANCH", ""),
 		DefaultCallbackURL:  envOr("DEFAULT_CALLBACK_URL", ""),
+		OperatorPushURL:     envOr("OPERATOR_PUSH_URL", ""),
+		RunID:               envOr("RUN_ID", ""),
+		PodName:             envOr("POD_NAME", ""),
 		TurnTimeoutSeconds:  ti,
 		BootTimeoutSeconds:  bt,
+		PushIntervalSeconds: pi,
 		WebhookRetries:      wr,
 		Workspace:           envOr("WORKSPACE", "/workspace"),
 		HomeDir:             envOr("HOME_DIR", os.Getenv("HOME")),
