@@ -1,5 +1,7 @@
 # MEMORY.md - tatara-claude-code-wrapper
 
+- 2026-06-14: Merge-integrated `Manager.handleExit` (from #16/tp786) alongside the interject feature: `watch()` now delegates to `handleExit`, which on an unexpected claude exit fails any in-flight turn (reusing failTimeout's bookkeeping), sets state Dead, and fires OnTurnDone so the caller learns immediately instead of hanging until the 30-minute timeout. `SimulateExitForTest` drives the path in tests. Both features kept; unrelated-histories merge of `tatara/task-task-d9rlf` with `main`.
+
 - 2026-06-14: Added `POST /v1/interject` + `Manager.Interject(text)` for mid-session input: types paste+CR into the live claude turn (reusing the Submit keystroke sequence) WITHOUT creating a turn record or touching current/state/timer, so the running turn absorbs it and still completes with one Stop hook. `409`/`ErrNotBusy` when no turn is in flight. Counter `ccw_interjections_total`. Used by the operator to make issue/MR comments interrupt the agent nursing them (tatara-operator#25).
 
 - 2026-06-13: tatara-deploy-harness skill is SKILL-ONLY (no wrapper Go/chart change). TATARA_REPOS is operator-built in pod.go BuildPod from the Project's Repository list; tatara-helmfile reaches the workspace via its self-enroll Repository CR, cloned by bootstrap.Render. Issue number comes from kickoff prompt + TATARA_TASK/TATARA_PROJECT env; gh authed by GIT_TOKEN.
