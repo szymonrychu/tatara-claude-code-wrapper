@@ -70,8 +70,11 @@ Create a TodoWrite item per numbered step.
    - Body: Problem (what hurts, why it matters to the platform/repo goal);
      Evidence (`file:line` references and concrete graph findings from
      steps 1-2); Proposed approach (KISS, respecting the hard rules);
-     Scope boundary (what is in and explicitly out); Open questions for
-     the maintainer. Append the literal line `<!-- tatara-authored -->`.
+     Scope boundary (what is in and explicitly out); a SINGLE explicit
+     decision for the maintainer: "Approve to implement, or comment to
+     refine." Do NOT list open questions that invite back-and-forth - one
+     well-researched proposal gets one clear approval gate.
+     Append the literal line `<!-- tatara-authored -->`.
 
 6. **File it.** Call `propose_issue` with `title`, `body`, `kind`
    (`improvement` or `bug`), and `repo` (the repo slug; `project` defaults
