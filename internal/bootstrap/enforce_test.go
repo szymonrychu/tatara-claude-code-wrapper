@@ -103,8 +103,8 @@ func TestCommitAndPushAll_PushesEachRepoOnItsNamespaceDir(t *testing.T) {
 		s = append(s, strings.Join(c, " "))
 	}
 	all := strings.Join(s, "|")
-	require.Contains(t, all, "/ws/szymonrychu/tatara-cli push -u origin tatara/task-x")
-	require.Contains(t, all, "/ws/szymonrychu/infra/helmfile push -u origin tatara/task-x")
+	require.Contains(t, all, "/ws/szymonrychu/tatara-cli push --no-verify -u origin tatara/task-x")
+	require.Contains(t, all, "/ws/szymonrychu/infra/helmfile push --no-verify -u origin tatara/task-x")
 }
 
 func TestCommitAndPush_CommitsWhenDirtyThenPushes(t *testing.T) {
@@ -125,8 +125,8 @@ func TestCommitAndPush_CommitsWhenDirtyThenPushes(t *testing.T) {
 	}
 	joined := strings.Join(all, "|")
 	require.Contains(t, joined, "add -A")
-	require.Contains(t, joined, "commit -m agent work")
-	require.Contains(t, joined, "push -u origin tatara/task-abc")
+	require.Contains(t, joined, "commit --no-verify -m agent work")
+	require.Contains(t, joined, "push --no-verify -u origin tatara/task-abc")
 }
 
 func TestCommitAndPush_SkipsCommitWhenClean(t *testing.T) {

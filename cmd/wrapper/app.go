@@ -37,6 +37,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	if err := bootstrap.Render(buildBootstrapParams(cfg), gitRunner()); err != nil {
 		return nil, err
 	}
+	bootstrap.InstallHooks(cfg.Workspace, cfg.Repos, cfg.RepoURL, execRunnerDir(log))
 	if os.Getenv("TATARA_MEMORY_URL") != "" {
 		if _, lookErr := exec.LookPath("tatara"); lookErr == nil {
 			if err := bootstrap.RegisterTataraMCP(cfg.Workspace, execRunner(log)); err != nil {
@@ -197,6 +198,20 @@ func execRunner(log *slog.Logger) bootstrap.CmdRunner {
 			return fmt.Errorf("%s %v: %s: %w", name, args, string(out), err)
 		}
 		log.Info("mcp-config registered tatara server", "cmd", name, "args", args)
+		return nil
+	}
+}
+
+func execRunnerDir(log *slog.Logger) bootstrap.CmdRunnerDir {
+	return func(dir, name string, args ...string) error {
+		cmd := exec.Command(name, args...) //nolint:gosec // dir/name/args are controlled by bootstrap (mise/pre-commit), not user input
+		cmd.Dir = dir
+		cmd.Env = os.Environ()
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%s %v in %s: %s: %w", name, args, dir, string(out), err)
+		}
+		log.Info("hook install succeeded", "cmd", name, "args", args, "dir", dir)
 		return nil
 	}
 }

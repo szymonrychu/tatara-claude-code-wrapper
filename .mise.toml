@@ -5,6 +5,10 @@ go = "1.25.0"
 node = "22"
 golangci-lint = "2.12.2"
 helm = "4.2.1"
+pre-commit = "4.6.0"
+
+[hooks]
+postinstall = ["pre-commit install --hook-type pre-commit --hook-type pre-push || true"]
 
 [env]
 GOFLAGS = "-count=1"
