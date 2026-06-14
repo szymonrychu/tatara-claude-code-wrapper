@@ -180,17 +180,6 @@ func (s *scriptedGit) run(dir string, args ...string) error {
 	return nil
 }
 
-func argsContain(needle string) func([]string) bool {
-	return func(args []string) bool {
-		for _, a := range args {
-			if a == needle {
-				return true
-			}
-		}
-		return false
-	}
-}
-
 func argsContainAll(needles ...string) func([]string) bool {
 	return func(args []string) bool {
 		for _, n := range needles {
@@ -207,19 +196,6 @@ func argsContainAll(needles ...string) func([]string) bool {
 		}
 		return true
 	}
-}
-
-func callsContaining(calls [][]string, needle string) [][]string {
-	var out [][]string
-	for _, c := range calls {
-		for _, a := range c {
-			if a == needle {
-				out = append(out, c)
-				break
-			}
-		}
-	}
-	return out
 }
 
 func callsContainingAll(calls [][]string, needles ...string) [][]string {
