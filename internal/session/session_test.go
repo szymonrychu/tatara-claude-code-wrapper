@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -134,6 +135,45 @@ func TestTurnTimeout_FailsAndFiresCallback(t *testing.T) {
 	}
 	rec, _ := store.Get("turn-1")
 	require.Equal(t, turn.Failed, rec.State)
+}
+
+func TestClaudeExit_FailsInFlightTurnAndFiresCallback(t *testing.T) {
+	fp := &fakePTY{}
+	m, store := newMgr(t, fp) // TurnTimeout is 50ms
+
+	var mu sync.Mutex
+	calls := 0
+	done := make(chan *turn.Record, 1)
+	m.OnTurnDone = func(r *turn.Record) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		done <- r
+	}
+
+	_, err := m.Submit("hi", "https://cb/x")
+	require.NoError(t, err)
+
+	m.SimulateExitForTest(errors.New("signal: killed"))
+
+	select {
+	case r := <-done:
+		require.Equal(t, turn.Failed, r.State)
+		require.Equal(t, "https://cb/x", r.CallbackURL)
+	case <-time.After(time.Second):
+		t.Fatal("callback did not fire on claude exit")
+	}
+
+	rec, _ := store.Get("turn-1")
+	require.Equal(t, turn.Failed, rec.State)
+	require.False(t, m.Alive()) // state is Dead, so /readyz trips the pod restart
+
+	// The 50ms turn timer must not also fire: clearCurrentLocked dropped the
+	// in-flight id, so failTimeout no-ops. Callback fires exactly once.
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	require.Equal(t, 1, calls)
+	mu.Unlock()
 }
 
 // syncBuffer is a concurrency-safe slog sink: the tailer writes from its own
