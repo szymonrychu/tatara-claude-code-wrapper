@@ -34,6 +34,31 @@ type Params struct {
 // GitRunner runs a git subcommand in dir; injected for testability.
 type GitRunner func(dir string, args ...string) error
 
+// checkoutTaskBranch checks out taskBranch in dir. If the branch already
+// exists on the remote (ls-remote --exit-code returns nil), it resumes:
+// unshallows the clone (best-effort), fetches the remote branch, then checks
+// out with -B <branch> FETCH_HEAD so the agent has its prior commits and a
+// full history to rebase against. If the branch does not exist, it falls back
+// to the fresh-task path: plain "checkout -b <branch>".
+func checkoutTaskBranch(dir, taskBranch string, git GitRunner) error {
+	branchExists := git(dir, "ls-remote", "--exit-code", "--heads", "origin", taskBranch) == nil
+	if branchExists {
+		// Unshallow so the rebase against origin/<default> has a merge base. The
+		// clone is always --depth 1 (cloneRepo / the multi-repo clone above), so
+		// unshallow always applies and a failure here is real (network), not the
+		// benign "already complete" case -- propagate it rather than proceed with a
+		// shallow clone whose rebase would fail with no merge base.
+		if err := git(dir, "fetch", "--unshallow", "origin"); err != nil {
+			return fmt.Errorf("unshallow for resume of %s: %w", taskBranch, err)
+		}
+		if err := git(dir, "fetch", "origin", taskBranch); err != nil {
+			return fmt.Errorf("fetch remote task branch %s: %w", taskBranch, err)
+		}
+		return git(dir, "checkout", "-B", taskBranch, "FETCH_HEAD")
+	}
+	return git(dir, "checkout", "-b", taskBranch)
+}
+
 func Render(p Params, git GitRunner) error {
 	claudeHome := filepath.Join(p.HomeDir, ".claude")
 	if err := os.MkdirAll(claudeHome, 0o755); err != nil {
@@ -75,10 +100,12 @@ func Render(p Params, git GitRunner) error {
 				continue // non-primary clone failure: skip
 			}
 			if p.TaskBranch != "" {
-				if err := git(dest, "checkout", "-b", p.TaskBranch); err != nil {
-					if r.URL == p.RepoURL {
-						return err
-					}
+				// Surface checkout/resume failures for ALL repos (not just the
+				// primary): a secondary repo silently left on the wrong branch
+				// would make the agent commit the wrong state. Fail loud so the
+				// operator retries the run.
+				if err := checkoutTaskBranch(dest, p.TaskBranch, git); err != nil {
+					return fmt.Errorf("checkout task branch in %s: %w", r.Name, err)
 				}
 			}
 		}
@@ -90,7 +117,7 @@ func Render(p Params, git GitRunner) error {
 			return err
 		}
 		if p.TaskBranch != "" {
-			if err := git(p.Workspace, "checkout", "-b", p.TaskBranch); err != nil {
+			if err := checkoutTaskBranch(p.Workspace, p.TaskBranch, git); err != nil {
 				return err
 			}
 		}

@@ -45,9 +45,10 @@ func TestRender_ClonesEachRepoIntoNamespaceSubdirAndChecksOutBranch(t *testing.T
 	require.Contains(t, joined, destA)
 	require.Contains(t, joined, "https://gitlab.com/szymonrychu/infra/helmfile.git")
 	require.Contains(t, joined, destB)
-	// checkout the task branch inside each namespace dir
-	require.Contains(t, joined, destA+" checkout -b tatara/task-x")
-	require.Contains(t, joined, destB+" checkout -b tatara/task-x")
+	// The fake GitRunner returns nil for ls-remote, so the resume path is taken:
+	// fetch --unshallow, fetch origin <branch>, checkout -B <branch> FETCH_HEAD.
+	require.Contains(t, joined, destA+" checkout -B tatara/task-x FETCH_HEAD")
+	require.Contains(t, joined, destB+" checkout -B tatara/task-x FETCH_HEAD")
 	// parent dirs of the namespace destinations were created
 	require.DirExists(t, filepath.Join(ws, "szymonrychu"))
 	require.DirExists(t, filepath.Join(ws, "szymonrychu", "infra"))

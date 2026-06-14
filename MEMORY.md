@@ -1,5 +1,7 @@
 # MEMORY.md - tatara-claude-code-wrapper
 
+- 2026-06-14: mise toolchain added (.mise.toml + CI mise-action). `mise run test` -> `make test` -> `go test -race` needs CGO_ENABLED=1 (race detector) which needs gcc; CI jobs (lint/test/build/smoke) each install build-essential (includes gcc + make) via apt BEFORE jdx/mise-action@v2. mise does NOT provide gcc; system build-essential is always required for race-enabled tests. min_version="2026.6.3" pinned in .mise.toml.
+
 - 2026-06-14: Merge-integrated `Manager.handleExit` (from #16/tp786) alongside the interject feature: `watch()` now delegates to `handleExit`, which on an unexpected claude exit fails any in-flight turn (reusing failTimeout's bookkeeping), sets state Dead, and fires OnTurnDone so the caller learns immediately instead of hanging until the 30-minute timeout. `SimulateExitForTest` drives the path in tests. Both features kept; unrelated-histories merge of `tatara/task-task-d9rlf` with `main`.
 
 - 2026-06-14: Added `POST /v1/interject` + `Manager.Interject(text)` for mid-session input: types paste+CR into the live claude turn (reusing the Submit keystroke sequence) WITHOUT creating a turn record or touching current/state/timer, so the running turn absorbs it and still completes with one Stop hook. `409`/`ErrNotBusy` when no turn is in flight. Counter `ccw_interjections_total`. Used by the operator to make issue/MR comments interrupt the agent nursing them (tatara-operator#25).
