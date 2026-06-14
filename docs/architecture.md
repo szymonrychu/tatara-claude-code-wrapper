@@ -160,6 +160,7 @@ Public surface (`Router()`), all `/v1/*` require a valid Keycloak JWT
 | Method | Path | Notes |
 |---|---|---|
 | POST | `/v1/messages` | `{text, callbackUrl?}` -> `202 {turnId}` or `409` if busy / `400` if no text |
+| POST | `/v1/interject` | `{text}` injected into the in-flight turn -> `202`, `409` if no turn running, `400` if no text |
 | GET | `/v1/messages` | history: `[{turnId, state, startedAt, completedAt}]` |
 | GET | `/v1/messages/{turnId}` | full result; `404` if unknown |
 | GET | `/v1/session` | `{state, turnsCompleted, model, repo}` |
