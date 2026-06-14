@@ -187,6 +187,10 @@ func (mgr *Manager) SetWriterForTest(w ptyWriter) {
 	mgr.state = Ready
 }
 
+// SimulateExitForTest drives the unexpected-exit path as if the supervised
+// claude process had terminated with err. Test-only.
+func (mgr *Manager) SimulateExitForTest(err error) { mgr.handleExit(err) }
+
 // Start spawns claude, reads its PTY into the ring buffer, navigates the boot
 // dialogs, and marks READY once the TUI settles.
 func (mgr *Manager) Start(ctx context.Context) error {
@@ -289,17 +293,47 @@ func (mgr *Manager) writeRaw(s string) {
 }
 
 func (mgr *Manager) watch(proc *claudeProc) {
-	err := proc.cmd.Wait()
+	mgr.handleExit(proc.cmd.Wait())
+}
+
+// handleExit reacts to the supervised claude process terminating. On a graceful
+// shutdown it just records the state and logs. On an unexpected exit it fails
+// any in-flight turn (reusing failTimeout's bookkeeping) and fires OnTurnDone so
+// the caller learns immediately, rather than hanging until the 30-minute turn
+// timeout that the in-RAM store and timer never reach after the pod restarts.
+// The final state is Dead either way so /readyz still trips the restart; the
+// callback is dispatched first so it can escape before the pod goes away.
+func (mgr *Manager) handleExit(err error) {
 	mgr.mu.Lock()
-	stopping := mgr.stopping
-	mgr.state = Dead
-	mgr.mu.Unlock()
-	if stopping {
+	if mgr.stopping {
+		mgr.state = Dead
+		mgr.mu.Unlock()
 		mgr.log.Info("claude stopped (shutdown)")
 		return
 	}
+	id := mgr.current
+	var rec *turn.Record
+	var durMs int64
+	if id != "" {
+		if mgr.timer != nil {
+			mgr.timer.Stop()
+		}
+		now := mgr.now()
+		durMs = now.Sub(mgr.currentStarted).Milliseconds()
+		_ = mgr.store.Fail(id, "claude exited", now)
+		mgr.clearCurrentLocked() // sets state = Ready; overridden to Dead below
+		mgr.m.TurnsTotal.WithLabelValues("failed").Inc()
+		rec, _ = mgr.store.Get(id)
+	}
+	mgr.state = Dead
+	mgr.mu.Unlock()
+
 	mgr.m.ClaudeRestarts.Inc()
+	if id != "" {
+		mgr.log.Warn("turn failed: claude exited", "turn_id", id, "duration_ms", durMs)
+	}
 	mgr.log.Error("claude exited", "err", err, "pty_tail", mgr.ring.tail(800))
+	mgr.fireDone(rec)
 }
 
 func (mgr *Manager) Submit(text, callbackURL string) (string, error) {
