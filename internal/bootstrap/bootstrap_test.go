@@ -2,6 +2,7 @@ package bootstrap_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -155,6 +156,209 @@ func TestRender_MultiRepo_PrimaryEmptyURLReturnsError(t *testing.T) {
 	err := bootstrap.Render(p, fakeGit)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "cannot derive namespace path from URL")
+}
+
+// scriptedGit is a recording fake GitRunner. For each call it matches the
+// args against its scripts in order (first match wins) and returns the
+// scripted error. All calls are recorded in Calls regardless of the result.
+type scriptedGit struct {
+	// scripts is a list of (predicate, error) pairs evaluated in order.
+	scripts []struct {
+		match func(args []string) bool
+		err   error
+	}
+	Calls [][]string
+}
+
+func (s *scriptedGit) run(dir string, args ...string) error {
+	s.Calls = append(s.Calls, args)
+	for _, sc := range s.scripts {
+		if sc.match(args) {
+			return sc.err
+		}
+	}
+	return nil
+}
+
+func argsContain(needle string) func([]string) bool {
+	return func(args []string) bool {
+		for _, a := range args {
+			if a == needle {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func argsContainAll(needles ...string) func([]string) bool {
+	return func(args []string) bool {
+		for _, n := range needles {
+			found := false
+			for _, a := range args {
+				if a == n {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+func callsContaining(calls [][]string, needle string) [][]string {
+	var out [][]string
+	for _, c := range calls {
+		for _, a := range c {
+			if a == needle {
+				out = append(out, c)
+				break
+			}
+		}
+	}
+	return out
+}
+
+func callsContainingAll(calls [][]string, needles ...string) [][]string {
+	var out [][]string
+	for _, c := range calls {
+		match := true
+		for _, n := range needles {
+			found := false
+			for _, a := range c {
+				if a == n {
+					found = true
+					break
+				}
+			}
+			if !found {
+				match = false
+				break
+			}
+		}
+		if match {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// TestCheckoutTaskBranch_BranchExists_ResumesFromRemote asserts that when
+// ls-remote reports the task branch exists on origin, Render fetches
+// --unshallow, fetches the branch, and checks out using -B <branch> FETCH_HEAD
+// (resume path). It must NOT issue a plain "checkout -b <branch>".
+func TestCheckoutTaskBranch_BranchExists_ResumesFromRemote(t *testing.T) {
+	sg := &scriptedGit{}
+	taskBranch := "tatara/task-abc123"
+	// ls-remote --exit-code --heads origin <branch> -> nil means branch exists
+	sg.scripts = append(sg.scripts, struct {
+		match func([]string) bool
+		err   error
+	}{argsContainAll("ls-remote", "--exit-code"), nil})
+
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		RepoURL:        "https://github.com/x/y",
+		RepoBranch:     "main",
+		TaskBranch:     taskBranch,
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+	}
+	require.NoError(t, bootstrap.Render(p, sg.run))
+
+	// Must have called fetch --unshallow
+	unshallow := callsContainingAll(sg.Calls, "fetch", "--unshallow")
+	require.NotEmpty(t, unshallow, "expected fetch --unshallow to be called on resume path")
+
+	// Must have called fetch origin <taskBranch>
+	fetchBranch := callsContainingAll(sg.Calls, "fetch", "origin", taskBranch)
+	require.NotEmpty(t, fetchBranch, "expected fetch origin <taskBranch> to be called on resume path")
+
+	// Must have called checkout -B <taskBranch> FETCH_HEAD
+	checkoutResume := callsContainingAll(sg.Calls, "checkout", "-B", taskBranch, "FETCH_HEAD")
+	require.NotEmpty(t, checkoutResume, "expected checkout -B <branch> FETCH_HEAD to be called on resume path")
+
+	// Must NOT have called plain checkout -b <taskBranch> (fresh-branch path)
+	freshCheckout := callsContainingAll(sg.Calls, "checkout", "-b", taskBranch)
+	require.Empty(t, freshCheckout, "checkout -b must NOT be called when branch already exists on remote")
+}
+
+// TestCheckoutTaskBranch_BranchAbsent_FreshBranch asserts that when ls-remote
+// returns a non-nil error (branch not found), Render issues the plain
+// "checkout -b <branch>" and does NOT fetch --unshallow or fetch origin <branch>.
+func TestCheckoutTaskBranch_BranchAbsent_FreshBranch(t *testing.T) {
+	taskBranch := "tatara/task-newbranch"
+	sg := &scriptedGit{}
+	// ls-remote --exit-code -> non-nil error means branch does NOT exist
+	sg.scripts = append(sg.scripts, struct {
+		match func([]string) bool
+		err   error
+	}{argsContainAll("ls-remote", "--exit-code"), fmt.Errorf("exit status 2")})
+
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		RepoURL:        "https://github.com/x/y",
+		RepoBranch:     "main",
+		TaskBranch:     taskBranch,
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+	}
+	require.NoError(t, bootstrap.Render(p, sg.run))
+
+	// Must have called plain checkout -b <taskBranch>
+	freshCheckout := callsContainingAll(sg.Calls, "checkout", "-b", taskBranch)
+	require.NotEmpty(t, freshCheckout, "expected checkout -b <branch> on fresh-task path")
+
+	// Must NOT have called fetch --unshallow
+	unshallow := callsContainingAll(sg.Calls, "fetch", "--unshallow")
+	require.Empty(t, unshallow, "fetch --unshallow must NOT be called on fresh-task path")
+
+	// Must NOT have called fetch origin <taskBranch>
+	fetchBranch := callsContainingAll(sg.Calls, "fetch", "origin", taskBranch)
+	require.Empty(t, fetchBranch, "fetch origin <branch> must NOT be called on fresh-task path")
+}
+
+// TestCheckoutTaskBranch_UnshallowErrorTolerated asserts that if fetch
+// --unshallow returns an error (e.g. repo is already complete), Render
+// continues and still fetches the branch + checks out -B FETCH_HEAD.
+func TestCheckoutTaskBranch_UnshallowErrorTolerated(t *testing.T) {
+	taskBranch := "tatara/task-exists"
+	sg := &scriptedGit{}
+	// ls-remote -> nil (branch exists)
+	sg.scripts = append(sg.scripts, struct {
+		match func([]string) bool
+		err   error
+	}{argsContainAll("ls-remote", "--exit-code"), nil})
+	// fetch --unshallow -> error (already a complete repo)
+	sg.scripts = append(sg.scripts, struct {
+		match func([]string) bool
+		err   error
+	}{argsContainAll("fetch", "--unshallow"), fmt.Errorf("unshallow: already unshallow")})
+
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		RepoURL:        "https://github.com/x/y",
+		RepoBranch:     "main",
+		TaskBranch:     taskBranch,
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+	}
+	// Render must not return an error even though unshallow failed
+	require.NoError(t, bootstrap.Render(p, sg.run))
+
+	// fetch origin <taskBranch> must still be called
+	fetchBranch := callsContainingAll(sg.Calls, "fetch", "origin", taskBranch)
+	require.NotEmpty(t, fetchBranch, "fetch origin <branch> must be called even when unshallow fails")
+
+	// checkout -B <taskBranch> FETCH_HEAD must still be called
+	checkoutResume := callsContainingAll(sg.Calls, "checkout", "-B", taskBranch, "FETCH_HEAD")
+	require.NotEmpty(t, checkoutResume, "checkout -B FETCH_HEAD must be called even when unshallow fails")
 }
 
 func TestRender_ConfiguresGitCredentialsAndIdentityBeforeClone(t *testing.T) {
