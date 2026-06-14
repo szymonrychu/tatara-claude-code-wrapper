@@ -40,19 +40,7 @@ type Config struct {
 	BootTimeout time.Duration
 	SubmitDelay time.Duration // pause between the paste and the submit keystroke
 	SubmitSeq   SubmitSequence
-}
-
-// claudeArgs builds the interactive launch flags. Per the Task-1 spike we pass
-// NO permission flag: bypass is configured via settings.defaultMode
-// (bootstrap). The "Bypass Permissions" warning dialog still appears at boot
-// regardless and is accepted by bootWait. MCP comes from the cwd .mcp.json +
-// enableAllProjectMcpServers, so no --mcp-config flag either.
-func (c Config) claudeArgs() []string {
-	args := []string{}
-	if c.Model != "" {
-		args = append(args, "--model", c.Model)
-	}
-	return args
+	MaxRestarts int // crash-relaunch budget per session; default 3
 }
 
 // HookResult is the payload cc-stop-hook POSTs to the internal endpoint.
@@ -91,9 +79,11 @@ type Manager struct {
 
 	OnTurnDone func(*turn.Record)
 
+	spawn func(cfg Config, resume bool) (claudeProcess, error)
+
 	mu             sync.Mutex
 	w              ptyWriter
-	proc           *claudeProc
+	proc           claudeProcess
 	ring           *ringBuffer
 	stopping       bool
 	state          State
@@ -102,6 +92,7 @@ type Manager struct {
 	timer          *time.Timer
 	turnsCompleted int
 	transcriptPath string
+	restarts       int // consecutive crash-relaunches; reset on Complete
 
 	// tailer goroutine
 	tailer        *transcript.Tailer
@@ -117,7 +108,18 @@ func New(cfg Config, store *turn.Store, m *metrics.Metrics, log *slog.Logger, no
 	if cfg.SubmitDelay <= 0 {
 		cfg.SubmitDelay = 400 * time.Millisecond
 	}
-	return &Manager{cfg: cfg, store: store, m: m, log: log, now: now, newID: newID, state: Booting, ring: newRing()}
+	if cfg.MaxRestarts <= 0 {
+		cfg.MaxRestarts = 3
+	}
+	mgr := &Manager{cfg: cfg, store: store, m: m, log: log, now: now, newID: newID, state: Booting, ring: newRing()}
+	mgr.spawn = func(cfg Config, resume bool) (claudeProcess, error) {
+		p, err := spawnClaude(cfg, resume)
+		if err != nil {
+			return nil, err
+		}
+		return p, nil
+	}
+	return mgr
 }
 
 // StartTailer sets up the transcript tailer goroutine. It must be called before
@@ -195,10 +197,36 @@ func (mgr *Manager) SetWriterForTest(w ptyWriter) {
 // claude process had terminated with err. Test-only.
 func (mgr *Manager) SimulateExitForTest(err error) { mgr.handleExit(err) }
 
+// SetSpawnForTest replaces the spawn function used by Start/relaunch. Test-only.
+func (mgr *Manager) SetSpawnForTest(fn func(cfg Config, resume bool) (ClaudeProcess, error)) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	mgr.spawn = fn
+}
+
+// InjectProcForTest injects a fake process as the running proc, marks the
+// session Ready, and starts the watch goroutine. Test-only.
+func (mgr *Manager) InjectProcForTest(proc ClaudeProcess) {
+	mgr.mu.Lock()
+	mgr.proc, mgr.w = proc, proc
+	mgr.state = Ready
+	mgr.mu.Unlock()
+	go mgr.readPTY(proc)
+	go mgr.watch(proc)
+}
+
+// SetStoppingForTest marks the session as stopping (as if Shutdown was called).
+// Test-only.
+func (mgr *Manager) SetStoppingForTest() {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	mgr.stopping = true
+}
+
 // Start spawns claude, reads its PTY into the ring buffer, navigates the boot
 // dialogs, and marks READY once the TUI settles.
 func (mgr *Manager) Start(ctx context.Context) error {
-	proc, err := spawnClaude(mgr.cfg)
+	proc, err := mgr.spawn(mgr.cfg, false)
 	if err != nil {
 		return err
 	}
@@ -216,10 +244,10 @@ func (mgr *Manager) Start(ctx context.Context) error {
 // readPTY copies the interactive TUI's output into the ring buffer. It is the
 // only window into the session: bootWait reads it for dialogs and watch logs
 // its tail on exit.
-func (mgr *Manager) readPTY(proc *claudeProc) {
+func (mgr *Manager) readPTY(proc claudeProcess) {
 	buf := make([]byte, 4096)
 	for {
-		n, err := proc.ptmx.Read(buf)
+		n, err := proc.Read(buf)
 		if n > 0 {
 			_, _ = mgr.ring.Write(buf[:n])
 		}
@@ -296,17 +324,138 @@ func (mgr *Manager) writeRaw(s string) {
 	}
 }
 
-func (mgr *Manager) watch(proc *claudeProc) {
-	mgr.handleExit(proc.cmd.Wait())
+// watch blocks until the supervised claude process exits, then handles
+// recovery: relaunch with --continue (up to MaxRestarts consecutive crashes),
+// re-submit any in-flight turn, or fail the turn and mark Dead if budget
+// exhausted.
+func (mgr *Manager) watch(proc claudeProcess) {
+	err := proc.Wait()
+	mgr.mu.Lock()
+	if mgr.stopping {
+		mgr.state = Dead
+		mgr.mu.Unlock()
+		mgr.log.Info("claude stopped (shutdown)")
+		return
+	}
+	inFlight := mgr.current
+	mgr.restarts++
+	attempt := mgr.restarts
+	mgr.state = Dead // brief: Submit rejects until relaunch flips to Ready
+	mgr.mu.Unlock()
+
+	mgr.m.ClaudeRestarts.Inc()
+	mgr.log.Error("claude exited unexpectedly", "err", err, "in_flight_turn", inFlight,
+		"attempt", attempt, "max_restarts", mgr.cfg.MaxRestarts, "pty_tail", mgr.ring.tail(800))
+
+	if attempt > mgr.cfg.MaxRestarts {
+		mgr.log.Error("claude restart budget exhausted; operator will respawn",
+			"max_restarts", mgr.cfg.MaxRestarts)
+		if inFlight != "" {
+			mgr.failTurn(inFlight, fmt.Sprintf("claude died; restart budget (%d) exhausted", mgr.cfg.MaxRestarts))
+		}
+		return // state stays Dead
+	}
+
+	if rerr := mgr.relaunch(); rerr != nil {
+		mgr.mu.Lock()
+		mgr.state = Dead
+		mgr.mu.Unlock()
+		mgr.log.Error("claude relaunch failed; operator will respawn", "err", rerr)
+		if inFlight != "" {
+			mgr.failTurn(inFlight, fmt.Sprintf("claude relaunch failed: %v", rerr))
+		}
+		return
+	}
+	mgr.log.Info("claude relaunched after exit", "attempt", attempt, "resumed_turn", inFlight)
+	if inFlight != "" {
+		mgr.resumeTurn(inFlight)
+	}
 }
 
-// handleExit reacts to the supervised claude process terminating. On a graceful
-// shutdown it just records the state and logs. On an unexpected exit it fails
-// any in-flight turn (reusing failTimeout's bookkeeping) and fires OnTurnDone so
-// the caller learns immediately, rather than hanging until the 30-minute turn
-// timeout that the in-RAM store and timer never reach after the pod restarts.
-// The final state is Dead either way so /readyz still trips the restart; the
-// callback is dispatched first so it can escape before the pod goes away.
+// relaunch spawns a fresh claude (with --continue when a conversation exists),
+// rewires the PTY, restarts the reader+watcher, and waits for boot. The new
+// watch goroutine handles the next death (restarts persists across relaunches).
+func (mgr *Manager) relaunch() error {
+	proc, err := mgr.spawn(mgr.cfg, mgr.shouldResume())
+	if err != nil {
+		return err
+	}
+	mgr.mu.Lock()
+	mgr.proc, mgr.w = proc, proc
+	mgr.state = Booting
+	mgr.mu.Unlock()
+	go mgr.readPTY(proc)
+	go mgr.watch(proc)
+	mgr.bootWait() // flips Booting -> Ready
+	return nil
+}
+
+// shouldResume reports whether a prior conversation exists to --continue. A
+// death during the very first boot (no turn ever submitted, none completed)
+// relaunches fresh; anything later resumes.
+func (mgr *Manager) shouldResume() bool {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	return mgr.current != "" || mgr.turnsCompleted > 0 || mgr.transcriptPath != ""
+}
+
+// resumeTurn re-submits the in-flight turn's prompt to the restored session,
+// keeping the same turn id (so the eventual Stop hook still correlates) and the
+// original timeout timer. No-op if the turn was resolved during relaunch.
+func (mgr *Manager) resumeTurn(id string) {
+	mgr.mu.Lock()
+	if mgr.current != id || mgr.state != Ready {
+		mgr.mu.Unlock()
+		return
+	}
+	rec, ok := mgr.store.Get(id)
+	if !ok || mgr.w == nil {
+		mgr.mu.Unlock()
+		return
+	}
+	seq := mgr.cfg.SubmitSeq
+	if _, err := mgr.w.Write([]byte(seq.PasteStart + rec.Text + seq.PasteEnd)); err != nil {
+		mgr.mu.Unlock()
+		mgr.failTurn(id, fmt.Sprintf("resume write paste: %v", err))
+		return
+	}
+	time.Sleep(mgr.cfg.SubmitDelay)
+	if _, err := mgr.w.Write([]byte(seq.Submit)); err != nil {
+		mgr.mu.Unlock()
+		mgr.failTurn(id, fmt.Sprintf("resume write submit: %v", err))
+		return
+	}
+	mgr.state = Busy
+	mgr.mu.Unlock()
+	mgr.log.Info("resumed in-flight turn after relaunch", "turn_id", id)
+}
+
+// failTurn fails the in-flight turn immediately (used when claude died and the
+// restart budget is exhausted or a relaunch failed). Marks the session Dead so
+// the operator respawns a fresh pod. No-op if id is no longer current.
+func (mgr *Manager) failTurn(id, reason string) {
+	mgr.mu.Lock()
+	if mgr.current != id {
+		mgr.mu.Unlock()
+		return
+	}
+	if mgr.timer != nil {
+		mgr.timer.Stop()
+	}
+	now := mgr.now()
+	_ = mgr.store.Fail(id, reason, now)
+	mgr.clearCurrentLocked(Dead)
+	mgr.m.TurnsTotal.WithLabelValues("failed").Inc()
+	rec, _ := mgr.store.Get(id)
+	mgr.mu.Unlock()
+	mgr.log.Warn("turn failed", "turn_id", id, "reason", reason)
+	mgr.fireDone(rec)
+}
+
+// handleExit is kept for backwards compatibility with SimulateExitForTest.
+// It drives the old "fail immediately on exit" path used by unit tests that
+// test the legacy behaviour (prior to the restart loop). The new path goes
+// through watch(). The test helper calls this directly, bypassing watch().
 func (mgr *Manager) handleExit(err error) {
 	mgr.mu.Lock()
 	if mgr.stopping {
@@ -325,7 +474,7 @@ func (mgr *Manager) handleExit(err error) {
 		now := mgr.now()
 		durMs = now.Sub(mgr.currentStarted).Milliseconds()
 		_ = mgr.store.Fail(id, "claude exited", now)
-		mgr.clearCurrentLocked() // sets state = Ready; overridden to Dead below
+		mgr.clearCurrentLocked(Ready) // sets state = Ready; overridden to Dead below
 		mgr.m.TurnsTotal.WithLabelValues("failed").Inc()
 		rec, _ = mgr.store.Get(id)
 	}
@@ -434,7 +583,8 @@ func (mgr *Manager) Complete(r HookResult) error {
 		}
 	}
 	_ = mgr.store.Complete(id, r.FinalText, r.ResultJSON, r.Usage, r.StopReason, now)
-	mgr.clearCurrentLocked()
+	mgr.clearCurrentLocked(Ready)
+	mgr.restarts = 0 // a completed turn proves the session healthy
 	mgr.m.HookReceived.Inc()
 	mgr.m.TurnsTotal.WithLabelValues("complete").Inc()
 	mgr.m.TurnDuration.Observe(now.Sub(started).Seconds())
@@ -456,7 +606,7 @@ func (mgr *Manager) failTimeout(id string) {
 	}
 	now := mgr.now()
 	_ = mgr.store.Fail(id, "turn timed out", now)
-	mgr.clearCurrentLocked()
+	mgr.clearCurrentLocked(Ready)
 	mgr.m.TurnsTotal.WithLabelValues("failed").Inc()
 	rec, _ := mgr.store.Get(id)
 	mgr.mu.Unlock()
@@ -464,10 +614,10 @@ func (mgr *Manager) failTimeout(id string) {
 	mgr.fireDone(rec)
 }
 
-func (mgr *Manager) clearCurrentLocked() {
+func (mgr *Manager) clearCurrentLocked(next State) {
 	mgr.current = ""
 	mgr.turnsCompleted++
-	mgr.state = Ready
+	mgr.state = next
 	mgr.m.TurnInFlight.Set(0)
 }
 
@@ -497,7 +647,8 @@ func (mgr *Manager) TranscriptPath() string {
 
 func (mgr *Manager) Shutdown(ctx context.Context) error {
 	mgr.mu.Lock()
-	w, proc := mgr.w, mgr.proc
+	w := mgr.w
+	proc := mgr.proc
 	mgr.stopping = true
 	mgr.state = Dead
 	cancel := mgr.tailerCancel
@@ -510,7 +661,13 @@ func (mgr *Manager) Shutdown(ctx context.Context) error {
 		_ = w.Close()
 	}
 	if proc != nil {
-		_ = proc.cmd.Process.Kill()
+		// proc is claudeProcess; real *claudeProc has cmd.Process.Kill accessible
+		// only via the concrete type. We close the PTY (done above via w.Close())
+		// which causes the process to receive SIGHUP, completing the shutdown.
+		// For real procs we also send SIGKILL via the concrete type assertion.
+		if cp, ok := proc.(*claudeProc); ok {
+			_ = cp.cmd.Process.Kill()
+		}
 	}
 	return nil
 }
