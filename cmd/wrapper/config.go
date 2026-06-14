@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
 )
@@ -28,6 +29,11 @@ type config struct {
 	TurnTimeoutSeconds  int
 	BootTimeoutSeconds  int
 	WebhookRetries      int
+	MetricsPushURL      string
+	MetricsPushInterval int
+	MetricsJob          string
+	RunID               string
+	PodName             string
 	Workspace           string
 	HomeDir             string
 	ClaudePath          string
@@ -54,6 +60,10 @@ func loadConfig(args []string) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	mpi, err := envIntOr("METRICS_PUSH_INTERVAL_SECONDS", 15)
+	if err != nil {
+		return config{}, err
+	}
 	cfg := config{
 		HTTPAddr:            envOr("HTTP_ADDR", ":8080"),
 		InternalAddr:        envOr("INTERNAL_ADDR", "127.0.0.1:8090"),
@@ -72,6 +82,11 @@ func loadConfig(args []string) (config, error) {
 		TurnTimeoutSeconds:  ti,
 		BootTimeoutSeconds:  bt,
 		WebhookRetries:      wr,
+		MetricsPushURL:      envOr("METRICS_PUSH_URL", ""),
+		MetricsPushInterval: mpi,
+		MetricsJob:          envOr("METRICS_JOB", "tatara-claude-code-wrapper"),
+		RunID:               envOr("RUN_ID", genRunID()),
+		PodName:             envOr("POD_NAME", hostnameOr("unknown")),
 		Workspace:           envOr("WORKSPACE", "/workspace"),
 		HomeDir:             envOr("HOME_DIR", os.Getenv("HOME")),
 		ClaudePath:          envOr("CLAUDE_PATH", "claude"),
@@ -100,6 +115,19 @@ func loadConfig(args []string) (config, error) {
 func envOr(k, def string) string {
 	if v, ok := os.LookupEnv(k); ok {
 		return v
+	}
+	return def
+}
+
+// genRunID derives a unique id for this wrapper run when the operator did not
+// inject RUN_ID. One pod runs one wrapper, so the start timestamp is unique.
+func genRunID() string {
+	return "run-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+}
+
+func hostnameOr(def string) string {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
 	}
 	return def
 }

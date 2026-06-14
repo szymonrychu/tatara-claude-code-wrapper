@@ -27,6 +27,11 @@ defaultCallbackUrl: ""
 turnTimeoutSeconds: 1800
 bootTimeoutSeconds: 60
 webhookRetries: 3
+# Operator metrics push-receiver. Blank disables pushing; the deploying
+# helmfile sets the in-cluster operator URL. Series are keyed by run_id/pod/job.
+metricsPushUrl: ""
+metricsPushIntervalSeconds: 15
+metricsJob: "tatara-claude-code-wrapper"
 
 # file-shaped inputs rendered into the files ConfigMap, mounted at /etc/wrapper
 globalClaudeMd: ""

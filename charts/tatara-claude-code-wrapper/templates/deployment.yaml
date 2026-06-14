@@ -35,6 +35,12 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.anthropicApiKeySecret }}
                   key: {{ .Values.anthropicApiKeyKey }}
+            # pod label for pushed metrics (downward API); the wrapper falls
+            # back to its hostname when unset.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           ports:
             - name: http
               containerPort: 8080

@@ -80,6 +80,9 @@ DEFAULT_CALLBACK_URL: {{ .Values.defaultCallbackUrl | quote }}
 TURN_TIMEOUT_SECONDS: {{ .Values.turnTimeoutSeconds | quote }}
 BOOT_TIMEOUT_SECONDS: {{ .Values.bootTimeoutSeconds | quote }}
 WEBHOOK_RETRIES: {{ .Values.webhookRetries | quote }}
+METRICS_PUSH_URL: {{ .Values.metricsPushUrl | quote }}
+METRICS_PUSH_INTERVAL_SECONDS: {{ .Values.metricsPushIntervalSeconds | quote }}
+METRICS_JOB: {{ .Values.metricsJob | quote }}
 GLOBAL_CLAUDE_MD_PATH: "/etc/wrapper/global-claude.md"
 PROJECT_CLAUDE_MD_PATH: "/etc/wrapper/project-claude.md"
 MCP_BASE_PATH: "/etc/wrapper/mcp-base.json"

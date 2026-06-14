@@ -12,6 +12,7 @@ type Metrics struct {
 	HookReceived      prometheus.Counter
 	StreamEventsTotal *prometheus.CounterVec
 	Interjections     prometheus.Counter
+	MetricsPush       *prometheus.CounterVec
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -33,8 +34,10 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_stream_events_total", Help: "Transcript stream events emitted by stream_type."}, []string{"stream_type"}),
 		Interjections: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "ccw_interjections_total", Help: "Mid-turn interjections injected into the live session."}),
+		MetricsPush: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_metrics_push_total", Help: "Operator metrics pushes by op and result."}, []string{"op", "result"}),
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
-		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal, m.Interjections)
+		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal, m.Interjections, m.MetricsPush)
 	return m
 }

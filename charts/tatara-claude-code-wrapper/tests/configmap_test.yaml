@@ -26,6 +26,13 @@ tests:
           path: "data.GLOBAL_CLAUDE_MD_PATH"
       - exists:
           path: "data.ALLOWED_TOOLS_PATH"
+      - exists:
+          path: "data.METRICS_PUSH_URL"
+      - exists:
+          path: "data.METRICS_PUSH_INTERVAL_SECONDS"
+      - matchRegex:
+          path: "data.METRICS_JOB"
+          pattern: "tatara-claude-code-wrapper"
       - notExists:
           path: "data.allowedTools"
       - notExists:

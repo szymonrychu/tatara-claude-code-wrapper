@@ -15,6 +15,7 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/httpapi"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metricspush"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/obs"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
@@ -27,6 +28,7 @@ type app struct {
 	internal *http.Server
 	sess     *session.Manager
 	sender   *webhook.Sender
+	pusher   *metricspush.Pusher
 }
 
 func newApp(ctx context.Context, cfg config) (*app, error) {
@@ -103,11 +105,21 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		verifier = v
 	}
 
+	pusher := metricspush.New(metricspush.Config{
+		URL:      cfg.MetricsPushURL,
+		Interval: time.Duration(cfg.MetricsPushInterval) * time.Second,
+		RunID:    cfg.RunID,
+		Pod:      cfg.PodName,
+		Job:      cfg.MetricsJob,
+	}, reg, m, log)
+	pusher.Start(ctx)
+
 	api := httpapi.New(httpapi.Deps{Ctl: sess, Store: store, Verifier: verifier, Log: log, Registry: reg})
 	return &app{
 		log:      log,
 		sess:     sess,
 		sender:   sender,
+		pusher:   pusher,
 		pub:      &http.Server{Addr: cfg.HTTPAddr, Handler: api.Router(), ReadHeaderTimeout: 10 * time.Second},
 		internal: &http.Server{Addr: cfg.InternalAddr, Handler: api.InternalRouter(), ReadHeaderTimeout: 10 * time.Second},
 	}, nil
@@ -122,6 +134,11 @@ func (a *app) run() error {
 
 func (a *app) shutdown(ctx context.Context) error {
 	_ = a.sess.Shutdown(ctx)
+	// Final push + delete the run's series so the operator drops them
+	// immediately; best-effort and bounded, never blocks exit.
+	pushCtx, pushCancel := context.WithTimeout(ctx, 5*time.Second)
+	a.pusher.Shutdown(pushCtx)
+	pushCancel()
 	// Drain in-flight webhook deliveries within a bounded window so retries
 	// either complete or log a clean abort instead of being orphaned at exit.
 	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)

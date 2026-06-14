@@ -25,6 +25,16 @@ tests:
               secretKeyRef:
                 name: tatara-claude-code-wrapper
                 key: anthropic-api-key
+  - it: injects POD_NAME via downward API for pushed metrics
+    asserts:
+      - template: deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
   - it: defaults workspace to emptyDir
     asserts:
       - template: deployment.yaml
