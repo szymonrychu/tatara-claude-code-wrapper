@@ -237,7 +237,7 @@ func (mgr *Manager) Start(ctx context.Context) error {
 	go mgr.readPTY(proc)
 	go mgr.watch(proc)
 
-	mgr.bootWait()
+	mgr.bootWait(proc)
 	return nil
 }
 
@@ -263,7 +263,7 @@ func (mgr *Manager) readPTY(proc claudeProcess) {
 // keystroke lands on the dialog and exits claude. Sequence confirmed against
 // the real binary in docs/spike-findings.md. Uses real wall-clock (not the
 // injected clock) since it polls live output.
-func (mgr *Manager) bootWait() {
+func (mgr *Manager) bootWait(proc claudeProcess) {
 	const (
 		minBoot   = 4 * time.Second
 		idleReady = 1500 * time.Millisecond
@@ -275,7 +275,9 @@ func (mgr *Manager) bootWait() {
 	lastChange := start
 	acceptedBypass := false
 	for {
-		if mgr.isDead() {
+		// Bail if the session died or a newer relaunch superseded this proc, so
+		// a stale bootWait does not poll the shared ring for the full timeout.
+		if mgr.isDead() || !mgr.isActiveProc(proc) {
 			return
 		}
 		now := time.Now()
@@ -302,11 +304,17 @@ func (mgr *Manager) bootWait() {
 		time.Sleep(poll)
 	}
 	mgr.mu.Lock()
-	if mgr.state == Booting {
+	if mgr.state == Booting && mgr.proc == proc {
 		mgr.state = Ready
 	}
 	mgr.mu.Unlock()
 	mgr.log.Info("session ready", "boot_ms", time.Since(start).Milliseconds(), "accepted_bypass", acceptedBypass)
+}
+
+func (mgr *Manager) isActiveProc(proc claudeProcess) bool {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	return mgr.proc == proc
 }
 
 func (mgr *Manager) isDead() bool {
@@ -381,12 +389,18 @@ func (mgr *Manager) relaunch() error {
 		return err
 	}
 	mgr.mu.Lock()
+	old := mgr.proc
 	mgr.proc, mgr.w = proc, proc
 	mgr.state = Booting
 	mgr.mu.Unlock()
+	// Close the dead proc's PTY master so its fd does not leak across relaunches
+	// (cmd.Wait reaps the child, but the master stays open otherwise).
+	if old != nil {
+		_ = old.Close()
+	}
 	go mgr.readPTY(proc)
 	go mgr.watch(proc)
-	mgr.bootWait() // flips Booting -> Ready
+	mgr.bootWait(proc) // flips Booting -> Ready
 	return nil
 }
 
