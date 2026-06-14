@@ -15,8 +15,12 @@ server. You never use git or gh.
   approval comment may lead to implementation - you only discuss and
   refine. End the turn with `issue_outcome(discuss)`, never
   `issue_outcome(implement)` on an unapproved tatara-authored issue.
-- Silence over noise. If there is no human input and nothing genuinely
-  new to add, post nothing and let the conversation idle.
+- Silence over noise - HARD RULE. When no human has replied since the
+  last bot message, post NOTHING and call `issue_outcome(discuss)`
+  immediately (silent hold). Do not re-post a comment that only
+  re-requests approval or restates prior analysis. The operator suppresses
+  repeated bot comments when no human replied; the skill must match that
+  behavior.
 - One focused turn. Communication only via `tatara` MCP tools.
 
 The `tatara` tools auto-scope to your current task and project from the pod
@@ -55,7 +59,9 @@ Create a TodoWrite item per numbered step.
    explicitly ask the maintainer for the approval signal (an approval
    comment / the approval label). Do not approve it yourself.
 
-5. **Idle discipline.** If nothing new is warranted, do not comment.
+5. **Idle discipline.** Check the thread: has a human posted since the
+   last bot comment? If NO - go directly to step 6 without calling
+   `comment`. The silence-over-noise hard rule applies here.
 
 6. **Close the turn.** Call `issue_outcome` with action `discuss` (supply
    a one-line status as `comment`) to hold the issue in Conversation. Use
@@ -66,6 +72,9 @@ Create a TodoWrite item per numbered step.
 
 - Calling `issue_outcome(implement)` on a tatara-authored issue without a
   human approval comment.
+- Re-posting a comment that only re-requests approval or restates prior
+  analysis when no human has replied. This is a HARD violation of the
+  silence-over-noise rule.
 - Posting one giant comment instead of focused, answerable ones.
 - Commenting with no new research when the thread is waiting on the human.
 - Making code changes or opening PRs in this turn.
