@@ -323,10 +323,12 @@ func TestCheckoutTaskBranch_BranchAbsent_FreshBranch(t *testing.T) {
 	require.Empty(t, fetchBranch, "fetch origin <branch> must NOT be called on fresh-task path")
 }
 
-// TestCheckoutTaskBranch_UnshallowErrorTolerated asserts that if fetch
-// --unshallow returns an error (e.g. repo is already complete), Render
-// continues and still fetches the branch + checks out -B FETCH_HEAD.
-func TestCheckoutTaskBranch_UnshallowErrorTolerated(t *testing.T) {
+// TestCheckoutTaskBranch_UnshallowErrorPropagates asserts that a fetch
+// --unshallow failure aborts the resume (returns an error) rather than
+// proceeding with a shallow clone whose rebase would fail with no merge base.
+// The clone is always --depth 1, so an unshallow failure is a real (network)
+// error, never the benign "already complete" case.
+func TestCheckoutTaskBranch_UnshallowErrorPropagates(t *testing.T) {
 	taskBranch := "tatara/task-exists"
 	sg := &scriptedGit{}
 	// ls-remote -> nil (branch exists)
@@ -334,11 +336,11 @@ func TestCheckoutTaskBranch_UnshallowErrorTolerated(t *testing.T) {
 		match func([]string) bool
 		err   error
 	}{argsContainAll("ls-remote", "--exit-code"), nil})
-	// fetch --unshallow -> error (already a complete repo)
+	// fetch --unshallow -> error (genuine failure)
 	sg.scripts = append(sg.scripts, struct {
 		match func([]string) bool
 		err   error
-	}{argsContainAll("fetch", "--unshallow"), fmt.Errorf("unshallow: already unshallow")})
+	}{argsContainAll("fetch", "--unshallow"), fmt.Errorf("unshallow: network unreachable")})
 
 	p := bootstrap.Params{
 		HomeDir: t.TempDir(), Workspace: t.TempDir(),
@@ -349,16 +351,14 @@ func TestCheckoutTaskBranch_UnshallowErrorTolerated(t *testing.T) {
 		HookCommand:    "/usr/local/bin/cc-stop-hook",
 		PermissionMode: "bypassPermissions",
 	}
-	// Render must not return an error even though unshallow failed
-	require.NoError(t, bootstrap.Render(p, sg.run))
+	// Render must surface the unshallow failure, not swallow it.
+	err := bootstrap.Render(p, sg.run)
+	require.Error(t, err, "unshallow failure on the resume path must abort Render")
+	require.Contains(t, err.Error(), "unshallow")
 
-	// fetch origin <taskBranch> must still be called
-	fetchBranch := callsContainingAll(sg.Calls, "fetch", "origin", taskBranch)
-	require.NotEmpty(t, fetchBranch, "fetch origin <branch> must be called even when unshallow fails")
-
-	// checkout -B <taskBranch> FETCH_HEAD must still be called
-	checkoutResume := callsContainingAll(sg.Calls, "checkout", "-B", taskBranch, "FETCH_HEAD")
-	require.NotEmpty(t, checkoutResume, "checkout -B FETCH_HEAD must be called even when unshallow fails")
+	// Must NOT have proceeded to fetch the branch or checkout once unshallow failed.
+	require.Empty(t, callsContainingAll(sg.Calls, "checkout", "-B", taskBranch, "FETCH_HEAD"),
+		"must not checkout the resumed branch after an unshallow failure")
 }
 
 func TestRender_ConfiguresGitCredentialsAndIdentityBeforeClone(t *testing.T) {
