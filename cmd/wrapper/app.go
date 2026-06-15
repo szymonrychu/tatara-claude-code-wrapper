@@ -16,6 +16,7 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/httpapi"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/obs"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/pushclient"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/webhook"
@@ -27,6 +28,7 @@ type app struct {
 	internal *http.Server
 	sess     *session.Manager
 	sender   *webhook.Sender
+	pusher   *pushclient.Pusher
 }
 
 func newApp(ctx context.Context, cfg config) (*app, error) {
@@ -105,16 +107,29 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	}
 
 	api := httpapi.New(httpapi.Deps{Ctl: sess, Store: store, Verifier: verifier, Log: log, Registry: reg})
+
+	// Push-metrics client: this Pod is too short-lived to be reliably scraped,
+	// so it pushes its /metrics to the operator's push-receiver. A no-op unless
+	// the operator wired OPERATOR_PUSH_URL + RUN_ID.
+	pusher := pushclient.New(pushclient.Config{
+		URL:      cfg.OperatorPushURL,
+		RunID:    cfg.RunID,
+		Pod:      cfg.PodName,
+		Interval: time.Duration(cfg.PushIntervalSeconds) * time.Second,
+	}, reg, log)
+
 	return &app{
 		log:      log,
 		sess:     sess,
 		sender:   sender,
+		pusher:   pusher,
 		pub:      &http.Server{Addr: cfg.HTTPAddr, Handler: api.Router(), ReadHeaderTimeout: 10 * time.Second},
 		internal: &http.Server{Addr: cfg.InternalAddr, Handler: api.InternalRouter(), ReadHeaderTimeout: 10 * time.Second},
 	}, nil
 }
 
 func (a *app) run() error {
+	a.pusher.Start()
 	errCh := make(chan error, 2)
 	go func() { errCh <- a.internal.ListenAndServe() }()
 	go func() { errCh <- a.pub.ListenAndServe() }()
@@ -122,6 +137,9 @@ func (a *app) run() error {
 }
 
 func (a *app) shutdown(ctx context.Context) error {
+	// Stop pushing and remove this run's series before the rest tears down, so
+	// the operator drops them immediately rather than waiting for the TTL.
+	a.pusher.Shutdown(ctx)
 	_ = a.sess.Shutdown(ctx)
 	// Drain in-flight webhook deliveries within a bounded window so retries
 	// either complete or log a clean abort instead of being orphaned at exit.
