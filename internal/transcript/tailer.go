@@ -199,6 +199,10 @@ func (t *Tailer) processLine(raw []byte) {
 		return
 	}
 
+	// Capture turnID once per line so all branches share the same value and
+	// the session mutex is taken at most once per poll cycle.
+	turnID := t.turnID()
+
 	var entry transcriptEntry
 	if err := json.Unmarshal(raw, &entry); err != nil {
 		// Malformed line - emit raw event, never drop
@@ -207,7 +211,7 @@ func (t *Tailer) processLine(raw []byte) {
 			"stream_type", "raw",
 			"raw_line", t.redactor.Scrub(string(raw)),
 			"parse_error", err.Error(),
-			"turn_id", t.turnID(),
+			"turn_id", turnID,
 		)
 		t.incCounter("raw")
 		return
@@ -224,14 +228,13 @@ func (t *Tailer) processLine(raw []byte) {
 			"session_id", entry.SessionID,
 			"transcript_uuid", entry.UUID,
 			"ts", entry.Timestamp,
-			"turn_id", t.turnID(),
+			"turn_id", turnID,
 		)
 		t.incCounter(metricType)
 		return
 	}
 
 	msg := entry.Message
-	turnID := t.turnID()
 
 	// Emit one event per content block
 	for _, rawBlock := range msg.Content {
@@ -265,9 +268,20 @@ func (t *Tailer) processLine(raw []byte) {
 			)
 			t.incCounter("text")
 		case "thinking":
-			thinking := block.Thinking
-			if thinking == "" {
-				thinking = block.Text
+			if block.Thinking == "" {
+				// Empty Thinking field is an unexpected shape - emit raw so it is
+				// visible rather than silently coerced via the dead text fallback.
+				t.log.Info("agent stream",
+					"action", "agent_stream",
+					"stream_type", "raw",
+					"session_id", entry.SessionID,
+					"transcript_uuid", entry.UUID,
+					"ts", entry.Timestamp,
+					"turn_id", turnID,
+					"raw_line", t.redactor.Scrub(string(rawBlock)),
+				)
+				t.incCounter("raw")
+				continue
 			}
 			t.log.Info("agent stream",
 				"action", "agent_stream",
@@ -276,7 +290,7 @@ func (t *Tailer) processLine(raw []byte) {
 				"transcript_uuid", entry.UUID,
 				"ts", entry.Timestamp,
 				"turn_id", turnID,
-				"text", t.redactor.Scrub(thinking),
+				"text", t.redactor.Scrub(block.Thinking),
 			)
 			t.incCounter("thinking")
 		case "tool_use":

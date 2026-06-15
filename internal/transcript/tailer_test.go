@@ -513,6 +513,97 @@ func TestTailer_MessageEndEvent(t *testing.T) {
 	}
 }
 
+// TestTailer_ThinkingFallbackRemovedEmitsRaw verifies that a thinking block
+// with an empty Thinking field (and a non-empty Text field) is emitted as a
+// raw event rather than silently falling back to the Text field. The fallback
+// is dead code for a shape that never occurs and masks unexpected content.
+func TestTailer_ThinkingFallbackRemovedEmitsRaw(t *testing.T) {
+	// Craft a thinking block where thinking="" and text="some text" (invalid shape).
+	line := `{"type":"assistant","uuid":"uuid-think-bad","sessionId":"sess-1","timestamp":"2026-06-11T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","text":"fallback text","thinking":""}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}}`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	writeTranscriptLine(t, path, line)
+
+	h := newCaptureHandler()
+	log := slog.New(h)
+	tailer := NewTailer(log, NewRedactor(nil), func() string { return "" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	recs := waitForRecords(t, h, 1, 2*time.Second)
+	cancel()
+	<-done
+
+	stream := filterAgentStream(recs)
+	// Must NOT emit a thinking event with text="fallback text" (the dead fallback).
+	// Must emit a raw event so the unexpected shape is visible.
+	for _, r := range stream {
+		if r["stream_type"] == "thinking" {
+			t.Errorf("unexpected thinking event with text=%v; want raw event for empty-Thinking block", r["text"])
+		}
+	}
+	var hasRaw bool
+	for _, r := range stream {
+		if r["stream_type"] == "raw" {
+			hasRaw = true
+			break
+		}
+	}
+	if !hasRaw {
+		t.Fatalf("expected raw event for empty-Thinking block, got: %v", stream)
+	}
+}
+
+// TestTailer_TurnIDCapturedOnce verifies that processLine calls turnID() at
+// most once, even for malformed and non-message paths. We do this by counting
+// invocations; if it's called more than once for a single line that would be
+// unnecessary mutex churn.
+func TestTailer_TurnIDCapturedOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	// Write a malformed line AND a non-message line AND a message line.
+	writeTranscriptLine(t, path, "not valid json {{{")
+	writeTranscriptLine(t, path, `{"type":"system","uuid":"u2","sessionId":"s1","timestamp":"2026-06-15T00:00:00.000Z"}`)
+	writeTranscriptLine(t, path, makeToolUseLine())
+
+	var callCount int
+	var mu sync.Mutex
+	turnFn := func() string {
+		mu.Lock()
+		callCount++
+		mu.Unlock()
+		return "turn-x"
+	}
+
+	h := newCaptureHandler()
+	log := slog.New(h)
+	tailer := NewTailer(log, NewRedactor(nil), turnFn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	// 3 lines: malformed(1 event) + system(1 event) + tool_use line (tool_use + message_end = 2 events)
+	waitForRecords(t, h, 4, 2*time.Second)
+	cancel()
+	<-done
+
+	mu.Lock()
+	got := callCount
+	mu.Unlock()
+
+	// 3 lines processed -> at most 3 turnID calls (one per line).
+	if got > 3 {
+		t.Errorf("turnID called %d times for 3 lines, want <= 3 (once per line)", got)
+	}
+}
+
 func TestTailer_RedactorAppliedToText(t *testing.T) {
 	// Craft a line where the text field contains a secret
 	secretVal := "supersecrettoken9999"
