@@ -9,7 +9,7 @@ import (
 
 func TestDiscoverySkillsPresentAndValid(t *testing.T) {
 	root := "../../templates/skills"
-	for _, name := range []string{"tatara-deep-research", "tatara-research-followup"} {
+	for _, name := range []string{"tatara-deep-research", "tatara-research-followup", "tatara-repo-health"} {
 		path := filepath.Join(root, name, "SKILL.md")
 		b, err := os.ReadFile(path)
 		if err != nil {
