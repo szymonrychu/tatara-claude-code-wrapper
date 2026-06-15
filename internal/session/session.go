@@ -145,7 +145,7 @@ func (mgr *Manager) StartTailer(ctx context.Context) {
 	redactor := transcript.NewRedactor(secretsFromEnv())
 	tailer := transcript.NewTailer(mgr.log, redactor, mgr.currentTurnID)
 	tailer.WithCounter(mgr.m.StreamEventsTotal)
-	tailerCtx, cancel := context.WithCancel(ctx)
+	tailerCtx, cancel := context.WithCancel(ctx) //nolint:gosec // cancel is stored in mgr.tailerCancel and invoked by Shutdown/path-change restart
 	mgr.mu.Lock()
 	mgr.tailer = tailer
 	mgr.tailerParent = ctx
@@ -685,7 +685,7 @@ func (mgr *Manager) Complete(r HookResult) error {
 				mgr.log.Warn("transcript path changed, restarting tailer",
 					"old_path", prevPath, "new_path", r.TranscriptPath)
 				mgr.tailerCancel()
-				newCtx, newCancel := context.WithCancel(mgr.tailerParent)
+				newCtx, newCancel := context.WithCancel(mgr.tailerParent) //nolint:gosec // newCancel is stored in mgr.tailerCancel and invoked by Shutdown/next path-change restart
 				mgr.tailerCtx = newCtx
 				mgr.tailerCancel = newCancel
 				path := mgr.transcriptPath

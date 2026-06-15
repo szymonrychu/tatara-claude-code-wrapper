@@ -42,7 +42,7 @@ func New(cfg Config, m *metrics.Metrics, log *slog.Logger) *Sender {
 	if cfg.Backoff <= 0 {
 		cfg.Backoff = time.Second
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // cancel is stored in s.cancel and invoked by Shutdown
 	return &Sender{cfg: cfg, client: &http.Client{Timeout: 30 * time.Second}, m: m, log: log, ctx: ctx, cancel: cancel}
 }
 
