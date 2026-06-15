@@ -1,18 +1,25 @@
 ---
 name: tatara-deep-research
-description: Use on an autonomous platform-research turn (the brainstorm task kind) to discover ONE high-leverage improvement for the tatara platform and open a discovery-phase issue via the propose_issue MCP tool. Researches deeply across the whole platform using the tatara-memory knowledge/code graph plus the on-disk repo, scores leverage against platform and per-repo goals, and files a single well-formed issue that stays in discovery (never self-implemented).
+description: Use on an autonomous platform-research turn (the brainstorm task kind) to discover ONE high-leverage improvement for the tatara platform. Researches deeply across the whole platform using the tatara-memory knowledge/code graph plus the on-disk repo, scores leverage, dedups against open issues, then takes exactly one action: open a discovery-phase issue via propose_issue when the idea is novel and standalone, or add a substantive design comment via comment_on_issue when the idea connects to / is a sub-aspect of an existing open issue. Never self-implemented.
 ---
 
 # tatara deep research
 
-Discover and propose ONE high-leverage improvement issue per run. All
-input and output go through the `tatara` MCP server. You never use git or
-gh; you never open an issue yourself - `propose_issue` does that under the
-bot identity.
+Discover ONE high-leverage improvement per run, then take exactly one
+action: `propose_issue` (novel, standalone) or `comment_on_issue` (the
+idea belongs on an existing open issue). All input and output go through
+the `tatara` MCP server. You never use git or gh; you never open or comment
+on an issue yourself - `propose_issue` / `comment_on_issue` do that under
+the bot identity.
 
 ## Hard constraints
 
-- ONE issue per run. The brainstorm task completes after a single proposal.
+- ONE action per run: EITHER one `propose_issue` (novel, standalone idea)
+  OR one `comment_on_issue` (your idea duplicates, extends, or is a
+  sub-aspect of an existing open issue). The brainstorm task completes after
+  that single action. If nothing is genuinely novel AND nothing on an open
+  issue is worth a substantive addition, finish with no action - honest
+  no-yield beats a low-value proposal or an empty comment.
 - Stay in discovery. Do NOT request implementation. Embed the literal
   marker `<!-- tatara-authored -->` in the issue body and never set a
   trigger label - the operator holds tatara-authored ideas in
@@ -59,10 +66,19 @@ Create a TodoWrite item per numbered step.
    work before the memory retrieval-quality eval harness exists. Pick the
    single highest-leverage, well-scoped item.
 
-4. **Dedup.** Call `task_list` and review the repo's open issues/tasks to
-   avoid duplicating an existing proposal or the operator's own brainstorm
-   output. If a similar idea is already open, pick the next-best candidate
-   instead.
+4. **Dedup, then decide propose-vs-comment.** Call `task_list` and review
+   the repo's open issues/tasks (and any open issues listed in your turn
+   prompt) before acting:
+   - **Duplicate** of an already-open issue -> do NOT open a new one. Either
+     pick the next-best novel candidate, or, if you have a concrete addition,
+     comment on it (next bullet).
+   - **Connecting / sub-aspect / extends** an existing open issue (it belongs
+     there, not as its own issue) -> call `comment_on_issue` with a
+     substantive design note that advances that issue (`repo` = the slug,
+     `number` = the issue number, `body` = the note). This ENDS the run -
+     skip steps 5-6.
+   - **Genuinely novel and standalone** -> proceed to compose a new proposal
+     (step 5).
 
 5. **Compose ONE proposal.** Write:
    - Title: imperative, specific (e.g. "Add per-item ingest timeout to the
@@ -76,14 +92,17 @@ Create a TodoWrite item per numbered step.
      well-researched proposal gets one clear approval gate.
      Append the literal line `<!-- tatara-authored -->`.
 
-6. **File it.** Call `propose_issue` with `title`, `body`, `kind`
+6. **File it** (novel path only; a connecting idea already ended at step 4
+   via `comment_on_issue`). Call `propose_issue` with `title`, `body`, `kind`
    (`improvement` or `bug`), and `repo` (the repo slug; `project` defaults
    from env). Do not set any trigger/approval label. Then stop - the
    brainstorm task is complete.
 
 ## Anti-patterns
 
-- Proposing more than one issue in a run.
+- Proposing more than one issue (or more than one action) in a run.
+- Discarding a connecting idea instead of adding it as a `comment_on_issue`
+  on the existing issue it belongs to (opening a near-duplicate is worse).
 - Proposing vague "improve X" issues with no `file:line` evidence.
 - Requesting implementation / setting a trigger label (breaks discovery).
 - Proposing memory ranking work before the eval-harness gate.
