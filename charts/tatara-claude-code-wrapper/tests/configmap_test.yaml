@@ -32,3 +32,8 @@ tests:
           path: "data.extraMcpServers"
       - notExists:
           path: "data.baseMcp"
+  - it: oidcIssuer defaults to empty string (cluster-agnostic)
+    asserts:
+      - equal:
+          path: data.OIDC_ISSUER
+          value: ""

@@ -7,7 +7,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 CLAUDE_CODE_VERSION ?= latest
-TATARA_CLI_VERSION ?= 0.7.0
+TATARA_CLI_VERSION ?= ad2a2db
 IMAGE_REF := $(REGISTRY)/$(IMAGE_NAME):$(VERSION)
 MODPATH := github.com/szymonrychu/tatara-claude-code-wrapper
 

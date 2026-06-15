@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"io"
 	"net/http"
 	"os"
 )
@@ -15,13 +16,14 @@ func (a *API) getTranscript(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "no transcript yet", http.StatusNotFound)
 		return
 	}
-	b, err := os.ReadFile(p)
+	f, err := os.Open(p)
 	if err != nil {
 		http.Error(w, "transcript unavailable", http.StatusNotFound)
 		return
 	}
+	defer func() { _ = f.Close() }()
 	w.Header().Set("Content-Type", "application/x-ndjson")
-	_, _ = w.Write(b)
+	_, _ = io.Copy(w, f)
 }
 
 func (a *API) deleteSession(w http.ResponseWriter, r *http.Request) {

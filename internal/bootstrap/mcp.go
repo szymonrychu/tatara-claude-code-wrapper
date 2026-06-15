@@ -50,7 +50,7 @@ func mergeMCP(p Params) error {
 	if err != nil {
 		return fmt.Errorf("marshal mcp: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(p.Workspace, ".mcp.json"), out, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(p.Workspace, ".mcp.json"), out, 0o644); err != nil {
 		return fmt.Errorf("write .mcp.json: %w", err)
 	}
 	return nil

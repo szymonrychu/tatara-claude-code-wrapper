@@ -86,7 +86,7 @@ func TestTataraMCP_AdvertisesScmProjectTools(t *testing.T) {
 	send(rpcReq{JSONRPC: "2.0", ID: 2, Method: "tools/list"})
 
 	names := collectToolNames(t, stdout)
-	for _, want := range []string{"propose_issue", "review_verdict", "pr_outcome", "issue_outcome", "comment"} {
+	for _, want := range []string{"propose_issue", "review_verdict", "pr_outcome", "issue_outcome", "comment", "decline_implementation"} {
 		require.Containsf(t, names, want, "tatara mcp must advertise %q; got %v", want, names)
 	}
 }

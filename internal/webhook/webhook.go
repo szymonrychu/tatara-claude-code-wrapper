@@ -15,6 +15,10 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
 )
 
+// maxBackoff caps exponential backoff growth to prevent int64 overflow and
+// bound the worst-case retry rate regardless of the configured Retries value.
+const maxBackoff = 60 * time.Second
+
 type Config struct {
 	Retries int
 	Backoff time.Duration
@@ -29,29 +33,43 @@ type Sender struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	mu     sync.Mutex
+	closed bool
 }
 
 func New(cfg Config, m *metrics.Metrics, log *slog.Logger) *Sender {
 	if cfg.Backoff <= 0 {
 		cfg.Backoff = time.Second
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // cancel is stored in s.cancel and invoked by Shutdown
 	return &Sender{cfg: cfg, client: &http.Client{Timeout: 30 * time.Second}, m: m, log: log, ctx: ctx, cancel: cancel}
 }
 
 // Deliver posts the record to url asynchronously, retrying with exponential
 // backoff. A blank url is a no-op (poll-only callers). Delivery runs under the
 // sender's own context and is tracked so Shutdown can drain or abort it.
+// Calls received after Shutdown has begun are silently dropped so that wg.Add
+// cannot race with wg.Wait.
 func (s *Sender) Deliver(url string, rec *turn.Record) {
 	if url == "" {
 		return
 	}
-	body, err := json.Marshal(rec)
-	if err != nil {
-		s.log.Error("webhook: marshal", "err", err, "turn_id", rec.ID)
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		s.log.Warn("webhook: deliver after shutdown, dropping", "turn_id", rec.ID, "url", url)
 		return
 	}
 	s.wg.Add(1)
+	s.mu.Unlock()
+
+	body, err := json.Marshal(rec)
+	if err != nil {
+		s.wg.Done()
+		s.log.Error("webhook: marshal", "err", err, "turn_id", rec.ID)
+		return
+	}
 	go func() {
 		defer s.wg.Done()
 		s.deliver(s.ctx, url, rec.ID, body)
@@ -62,7 +80,12 @@ func (s *Sender) Deliver(url string, rec *turn.Record) {
 // finish their retries cleanly until ctx's deadline; if that bounded drain
 // window elapses first, it cancels in-flight retries (which log a clean abort
 // and record a "dropped" outcome) and joins the goroutines before returning.
+// After Shutdown returns, subsequent Deliver calls are silently dropped.
 func (s *Sender) Shutdown(ctx context.Context) {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+
 	done := make(chan struct{})
 	go func() { s.wg.Wait(); close(done) }()
 	select {
@@ -87,6 +110,9 @@ func (s *Sender) deliver(ctx context.Context, url, turnID string, body []byte) {
 			case <-time.After(backoff):
 			}
 			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 			continue
 		}
 		s.m.WebhookDelivery.WithLabelValues("ok").Inc()

@@ -75,3 +75,32 @@ tests:
       - template: deployment.yaml
         exists:
           path: "spec.template.spec.volumes[?(@.name=='workspace')].persistentVolumeClaim"
+  - it: container has cpu and memory requests set
+    asserts:
+      - template: deployment.yaml
+        exists:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+      - template: deployment.yaml
+        exists:
+          path: spec.template.spec.containers[0].resources.requests.memory
+  - it: container has a memory limit set
+    asserts:
+      - template: deployment.yaml
+        exists:
+          path: spec.template.spec.containers[0].resources.limits.memory
+  - it: pod security context sets runAsNonRoot
+    asserts:
+      - template: deployment.yaml
+        equal:
+          path: spec.template.spec.securityContext.runAsNonRoot
+          value: true
+  - it: container security context drops all capabilities and disables privilege escalation
+    asserts:
+      - template: deployment.yaml
+        equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+      - template: deployment.yaml
+        contains:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          content: ALL

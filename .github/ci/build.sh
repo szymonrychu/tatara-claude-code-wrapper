@@ -13,6 +13,10 @@ BUILDKITD_ADDR="tcp://buildkitd.arc-runners:1234"
 SHORT_SHA="${GITHUB_SHA:0:7}"
 VERSION="$(git describe --tags --always --dirty)"
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# TATARA_CLI_VERSION pins the cli SHA baked into the image; keep in sync with
+# Dockerfile ARG default and Makefile default.  Use the short SHA published by
+# tatara-cli CI (both SHORT_SHA and VERSION tags are pushed on every main merge).
+TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-ad2a2db}"
 DEST="harbor.szymonrichert.pl/containers/${REPO}"
 
 : "${GITHUB_TOKEN:?GITHUB_TOKEN required}"
@@ -41,6 +45,7 @@ buildctl --addr "$BUILDKITD_ADDR" build \
   --opt build-arg:VERSION="${VERSION}" \
   --opt build-arg:COMMIT="${SHORT_SHA}" \
   --opt build-arg:DATE="${BUILD_DATE}" \
+  --opt build-arg:TATARA_CLI_VERSION="${TATARA_CLI_VERSION}" \
   --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN \
   --output "type=image,\"name=${DEST}:${SHORT_SHA},${DEST}:${VERSION}\",push=true"
 

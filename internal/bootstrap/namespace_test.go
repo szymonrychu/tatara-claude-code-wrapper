@@ -18,6 +18,15 @@ func TestNamespacePath(t *testing.T) {
 		{"https with userinfo", "https://x-access-token:tok@github.com/szymonrychu/tatara-cli.git", "szymonrychu/tatara-cli"},
 		{"trailing slash", "https://github.com/szymonrychu/tatara-cli/", "szymonrychu/tatara-cli"},
 		{"http scheme", "http://example.com/owner/repo.git", "owner/repo"},
+		// finding 10: malformed URLs with no owner segment must return ""
+		// so callers (Render, CommitAndPushAll) treat them as invalid and skip/error.
+		// host-only URL: after stripping scheme + host, nothing remains.
+		{"host only", "https://github.com/", ""},
+		// empty URL
+		{"empty url", "", ""},
+		// URL with host that has no dot/colon (treated as owner, not host),
+		// giving owner/repo -> valid two-segment path.
+		{"host no dot", "https://host/repo.git", "host/repo"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

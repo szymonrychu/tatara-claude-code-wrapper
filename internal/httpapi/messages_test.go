@@ -5,8 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,18 +22,19 @@ import (
 )
 
 type fakeCtl struct {
-	submitID     string
-	submitErr    error
-	interjectErr error
-	interjected  string
-	completed    session.HookResult
+	submitID       string
+	submitErr      error
+	interjectErr   error
+	interjected    string
+	completed      session.HookResult
+	transcriptPath string
 }
 
 func (f *fakeCtl) Submit(text, cb string) (string, error) { return f.submitID, f.submitErr }
 func (f *fakeCtl) Interject(text string) error            { f.interjected = text; return f.interjectErr }
 func (f *fakeCtl) Complete(r session.HookResult) error    { f.completed = r; return nil }
 func (f *fakeCtl) Snapshot() session.Snapshot             { return session.Snapshot{State: session.Ready} }
-func (f *fakeCtl) TranscriptPath() string                 { return "" }
+func (f *fakeCtl) TranscriptPath() string                 { return f.transcriptPath }
 func (f *fakeCtl) Alive() bool                            { return true }
 func (f *fakeCtl) Shutdown(context.Context) error         { return nil }
 
@@ -101,3 +106,88 @@ func TestGetMessage_404Then200(t *testing.T) {
 func timeZero() time.Time { return time.Unix(0, 0) }
 
 var _ = errors.New // keep errors import if unused after edits
+
+// newAPIWithLog builds an API that writes structured logs to logBuf.
+func newAPIWithLog(ctl httpapi.SessionController, store *turn.Store, logBuf io.Writer) *httpapi.API {
+	log := slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	return httpapi.New(httpapi.Deps{Ctl: ctl, Store: store, Log: log})
+}
+
+// TestRouter_EmitsRequestHandledLog verifies the logging middleware writes a
+// "request handled" JSON log line with method, route, status, duration_ms
+// for every request (findings 4+5).
+func TestRouter_EmitsRequestHandledLog(t *testing.T) {
+	var logBuf bytes.Buffer
+	api := newAPIWithLog(&fakeCtl{submitID: "turn-x"}, turn.NewStore(), &logBuf)
+
+	body, _ := json.Marshal(map[string]string{"text": "hello", "callbackUrl": ""})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	// Use Router() - the real public router with middleware
+	api.Router().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+
+	data := logBuf.String()
+	lines := strings.Split(strings.TrimRight(data, "\n"), "\n")
+	found := false
+	for _, ln := range lines {
+		var m map[string]any
+		if json.Unmarshal([]byte(ln), &m) == nil && m["msg"] == "request handled" {
+			require.Equal(t, "POST", m["method"])
+			require.NotNil(t, m["route"])
+			require.NotNil(t, m["status"])
+			require.NotNil(t, m["duration_ms"])
+			found = true
+		}
+	}
+	require.True(t, found, "expected 'request handled' log line from Router middleware")
+}
+
+// TestGetTranscript_Streams verifies that GET /v1/transcript streams the file
+// without loading it all into memory at once (finding 3). Correctness check:
+// response body equals file contents and Content-Type is application/x-ndjson.
+func TestGetTranscript_Streams(t *testing.T) {
+	// Write a small JSONL file to a temp path.
+	f, err := os.CreateTemp(t.TempDir(), "transcript-*.jsonl")
+	require.NoError(t, err)
+	content := `{"type":"user","text":"hello"}` + "\n" + `{"type":"assistant","text":"world"}` + "\n"
+	_, err = io.WriteString(f, content)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	ctl := &fakeCtl{transcriptPath: f.Name()}
+	api := newAPI(ctl, turn.NewStore())
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/transcript", nil)
+	rec := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "application/x-ndjson", rec.Header().Get("Content-Type"))
+	require.Equal(t, content, rec.Body.String())
+}
+
+// TestInternalRouter_EmitsRequestHandledLog verifies access-log middleware on
+// the internal router (finding 5).
+func TestInternalRouter_EmitsRequestHandledLog(t *testing.T) {
+	var logBuf bytes.Buffer
+	ctl := &fakeCtl{}
+	api := newAPIWithLog(ctl, turn.NewStore(), &logBuf)
+
+	body, _ := json.Marshal(session.HookResult{FinalText: "ok", StopReason: "end_turn"})
+	req := httptest.NewRequest(http.MethodPost, "/internal/turn-complete", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	api.InternalRouter().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+
+	data := logBuf.String()
+	lines := strings.Split(strings.TrimRight(data, "\n"), "\n")
+	found := false
+	for _, ln := range lines {
+		var m map[string]any
+		if json.Unmarshal([]byte(ln), &m) == nil && m["msg"] == "request handled" {
+			found = true
+		}
+	}
+	require.True(t, found, "expected 'request handled' log line from InternalRouter middleware")
+}

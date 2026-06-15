@@ -203,13 +203,17 @@ func TestWatch_MidTurnDeath_RelaunchesAndResumes(t *testing.T) {
 		"spawn not called for relaunch")
 	require.True(t, st.resume(), "relaunch must use resume=true (--continue)")
 
-	// The second proc should receive the re-submitted turn text
+	// The second proc should receive the resume nudge (a plain submit keystroke).
+	// resumeTurn does NOT re-paste the original prompt because --continue already
+	// restored the full conversation (finding 1 fix: avoids double-submit).
 	require.Eventually(t, func() bool {
 		return len(second.bytes()) > 0
-	}, 2*time.Second, 10*time.Millisecond, "second proc did not receive re-submitted turn")
+	}, 2*time.Second, 10*time.Millisecond, "second proc did not receive resume nudge")
 
 	w := string(second.bytes())
-	assert.Contains(t, w, "hello world", "turn text must be re-submitted to new proc")
+	assert.Contains(t, w, session.DefaultSubmitSeq.Submit, "resume nudge (submit keystroke) must be sent to new proc")
+	// The full prompt must NOT be re-pasted (would cause double-submit via --continue).
+	assert.NotContains(t, w, "hello world", "full prompt must not be re-pasted on --continue resume")
 
 	// Turn must still be the same id, not failed
 	rec2, ok2 := store.Get("turn-1")

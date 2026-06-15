@@ -1,16 +1,21 @@
 package bootstrap_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 )
 
 func TestRender_WritesClaudeMdSettingsSkillsAndMergesMCP(t *testing.T) {
@@ -336,6 +341,130 @@ func TestCheckoutTaskBranch_UnshallowErrorPropagates(t *testing.T) {
 	require.Empty(t, callsContainingAll(sg.Calls, "checkout", "-B", taskBranch, "FETCH_HEAD"),
 		"must not checkout the resumed branch after an unshallow failure")
 }
+
+// TestRender_LogsAndMetricsOnClone verifies that Render emits an INFO log for
+// each successful clone/resume and increments BootstrapCloneTotal{result=ok}
+// and observes BootstrapDuration (finding 2).
+func TestRender_LogsAndMetricsOnClone(t *testing.T) {
+	var logBuf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		RepoURL:        "https://github.com/x/y",
+		RepoBranch:     "main",
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+		Log:            log,
+		M:              m,
+	}
+	// fake git: ls-remote exits non-nil (fresh task, no task branch)
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { return nil }))
+
+	// Check INFO log emitted
+	data := logBuf.Bytes()
+	lines := bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
+	found := false
+	for _, ln := range lines {
+		var rec map[string]any
+		if json.Unmarshal(ln, &rec) == nil && rec["msg"] == "repo cloned" {
+			require.Equal(t, "clone", rec["action"])
+			require.NotNil(t, rec["duration_ms"])
+			found = true
+		}
+	}
+	require.True(t, found, "no 'repo cloned' INFO log from Render")
+
+	// Check metrics
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	byName := map[string]bool{}
+	for _, mf := range mfs {
+		byName[mf.GetName()] = true
+		switch mf.GetName() {
+		case "ccw_bootstrap_clone_total":
+			for _, mm := range mf.GetMetric() {
+				for _, lp := range mm.GetLabel() {
+					if lp.GetName() == "result" && lp.GetValue() == "ok" {
+						require.Greater(t, mm.GetCounter().GetValue(), float64(0))
+					}
+				}
+			}
+		case "ccw_bootstrap_duration_seconds":
+			hist := mf.GetMetric()[0].GetHistogram()
+			require.Greater(t, hist.GetSampleCount(), uint64(0), "BootstrapDuration not observed")
+		}
+	}
+	require.True(t, byName["ccw_bootstrap_clone_total"], "ccw_bootstrap_clone_total not registered")
+	require.True(t, byName["ccw_bootstrap_duration_seconds"], "ccw_bootstrap_duration_seconds not registered")
+}
+
+// TestRender_WithoutLogAndMetrics verifies that nil Log/M doesn't panic (finding 2 backward compat).
+func TestRender_WithoutLogAndMetrics(t *testing.T) {
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+		// Log and M intentionally nil
+	}
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { return nil }))
+}
+
+// TestRender_MCPJsonPermissions verifies that .mcp.json is written 0644
+// (non-secret config) rather than 0600 (finding 7).
+func TestRender_MCPJsonPermissions(t *testing.T) {
+	ws := t.TempDir()
+	p := bootstrap.Params{
+		HomeDir:        t.TempDir(),
+		Workspace:      ws,
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+	}
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { return nil }))
+	info, err := os.Stat(filepath.Join(ws, ".mcp.json"))
+	require.NoError(t, err)
+	got := info.Mode().Perm()
+	require.Equal(t, os.FileMode(0o644), got, ".mcp.json must be 0644, got %o", got)
+}
+
+// TestRender_MultiRepo_PrimaryIdentifiedByPosition verifies that a clone failure
+// of the first repo (index 0) is escalated even when p.RepoURL is empty
+// (finding 2: primary by position, not URL match).
+func TestRender_MultiRepo_PrimaryIdentifiedByPosition(t *testing.T) {
+	fakeGit := func(dir string, args ...string) error {
+		// Fail all clone calls to trigger the primary escalation path.
+		for _, a := range args {
+			if a == "clone" {
+				return fmt.Errorf("clone failed: network unreachable")
+			}
+		}
+		return nil
+	}
+
+	p := bootstrap.Params{
+		HomeDir:        t.TempDir(),
+		Workspace:      t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+		RepoURL:        "", // intentionally empty
+		Repos: []bootstrap.RepoSpec{
+			{Name: "primary", URL: "https://github.com/owner/primary.git", Branch: "main"},
+			{Name: "secondary", URL: "https://github.com/owner/secondary.git", Branch: "main"},
+		},
+	}
+
+	err := bootstrap.Render(p, fakeGit)
+	require.Error(t, err, "clone failure of Repos[0] must return an error even when p.RepoURL is empty")
+	require.Contains(t, err.Error(), "primary")
+}
+
+var _ = io.Discard // keep io import if unused
 
 func TestRender_ConfiguresGitCredentialsAndIdentityBeforeClone(t *testing.T) {
 	var gitCalls [][]string

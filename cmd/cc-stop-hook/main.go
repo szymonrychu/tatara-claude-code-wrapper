@@ -11,6 +11,12 @@ import (
 	"time"
 )
 
+const (
+	maxPostAttempts = 5
+	postPerAttempt  = 5 * time.Second
+	postBackoff     = 500 * time.Millisecond
+)
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "cc-stop-hook:", err)
@@ -34,19 +40,40 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("marshal result: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, internalURL, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("new request: %w", err)
+	return postWithRetry(internalURL, body)
+}
+
+// postWithRetry POSTs body to url, retrying up to maxPostAttempts times on
+// network errors or non-2xx responses.  Each attempt has its own per-request
+// timeout so a hung connection never blocks the full budget.
+func postWithRetry(url string, body []byte) error {
+	var lastErr error
+	for attempt := 0; attempt < maxPostAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(postBackoff)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), postPerAttempt)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			cancel()
+			return fmt.Errorf("new request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		cancel()
+		if err != nil {
+			lastErr = fmt.Errorf("post result (attempt %d): %w", attempt+1, err)
+			continue
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("post result (attempt %d): unexpected status %d", attempt+1, resp.StatusCode)
+			continue
+		}
+		return nil
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("post result: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	return nil
+	return lastErr
 }
 
 func envOr(k, def string) string {

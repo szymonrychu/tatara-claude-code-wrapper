@@ -12,6 +12,11 @@ type Metrics struct {
 	HookReceived      prometheus.Counter
 	StreamEventsTotal *prometheus.CounterVec
 	Interjections     prometheus.Counter
+
+	// Bootstrap metrics (rule 13: counters for everything that counts/can fail).
+	BootstrapCloneTotal *prometheus.CounterVec // label: result=ok|fail
+	BootstrapDuration   prometheus.Histogram   // full Render() wall-clock time
+	CommitPushTotal     *prometheus.CounterVec // label: result=ok|fail
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -33,8 +38,16 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_stream_events_total", Help: "Transcript stream events emitted by stream_type."}, []string{"stream_type"}),
 		Interjections: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "ccw_interjections_total", Help: "Mid-turn interjections injected into the live session."}),
+		BootstrapCloneTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_bootstrap_clone_total", Help: "Bootstrap repo clone/resume attempts by result."}, []string{"result"}),
+		BootstrapDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "ccw_bootstrap_duration_seconds", Help: "Full Render() bootstrap wall-clock duration.",
+			Buckets: prometheus.ExponentialBuckets(0.5, 2, 8)}),
+		CommitPushTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_commit_push_total", Help: "CommitAndPush calls by result."}, []string{"result"}),
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
-		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal, m.Interjections)
+		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal, m.Interjections,
+		m.BootstrapCloneTotal, m.BootstrapDuration, m.CommitPushTotal)
 	return m
 }

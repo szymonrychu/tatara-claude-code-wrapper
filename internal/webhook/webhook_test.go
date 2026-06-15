@@ -70,3 +70,45 @@ func TestShutdown_AbortsInFlightRetries(t *testing.T) {
 		t.Fatal("Shutdown did not return; in-flight delivery was orphaned")
 	}
 }
+
+// TestBackoff_IsCapped verifies that repeated failures never produce a backoff
+// that overflows time.Duration. With a huge Retries and a tiny initial backoff
+// the deliver goroutine must still be abortable quickly after Shutdown.
+func TestBackoff_IsCapped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	// 200 retries starting at 1 ms would overflow without a cap (2^63 ns ~ 63 doublings).
+	s := webhook.New(webhook.Config{Retries: 200, Backoff: time.Millisecond},
+		metrics.New(prometheus.NewRegistry()), discardLogger())
+	s.Deliver(srv.URL, &turn.Record{ID: "backoff-cap", State: turn.Complete})
+
+	// Cancel immediately; if backoff overflows and goes negative, time.After fires
+	// at once and the loop becomes a tight spin that never yields to the select.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { s.Shutdown(ctx); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown hung: backoff likely overflowed and became a tight spin")
+	}
+}
+
+// TestDeliver_AfterShutdown_DoesNotPanic verifies that calling Deliver after
+// Shutdown has completed neither panics nor spawns an untracked goroutine.
+func TestDeliver_AfterShutdown_DoesNotPanic(t *testing.T) {
+	s := newSender(t, 0)
+	// Shut down with an already-done context so it completes immediately.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.Shutdown(ctx)
+
+	// This must not panic ("sync: WaitGroup is reused before previous Wait returned").
+	require.NotPanics(t, func() {
+		s.Deliver("http://127.0.0.1:0/no-such-server", &turn.Record{ID: "post-shutdown"})
+	})
+}

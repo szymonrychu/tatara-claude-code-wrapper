@@ -43,5 +43,11 @@ func namespacePath(cloneURL string) string {
 	}
 	out := strings.Join(parts, "/")
 	out = strings.TrimSuffix(out, ".git")
+	// Require at least owner/repo shape. A single-segment result has no owner
+	// and would clone into a bare directory (e.g. ws/github.com or ws/repo).
+	// Return "" so callers treat it the same as an empty URL and skip/error.
+	if !strings.Contains(out, "/") {
+		return ""
+	}
 	return out
 }
