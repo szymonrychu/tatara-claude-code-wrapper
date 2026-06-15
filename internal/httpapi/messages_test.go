@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -21,18 +22,19 @@ import (
 )
 
 type fakeCtl struct {
-	submitID     string
-	submitErr    error
-	interjectErr error
-	interjected  string
-	completed    session.HookResult
+	submitID       string
+	submitErr      error
+	interjectErr   error
+	interjected    string
+	completed      session.HookResult
+	transcriptPath string
 }
 
 func (f *fakeCtl) Submit(text, cb string) (string, error) { return f.submitID, f.submitErr }
 func (f *fakeCtl) Interject(text string) error            { f.interjected = text; return f.interjectErr }
 func (f *fakeCtl) Complete(r session.HookResult) error    { f.completed = r; return nil }
 func (f *fakeCtl) Snapshot() session.Snapshot             { return session.Snapshot{State: session.Ready} }
-func (f *fakeCtl) TranscriptPath() string                 { return "" }
+func (f *fakeCtl) TranscriptPath() string                 { return f.transcriptPath }
 func (f *fakeCtl) Alive() bool                            { return true }
 func (f *fakeCtl) Shutdown(context.Context) error         { return nil }
 
@@ -139,6 +141,30 @@ func TestRouter_EmitsRequestHandledLog(t *testing.T) {
 		}
 	}
 	require.True(t, found, "expected 'request handled' log line from Router middleware")
+}
+
+// TestGetTranscript_Streams verifies that GET /v1/transcript streams the file
+// without loading it all into memory at once (finding 3). Correctness check:
+// response body equals file contents and Content-Type is application/x-ndjson.
+func TestGetTranscript_Streams(t *testing.T) {
+	// Write a small JSONL file to a temp path.
+	f, err := os.CreateTemp(t.TempDir(), "transcript-*.jsonl")
+	require.NoError(t, err)
+	content := `{"type":"user","text":"hello"}` + "\n" + `{"type":"assistant","text":"world"}` + "\n"
+	_, err = io.WriteString(f, content)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	ctl := &fakeCtl{transcriptPath: f.Name()}
+	api := newAPI(ctl, turn.NewStore())
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/transcript", nil)
+	rec := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "application/x-ndjson", rec.Header().Get("Content-Type"))
+	require.Equal(t, content, rec.Body.String())
 }
 
 // TestInternalRouter_EmitsRequestHandledLog verifies access-log middleware on
