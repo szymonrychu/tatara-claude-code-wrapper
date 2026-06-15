@@ -27,3 +27,19 @@ func TestRing_TailStripsAnsiAndCaps(t *testing.T) {
 	require.LessOrEqual(t, len(r2.tail(ringCap*2)), ringCap)
 	require.Greater(t, r2.written(), ringCap) // monotonic count keeps growing
 }
+
+func TestRing_ResetClearsBufferKeepsTotal(t *testing.T) {
+	r := newRing()
+	_, _ = r.Write([]byte("Bypass Permissions mode"))
+	require.True(t, r.contains("Bypass Permissions mode"))
+	before := r.written()
+
+	r.reset()
+
+	// Buffered dialog text is gone, so a relaunch re-detects from scratch...
+	require.False(t, r.contains("Bypass Permissions mode"))
+	require.Equal(t, "", r.tail(100))
+	// ...but the monotonic counter is preserved so bootWait's written() baseline
+	// keeps working across the relaunch.
+	require.Equal(t, before, r.written())
+}

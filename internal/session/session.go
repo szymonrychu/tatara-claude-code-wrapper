@@ -215,6 +215,12 @@ func (mgr *Manager) InjectProcForTest(proc ClaudeProcess) {
 	go mgr.watch(proc)
 }
 
+// RingContainsForTest reports whether the ring buffer currently holds needle.
+// Test-only; lets relaunch tests assert the ring was reset.
+func (mgr *Manager) RingContainsForTest(needle string) bool {
+	return mgr.ring.contains(needle)
+}
+
 // SetStoppingForTest marks the session as stopping (as if Shutdown was called).
 // Test-only.
 func (mgr *Manager) SetStoppingForTest() {
@@ -398,6 +404,11 @@ func (mgr *Manager) relaunch() error {
 	if old != nil {
 		_ = old.Close()
 	}
+	// Clear the dead proc's output so bootWait navigates against only the new
+	// proc's dialogs. The old proc's Wait() has returned and its PTY master is
+	// closed, so its readPTY goroutine has stopped writing - this cannot race the
+	// new proc's first bytes (readPTY(proc) starts below).
+	mgr.ring.reset()
 	go mgr.readPTY(proc)
 	go mgr.watch(proc)
 	mgr.bootWait(proc) // flips Booting -> Ready

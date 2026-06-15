@@ -22,6 +22,7 @@ import (
 type fakeProc struct {
 	mu      sync.Mutex
 	written []byte
+	output  []byte // PTY bytes Read emits (once) before blocking until death
 
 	deadCh  chan struct{} // close to kill
 	waitErr error
@@ -29,6 +30,12 @@ type fakeProc struct {
 
 func newFakeProc() *fakeProc {
 	return &fakeProc{deadCh: make(chan struct{})}
+}
+
+// newFakeProcWithOutput seeds the PTY output the proc emits on boot (e.g. a
+// "Bypass Permissions mode" dialog) so it lands in the manager's ring buffer.
+func newFakeProcWithOutput(out string) *fakeProc {
+	return &fakeProc{deadCh: make(chan struct{}), output: []byte(out)}
 }
 
 func (f *fakeProc) kill() {
@@ -45,6 +52,14 @@ func (f *fakeProc) Wait() error {
 }
 
 func (f *fakeProc) Read(p []byte) (int, error) {
+	f.mu.Lock()
+	if len(f.output) > 0 {
+		n := copy(p, f.output)
+		f.output = f.output[n:]
+		f.mu.Unlock()
+		return n, nil
+	}
+	f.mu.Unlock()
 	<-f.deadCh
 	return 0, io.EOF
 }
@@ -310,6 +325,43 @@ func TestComplete_ResetsRestartCounter(t *testing.T) {
 	second.kill()
 	require.Eventually(t, func() bool { return st.calls() >= 2 }, 2*time.Second, 10*time.Millisecond,
 		"second relaunch not triggered (restart counter not reset by Complete)")
+}
+
+// TestRelaunch_ResetsRingNoStaleBypassAccept: the dead proc's "Bypass
+// Permissions mode" dialog text must not leak into the relaunched proc's boot
+// navigation. Before the ring reset, bootWait matched the stale string and fired
+// the accept keystrokes (Down+Enter) into the still-initializing TUI. With the
+// reset, the relaunched proc (which has not yet drawn its own dialog) sees no
+// match and bootWait stays its hand.
+func TestRelaunch_ResetsRingNoStaleBypassAccept(t *testing.T) {
+	// first boots and prints the bypass dialog; second (post-relaunch) withholds it.
+	first := newFakeProcWithOutput("\x1b[1mWARNING:\x1b[2GBypass\x1b[9GPermissions\x1b[21Gmode\x1b[0m")
+	second := newFakeProc()
+	third := newFakeProc() // safety valve for the new watch goroutine
+
+	st := newSpawnTracker(second, third)
+
+	mgr, _ := newRecoverMgr(t, []string{"turn-1"}, 3, st)
+	injectAndStart(t, mgr, first)
+
+	// The stale dialog must actually be resident in the ring before the crash,
+	// otherwise the reset would be a no-op and the test would pass vacuously.
+	require.Eventually(t, func() bool {
+		return mgr.RingContainsForTest("Bypass Permissions mode")
+	}, 2*time.Second, 10*time.Millisecond, "first proc's dialog never reached the ring")
+
+	// Crash -> relaunch (resets the ring) -> bootWait(second).
+	first.kill()
+	require.Eventually(t, func() bool {
+		return st.calls() >= 1 && mgr.Snapshot().State == session.Ready
+	}, 2*time.Second, 10*time.Millisecond, "relaunch did not return the session to Ready")
+
+	// The reset cleared the stale dialog...
+	require.False(t, mgr.RingContainsForTest("Bypass Permissions mode"),
+		"relaunch must reset the ring so stale dialog text does not persist")
+	// ...so bootWait never sent the accept keystroke to the relaunched proc.
+	assert.NotContains(t, string(second.bytes()), "\x1b[B",
+		"bootWait must not fire bypass-accept against a stale dialog after relaunch")
 }
 
 // TestWatch_ShutdownDeath_NoRelaunch: stopping=true when watch fires; must
