@@ -16,7 +16,7 @@ serviceAccount:
 
 httpAddr: ":8080"
 internalAddr: "127.0.0.1:8090"
-oidcIssuer: "https://auth.szymonrichert.pl/realms/master"
+oidcIssuer: ""
 oidcAudience: "tatara-claude-code-wrapper"
 logLevel: "info"
 model: ""
@@ -52,9 +52,23 @@ serviceMonitor:
 
 networkPolicy:
   enabled: true
-  callerNamespace: "tatara"
+  callerNamespace: ""
 
-resources: {}
+podSecurityContext:
+  runAsNonRoot: true
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
 
 persistence:
   enabled: false
