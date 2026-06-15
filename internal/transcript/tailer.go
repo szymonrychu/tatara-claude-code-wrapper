@@ -47,6 +47,20 @@ func (t *Tailer) incCounter(streamType string) {
 	}
 }
 
+// knownNonMessageTypes is the fixed cardinality set for non-message transcript entries.
+var knownNonMessageTypes = map[string]bool{
+	"system": true, "summary": true, "user": true, "assistant": true,
+}
+
+// clampNonMessageType maps unknown entry.Type values to "other" so the
+// ccw_stream_events_total metric label set stays bounded.
+func clampNonMessageType(t string) string {
+	if knownNonMessageTypes[t] {
+		return t
+	}
+	return "other"
+}
+
 // Follow reads the transcript at path from the start, then follows appends
 // until ctx is cancelled. Handles file not existing yet and inode changes.
 func (t *Tailer) Follow(ctx context.Context, path string) error {
@@ -200,7 +214,10 @@ func (t *Tailer) processLine(raw []byte) {
 	}
 
 	if entry.Message == nil {
-		// Non-message line (system, summary, etc.) - passthrough
+		// Non-message line (system, summary, etc.) - passthrough.
+		// Clamp the metric label to a known set; use the raw type only in the log
+		// (logs are not cardinality-bound).
+		metricType := clampNonMessageType(entry.Type)
 		t.log.Info("agent stream",
 			"action", "agent_stream",
 			"stream_type", entry.Type,
@@ -209,7 +226,7 @@ func (t *Tailer) processLine(raw []byte) {
 			"ts", entry.Timestamp,
 			"turn_id", t.turnID(),
 		)
-		t.incCounter(entry.Type)
+		t.incCounter(metricType)
 		return
 	}
 

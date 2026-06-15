@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -365,4 +366,228 @@ func TestStart_RealPTYWithCat(t *testing.T) {
 		time.Now, func() string { return "t" })
 	require.NoError(t, m.Start(context.Background()))
 	require.NoError(t, m.Shutdown(context.Background()))
+}
+
+// TestSubmitLog_HasActionField verifies "turn submitted" log includes action field (finding 6).
+func TestSubmitLog_HasActionField(t *testing.T) {
+	buf := &syncBuffer{}
+	log := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	store := turn.NewStore()
+	m := session.New(
+		session.Config{TurnTimeout: 50 * time.Millisecond, SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()), log,
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return "turn-1" },
+	)
+	m.SetWriterForTest(&fakePTY{})
+
+	_, err := m.Submit("hi", "")
+	require.NoError(t, err)
+
+	data := buf.Bytes()
+	lines := bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
+	found := false
+	for _, ln := range lines {
+		var rec map[string]any
+		if json.Unmarshal(ln, &rec) == nil && rec["msg"] == "turn submitted" {
+			require.Equal(t, "turn_submit", rec["action"], "action field missing or wrong in 'turn submitted' log")
+			found = true
+		}
+	}
+	require.True(t, found, "no 'turn submitted' log line found")
+}
+
+// TestFailTimeout_HasActionAndDurationMs verifies failTimeout log has action+duration_ms (finding 6)
+// and that TurnDuration histogram is observed (finding 8).
+func TestFailTimeout_HasActionAndDurationMs(t *testing.T) {
+	buf := &syncBuffer{}
+	log := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	store := turn.NewStore()
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	mgr := session.New(
+		session.Config{TurnTimeout: 50 * time.Millisecond, SubmitSeq: session.DefaultSubmitSeq},
+		store, m, log,
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return "turn-1" },
+	)
+	mgr.SetWriterForTest(&fakePTY{})
+
+	done := make(chan *turn.Record, 1)
+	mgr.OnTurnDone = func(r *turn.Record) { done <- r }
+
+	_, err := mgr.Submit("hi", "")
+	require.NoError(t, err)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("turn did not time out")
+	}
+
+	// Check log
+	data := buf.Bytes()
+	lines := bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
+	found := false
+	for _, ln := range lines {
+		var rec map[string]any
+		if json.Unmarshal(ln, &rec) == nil && rec["msg"] == "turn timed out" {
+			require.Equal(t, "turn_timeout", rec["action"], "action field missing in 'turn timed out' log")
+			require.NotNil(t, rec["duration_ms"], "duration_ms missing in 'turn timed out' log")
+			found = true
+		}
+	}
+	require.True(t, found, "no 'turn timed out' log line found")
+
+	// Check that TurnDuration histogram was observed (finding 8)
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() == "ccw_turn_duration_seconds" {
+			hist := mf.GetMetric()[0].GetHistogram()
+			require.Greater(t, hist.GetSampleCount(), uint64(0), "TurnDuration histogram not observed for timed-out turn")
+			return
+		}
+	}
+	t.Fatal("ccw_turn_duration_seconds metric not found")
+}
+
+// TestWritePTYStoreFail_DistinctMessages verifies paste vs submit store.Fail messages differ (finding 10).
+func TestWritePTYStoreFail_DistinctMessages(t *testing.T) {
+	// Use a PTY that fails on the first write (paste) and then succeeds
+	store := turn.NewStore()
+	m := session.New(
+		session.Config{TurnTimeout: time.Second, SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return "turn-1" },
+	)
+
+	// PTY that errors on the first write (paste)
+	failPTY := &failingPTY{failOn: 0}
+	m.SetWriterForTest(failPTY)
+
+	_, err := m.Submit("hi", "")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "paste")
+
+	rec, ok := store.Get("turn-1")
+	require.True(t, ok)
+	require.Contains(t, rec.Error, "paste", "store.Fail message should say 'paste', not generic 'write pty'")
+}
+
+type failingPTY struct {
+	mu     sync.Mutex
+	writes int
+	failOn int // fail on this write index
+}
+
+func (f *failingPTY) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	idx := f.writes
+	f.writes++
+	f.mu.Unlock()
+	if idx == f.failOn {
+		return 0, fmt.Errorf("simulated write failure")
+	}
+	return len(p), nil
+}
+
+func (f *failingPTY) Close() error { return nil }
+
+// TestTailer_RestartedOnTranscriptPathChange verifies that when Complete() is
+// called with a new transcript path (post crash+relaunch), the tailer stops
+// following the old file and starts following the new one.
+func TestTailer_RestartedOnTranscriptPathChange(t *testing.T) {
+	dir := t.TempDir()
+	firstPath := filepath.Join(dir, "session1.jsonl")
+	secondPath := filepath.Join(dir, "session2.jsonl")
+
+	// Write a line to the first transcript
+	line1 := `{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T00:00:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"first turn"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}}`
+	f1, err := os.Create(firstPath)
+	require.NoError(t, err)
+	_, err = f1.WriteString(line1 + "\n")
+	require.NoError(t, err)
+	require.NoError(t, f1.Close())
+
+	buf := &syncBuffer{}
+	log := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	store := turn.NewStore()
+	idIdx := 0
+	ids := []string{"turn-1", "turn-2"}
+	m := session.New(
+		session.Config{TurnTimeout: 50 * time.Millisecond, SubmitSeq: session.DefaultSubmitSeq},
+		store,
+		metrics.New(prometheus.NewRegistry()),
+		log,
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { s := ids[idIdx]; idIdx++; return s },
+	)
+	m.SetWriterForTest(&fakePTY{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	m.StartTailer(ctx)
+
+	// Submit and complete first turn - tailer starts on firstPath
+	_, err = m.Submit("hi", "")
+	require.NoError(t, err)
+	require.NoError(t, m.Complete(session.HookResult{
+		FinalText:      "ok",
+		StopReason:     "end_turn",
+		TranscriptPath: firstPath,
+	}))
+
+	// Wait for tailer to pick up the first transcript
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		data := buf.Bytes()
+		lines := bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
+		for _, ln := range lines {
+			var rec map[string]any
+			if json.Unmarshal(ln, &rec) == nil && rec["action"] == "agent_stream" && rec["stream_type"] == "text" {
+				goto firstTurnSeen
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("tailer did not emit agent_stream event for first transcript within timeout")
+firstTurnSeen:
+
+	// Write a line to the second transcript (simulating post-crash new session)
+	line2 := `{"type":"assistant","uuid":"u2","sessionId":"s2","timestamp":"2026-06-15T00:01:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"second turn after crash"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}}`
+	f2, err := os.Create(secondPath)
+	require.NoError(t, err)
+	_, err = f2.WriteString(line2 + "\n")
+	require.NoError(t, err)
+	require.NoError(t, f2.Close())
+
+	// Submit and complete second turn with new transcript path - tailer should switch
+	_, err = m.Submit("hi again", "")
+	require.NoError(t, err)
+	require.NoError(t, m.Complete(session.HookResult{
+		FinalText:      "ok2",
+		StopReason:     "end_turn",
+		TranscriptPath: secondPath,
+	}))
+
+	// Verify the log emits a WARN about path change
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		data := buf.Bytes()
+		lines := bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
+		for _, ln := range lines {
+			var rec map[string]any
+			if json.Unmarshal(ln, &rec) == nil && rec["msg"] == "transcript path changed, restarting tailer" {
+				return // test passes: tailer restart was logged
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("did not observe 'transcript path changed, restarting tailer' WARN within timeout")
 }

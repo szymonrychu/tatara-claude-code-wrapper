@@ -6,12 +6,15 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/auth"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/obs"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
 )
@@ -50,9 +53,35 @@ func New(d Deps) *API {
 	return &API{ctl: d.Ctl, store: d.Store, v: d.Verifier, log: d.Log, reg: d.Registry}
 }
 
+// requestLogger is a chi middleware that logs each request at INFO on completion
+// with request_id, user (from OIDC claims if present), route, method, status,
+// and duration_ms. Wires obs.RequestLogger into every handler (rules 12+13).
+func (a *API) requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		next.ServeHTTP(ww, r)
+
+		user := ""
+		if claims, ok := auth.ClaimsFromContext(r.Context()); ok {
+			user = claims.Subject
+		}
+		obs.RequestLogger(a.log, obs.RequestFields{
+			RequestID:  middleware.GetReqID(r.Context()),
+			User:       user,
+			Route:      r.URL.Path,
+			Method:     r.Method,
+			Status:     ww.Status(),
+			DurationMs: time.Since(start).Milliseconds(),
+		}).Info("request handled")
+	})
+}
+
 // Router is the public surface: OIDC-gated /v1/* plus open operator endpoints.
 func (a *API) Router() http.Handler {
 	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	r.Use(a.requestLogger)
 	r.Group(func(pr chi.Router) {
 		if a.v != nil {
 			pr.Use(auth.Middleware(a.v))
@@ -88,6 +117,8 @@ func (a *API) mountV1(r chi.Router) {
 // InternalRouter is the loopback-only surface the Stop hook posts to.
 func (a *API) InternalRouter() http.Handler {
 	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	r.Use(a.requestLogger)
 	r.Post("/internal/turn-complete", a.turnComplete)
 	return r
 }

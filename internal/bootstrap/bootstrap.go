@@ -2,8 +2,12 @@ package bootstrap
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
+
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 )
 
 // RepoSpec is one Project repo to clone into the workspace.
@@ -29,6 +33,11 @@ type Params struct {
 	GitUserName, GitUserEmail       string // commit identity for the agent
 	TaskBranch                      string // work branch the operator opens the PR from; checked out after clone
 	Repos                           []RepoSpec
+
+	// Optional: provide structured logging and metrics (rules 12+13).
+	// When nil, Render/CommitAndPush run silently without emitting log lines or metrics.
+	Log *slog.Logger
+	M   *metrics.Metrics
 }
 
 // GitRunner runs a git subcommand in dir; injected for testability.
@@ -60,6 +69,7 @@ func checkoutTaskBranch(dir, taskBranch string, git GitRunner) error {
 }
 
 func Render(p Params, git GitRunner) error {
+	renderStart := time.Now()
 	claudeHome := filepath.Join(p.HomeDir, ".claude")
 	if err := os.MkdirAll(claudeHome, 0o755); err != nil {
 		return fmt.Errorf("mkdir claude home: %w", err)
@@ -88,38 +98,74 @@ func Render(p Params, git GitRunner) error {
 				}
 				continue // non-primary parent-dir failure: skip
 			}
+			cloneStart := time.Now()
 			args := []string{"clone", "--depth", "1"}
 			if r.Branch != "" {
 				args = append(args, "--branch", r.Branch)
 			}
 			args = append(args, r.URL, dest)
 			if err := git(p.Workspace, args...); err != nil {
+				if p.M != nil {
+					p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
+				}
 				if r.URL == p.RepoURL {
 					return fmt.Errorf("clone primary repo %s: %w", r.Name, err)
 				}
 				continue // non-primary clone failure: skip
 			}
+			action := "clone"
 			if p.TaskBranch != "" {
 				// Surface checkout/resume failures for ALL repos (not just the
 				// primary): a secondary repo silently left on the wrong branch
 				// would make the agent commit the wrong state. Fail loud so the
 				// operator retries the run.
 				if err := checkoutTaskBranch(dest, p.TaskBranch, git); err != nil {
+					if p.M != nil {
+						p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
+					}
 					return fmt.Errorf("checkout task branch in %s: %w", r.Name, err)
 				}
+				if branchExists := git(dest, "ls-remote", "--exit-code", "--heads", "origin", p.TaskBranch) == nil; branchExists {
+					action = "resume"
+				}
+			}
+			if p.M != nil {
+				p.M.BootstrapCloneTotal.WithLabelValues("ok").Inc()
+			}
+			if p.Log != nil {
+				p.Log.Info("repo cloned", "action", action, "repo", r.Name, "branch", r.Branch,
+					"task_branch", p.TaskBranch, "duration_ms", time.Since(cloneStart).Milliseconds())
 			}
 		}
 	} else if p.RepoURL != "" {
 		if err := configureGit(p, git); err != nil {
 			return err
 		}
+		cloneStart := time.Now()
 		if err := cloneRepo(p, git); err != nil {
+			if p.M != nil {
+				p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
+			}
 			return err
 		}
+		action := "clone"
 		if p.TaskBranch != "" {
 			if err := checkoutTaskBranch(p.Workspace, p.TaskBranch, git); err != nil {
+				if p.M != nil {
+					p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
+				}
 				return err
 			}
+			if branchExists := git(p.Workspace, "ls-remote", "--exit-code", "--heads", "origin", p.TaskBranch) == nil; branchExists {
+				action = "resume"
+			}
+		}
+		if p.M != nil {
+			p.M.BootstrapCloneTotal.WithLabelValues("ok").Inc()
+		}
+		if p.Log != nil {
+			p.Log.Info("repo cloned", "action", action, "repo", p.RepoURL, "branch", p.RepoBranch,
+				"task_branch", p.TaskBranch, "duration_ms", time.Since(cloneStart).Milliseconds())
 		}
 	}
 	if err := writeIfSet(filepath.Join(p.Workspace, "CLAUDE.md"), p.ProjectClaudeMd); err != nil {
@@ -137,7 +183,13 @@ func Render(p Params, git GitRunner) error {
 	if err := writeClaudeJSON(p); err != nil {
 		return err
 	}
-	return installSkills(p)
+	if err := installSkills(p); err != nil {
+		return err
+	}
+	if p.M != nil {
+		p.M.BootstrapDuration.Observe(time.Since(renderStart).Seconds())
+	}
+	return nil
 }
 
 func writeIfSet(path, content string) error {

@@ -96,6 +96,7 @@ type Manager struct {
 
 	// tailer goroutine
 	tailer        *transcript.Tailer
+	tailerParent  context.Context // session-lifetime context; source for new per-path child contexts
 	tailerCtx     context.Context
 	tailerCancel  context.CancelFunc
 	tailerStarted bool
@@ -136,6 +137,7 @@ func (mgr *Manager) StartTailer(ctx context.Context) {
 	tailerCtx, cancel := context.WithCancel(ctx)
 	mgr.mu.Lock()
 	mgr.tailer = tailer
+	mgr.tailerParent = ctx
 	mgr.tailerCtx = tailerCtx
 	mgr.tailerCancel = cancel
 	mgr.mu.Unlock()
@@ -468,12 +470,14 @@ func (mgr *Manager) failTurn(id, reason string) {
 		mgr.timer.Stop()
 	}
 	now := mgr.now()
+	started := mgr.currentStarted
 	_ = mgr.store.Fail(id, reason, now)
 	mgr.clearCurrentLocked(Dead)
 	mgr.m.TurnsTotal.WithLabelValues("failed").Inc()
+	mgr.m.TurnDuration.Observe(now.Sub(started).Seconds())
 	rec, _ := mgr.store.Get(id)
 	mgr.mu.Unlock()
-	mgr.log.Warn("turn failed", "turn_id", id, "reason", reason)
+	mgr.log.Warn("turn failed", "action", "turn_fail", "turn_id", id, "reason", reason, "duration_ms", now.Sub(started).Milliseconds())
 	mgr.fireDone(rec)
 }
 
@@ -508,7 +512,7 @@ func (mgr *Manager) handleExit(err error) {
 
 	mgr.m.ClaudeRestarts.Inc()
 	if id != "" {
-		mgr.log.Warn("turn failed: claude exited", "turn_id", id, "duration_ms", durMs)
+		mgr.log.Warn("turn failed: claude exited", "action", "turn_fail", "turn_id", id, "duration_ms", durMs)
 	}
 	mgr.log.Error("claude exited", "err", err, "pty_tail", mgr.ring.tail(800))
 	mgr.fireDone(rec)
@@ -534,18 +538,18 @@ func (mgr *Manager) Submit(text, callbackURL string) (string, error) {
 	// (turns are sequential, so nothing else is writing).
 	seq := mgr.cfg.SubmitSeq
 	if _, err := mgr.w.Write([]byte(seq.PasteStart + text + seq.PasteEnd)); err != nil {
-		_ = mgr.store.Fail(id, fmt.Sprintf("write pty: %v", err), now)
+		_ = mgr.store.Fail(id, fmt.Sprintf("write pty paste: %v", err), now)
 		return "", fmt.Errorf("write pty paste: %w", err)
 	}
 	time.Sleep(mgr.cfg.SubmitDelay)
 	if _, err := mgr.w.Write([]byte(seq.Submit)); err != nil {
-		_ = mgr.store.Fail(id, fmt.Sprintf("write pty: %v", err), now)
+		_ = mgr.store.Fail(id, fmt.Sprintf("write pty submit: %v", err), now)
 		return "", fmt.Errorf("write pty submit: %w", err)
 	}
 	mgr.current, mgr.currentStarted, mgr.state = id, now, Busy
 	mgr.m.TurnInFlight.Set(1)
 	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.failTimeout(id) })
-	mgr.log.Info("turn submitted", "turn_id", id)
+	mgr.log.Info("turn submitted", "action", "turn_submit", "turn_id", id)
 	return id, nil
 }
 
@@ -594,17 +598,41 @@ func (mgr *Manager) Complete(r HookResult) error {
 	now := mgr.now()
 	started := mgr.currentStarted // capture before clearCurrentLocked resets state
 	if r.TranscriptPath != "" {
+		prevPath := mgr.transcriptPath
 		mgr.transcriptPath = r.TranscriptPath
-		if mgr.tailer != nil && !mgr.tailerStarted {
-			mgr.tailerStarted = true
-			path := mgr.transcriptPath
-			tailer := mgr.tailer
-			tailerCtx := mgr.tailerCtx
-			go func() {
-				if err := tailer.Follow(tailerCtx, path); err != nil && tailerCtx.Err() == nil {
-					mgr.log.Error("transcript tailer error", "err", err)
-				}
-			}()
+		if mgr.tailer != nil {
+			pathChanged := r.TranscriptPath != prevPath
+			if !mgr.tailerStarted {
+				// First start: launch tailer on the new path.
+				mgr.tailerStarted = true
+				path := mgr.transcriptPath
+				tailer := mgr.tailer
+				tailerCtx := mgr.tailerCtx
+				go func() {
+					if err := tailer.Follow(tailerCtx, path); err != nil && tailerCtx.Err() == nil {
+						mgr.log.Error("transcript tailer error", "err", err)
+					}
+				}()
+			} else if pathChanged && mgr.tailerParent != nil && mgr.tailerParent.Err() == nil {
+				// Transcript path changed after a crash+relaunch: cancel the old Follow
+				// and start a fresh one on the new path so we do not tail a stale file.
+				mgr.log.Warn("transcript path changed, restarting tailer",
+					"old_path", prevPath, "new_path", r.TranscriptPath)
+				mgr.tailerCancel()
+				newCtx, newCancel := context.WithCancel(mgr.tailerParent)
+				mgr.tailerCtx = newCtx
+				mgr.tailerCancel = newCancel
+				path := mgr.transcriptPath
+				tailer := mgr.tailer
+				go func() {
+					if err := tailer.Follow(newCtx, path); err != nil && newCtx.Err() == nil {
+						mgr.log.Error("transcript tailer error", "err", err)
+					}
+				}()
+			} else if pathChanged {
+				mgr.log.Warn("transcript path changed but session context is done; observability gap on new path",
+					"old_path", prevPath, "new_path", r.TranscriptPath)
+			}
 		}
 	}
 	_ = mgr.store.Complete(id, r.FinalText, r.ResultJSON, r.Usage, r.StopReason, now)
@@ -618,7 +646,7 @@ func (mgr *Manager) Complete(r HookResult) error {
 	}
 	rec, _ := mgr.store.Get(id)
 	mgr.mu.Unlock()
-	mgr.log.Info("turn complete", "turn_id", id, "duration_ms", now.Sub(started).Milliseconds())
+	mgr.log.Info("turn complete", "action", "turn_complete", "turn_id", id, "duration_ms", now.Sub(started).Milliseconds())
 	mgr.fireDone(rec)
 	return nil
 }
@@ -630,12 +658,14 @@ func (mgr *Manager) failTimeout(id string) {
 		return
 	}
 	now := mgr.now()
+	started := mgr.currentStarted
 	_ = mgr.store.Fail(id, "turn timed out", now)
 	mgr.clearCurrentLocked(Ready)
 	mgr.m.TurnsTotal.WithLabelValues("failed").Inc()
+	mgr.m.TurnDuration.Observe(now.Sub(started).Seconds())
 	rec, _ := mgr.store.Get(id)
 	mgr.mu.Unlock()
-	mgr.log.Warn("turn timed out", "turn_id", id)
+	mgr.log.Warn("turn timed out", "action", "turn_timeout", "turn_id", id, "duration_ms", now.Sub(started).Milliseconds())
 	mgr.fireDone(rec)
 }
 

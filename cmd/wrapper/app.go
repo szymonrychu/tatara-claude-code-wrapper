@@ -36,7 +36,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	reg := obs.PromRegistry()
 	m := metrics.New(reg)
 
-	if err := bootstrap.Render(buildBootstrapParams(cfg), gitRunner()); err != nil {
+	if err := bootstrap.Render(buildBootstrapParams(cfg, log, m), gitRunner()); err != nil {
 		return nil, err
 	}
 	bootstrap.InstallHooks(cfg.Workspace, cfg.Repos, cfg.RepoURL, execRunnerDir(log))
@@ -75,12 +75,22 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		// branch. Best-effort: a failure here must not drop the turn callback.
 		if cfg.TaskBranch != "" {
 			if len(cfg.Repos) > 0 {
+				pushStart := time.Now()
 				if err := bootstrap.CommitAndPushAll(cfg.Workspace, cfg.Repos, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner()); err != nil {
-					log.Error("commit/push failed", "error", err)
+					m.CommitPushTotal.WithLabelValues("fail").Inc()
+					log.Error("commit/push failed", "action", "commit_push", "error", err, "duration_ms", time.Since(pushStart).Milliseconds())
+				} else {
+					m.CommitPushTotal.WithLabelValues("ok").Inc()
+					log.Info("commit/push succeeded", "action", "commit_push", "branch", cfg.TaskBranch, "duration_ms", time.Since(pushStart).Milliseconds())
 				}
 			} else {
+				pushStart := time.Now()
 				if err := bootstrap.CommitAndPush(cfg.Workspace, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner()); err != nil {
-					log.Error("commit/push task branch failed", "branch", cfg.TaskBranch, "error", err)
+					m.CommitPushTotal.WithLabelValues("fail").Inc()
+					log.Error("commit/push task branch failed", "action", "commit_push", "branch", cfg.TaskBranch, "error", err, "duration_ms", time.Since(pushStart).Milliseconds())
+				} else {
+					m.CommitPushTotal.WithLabelValues("ok").Inc()
+					log.Info("commit/push succeeded", "action", "commit_push", "branch", cfg.TaskBranch, "duration_ms", time.Since(pushStart).Milliseconds())
 				}
 			}
 		}
@@ -150,7 +160,7 @@ func (a *app) shutdown(ctx context.Context) error {
 	return a.pub.Shutdown(ctx)
 }
 
-func buildBootstrapParams(cfg config) bootstrap.Params {
+func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) bootstrap.Params {
 	return bootstrap.Params{
 		HomeDir:         cfg.HomeDir,
 		Workspace:       cfg.Workspace,
@@ -171,6 +181,8 @@ func buildBootstrapParams(cfg config) bootstrap.Params {
 		GitUserEmail:    cfg.GitUserEmail,
 		TaskBranch:      cfg.TaskBranch,
 		Repos:           cfg.Repos,
+		Log:             log,
+		M:               m,
 	}
 }
 

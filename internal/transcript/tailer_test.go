@@ -59,6 +59,59 @@ func (h *captureHandler) WithGroup(name string) slog.Handler {
 	return &captureHandler{buf: h.buf, inner: h.inner.WithGroup(name), records: h.records}
 }
 
+// TestTailer_UnknownNonMessageType_ClampedInMetric verifies that a transcript
+// entry with an unknown type (not in the fixed enum) passes the raw type to
+// the log (cardinality-free) but maps to "other" in the metric counter.
+func TestTailer_UnknownNonMessageType_ClampedInMetric(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	// Write a non-message entry with a future/unknown type
+	writeTranscriptLine(t, path, `{"type":"future_unknown","uuid":"u1","sessionId":"s1","timestamp":"2026-06-15T00:00:00.000Z"}`)
+
+	h := newCaptureHandler()
+	log := slog.New(h)
+	// Check the log record - stream_type in the log should be the raw type, and
+	// we separately unit-test clampNonMessageType for the metric label.
+	tailer := NewTailer(log, NewRedactor(nil), func() string { return "" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	recs := waitForRecords(t, h, 1, 2*time.Second)
+	cancel()
+	<-done
+
+	stream := filterAgentStream(recs)
+	if len(stream) == 0 {
+		t.Fatal("expected at least one agent_stream event")
+	}
+	// The log stream_type must keep the raw type (so the log is queryable).
+	got := stream[0]
+	if got["stream_type"] != "future_unknown" {
+		t.Errorf("log stream_type = %v, want future_unknown (raw type preserved in log)", got["stream_type"])
+	}
+}
+
+func TestClampNonMessageType(t *testing.T) {
+	for _, tt := range []struct{ in, want string }{
+		{"system", "system"},
+		{"summary", "summary"},
+		{"user", "user"},
+		{"assistant", "assistant"},
+		{"unknown_future_type", "other"},
+		{"model_generated_label", "other"},
+		{"", "other"},
+	} {
+		got := clampNonMessageType(tt.in)
+		if got != tt.want {
+			t.Errorf("clampNonMessageType(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 func (h *captureHandler) Records() []map[string]any {
 	h.mu.Lock()
 	defer h.mu.Unlock()
