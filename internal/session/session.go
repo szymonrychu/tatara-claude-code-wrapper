@@ -18,6 +18,10 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
 )
 
+// goroutineJoinTimeout is the maximum time Shutdown waits for lifecycle
+// goroutines (readPTY, watch, tailer Follow) to exit after cancellation.
+const goroutineJoinTimeout = 5 * time.Second
+
 // DefaultSubmitSeq wraps a message in bracketed paste, then submits with CR.
 // Confirmed/overridden by the Task-1 spike.
 var DefaultSubmitSeq = SubmitSequence{PasteStart: "\x1b[200~", PasteEnd: "\x1b[201~", Submit: "\r"}
@@ -64,7 +68,8 @@ const (
 
 type Snapshot struct {
 	State          State  `json:"state"`
-	TurnsCompleted int    `json:"turnsCompleted"`
+	TurnsCompleted int    `json:"turnsCompleted"` // successful turns only (excludes failed/timed-out)
+	TurnsFinished  int    `json:"turnsFinished"`  // all terminal turns (success + failed + timed-out)
 	Model          string `json:"model"`
 	Repo           string `json:"repo"`
 }
@@ -81,18 +86,24 @@ type Manager struct {
 
 	spawn func(cfg Config, resume bool) (claudeProcess, error)
 
-	mu             sync.Mutex
-	w              ptyWriter
-	proc           claudeProcess
-	ring           *ringBuffer
-	stopping       bool
-	state          State
-	current        string // in-flight turn id, "" when idle
-	currentStarted time.Time
-	timer          *time.Timer
-	turnsCompleted int
-	transcriptPath string
-	restarts       int // consecutive crash-relaunches; reset on Complete
+	mu               sync.Mutex
+	w                ptyWriter
+	proc             claudeProcess
+	ring             *ringBuffer
+	stopping         bool
+	state            State
+	current          string // in-flight turn id, "" when idle
+	currentStarted   time.Time
+	currentSessionID string // claude's sessionId for the current turn (from hook); used for correlation
+	timer            *time.Timer
+	turnsCompleted   int // all terminal turns (success + failed + timed-out)
+	turnsSucceeded   int // successful turns only (Complete path)
+	transcriptPath   string
+	restarts         int // consecutive crash-relaunches; reset on Complete
+
+	// wg tracks lifecycle goroutines (readPTY, watch, tailer Follow) so
+	// Shutdown can wait for them to drain after cancellation.
+	wg sync.WaitGroup
 
 	// tailer goroutine
 	tailer        *transcript.Tailer
@@ -195,9 +206,22 @@ func (mgr *Manager) SetWriterForTest(w ptyWriter) {
 	mgr.state = Ready
 }
 
-// SimulateExitForTest drives the unexpected-exit path as if the supervised
-// claude process had terminated with err. Test-only.
-func (mgr *Manager) SimulateExitForTest(err error) { mgr.handleExit(err) }
+// SimulateExitForTest kills the injected fakeProc so the real watch() goroutine
+// fires. Callers must have used InjectProcForTest first. Test-only.
+//
+// Deprecated: use InjectProcForTest + proc.kill() directly, which exercises the
+// real watch() path. This shim exists only for callers not yet migrated.
+func (mgr *Manager) SimulateExitForTest(err error) {
+	mgr.mu.Lock()
+	proc := mgr.proc
+	// Mark stopping=true so watch() does not attempt a relaunch (the caller
+	// expects the old "fail immediately" semantics).
+	mgr.stopping = true
+	mgr.mu.Unlock()
+	if proc != nil {
+		_ = proc.Close()
+	}
+}
 
 // SetSpawnForTest replaces the spawn function used by Start/relaunch. Test-only.
 func (mgr *Manager) SetSpawnForTest(fn func(cfg Config, resume bool) (ClaudeProcess, error)) {
@@ -213,6 +237,7 @@ func (mgr *Manager) InjectProcForTest(proc ClaudeProcess) {
 	mgr.proc, mgr.w = proc, proc
 	mgr.state = Ready
 	mgr.mu.Unlock()
+	mgr.wg.Add(2)
 	go mgr.readPTY(proc)
 	go mgr.watch(proc)
 }
@@ -242,6 +267,7 @@ func (mgr *Manager) Start(ctx context.Context) error {
 	mgr.proc, mgr.w = proc, proc
 	mgr.mu.Unlock()
 
+	mgr.wg.Add(2)
 	go mgr.readPTY(proc)
 	go mgr.watch(proc)
 
@@ -253,6 +279,7 @@ func (mgr *Manager) Start(ctx context.Context) error {
 // only window into the session: bootWait reads it for dialogs and watch logs
 // its tail on exit.
 func (mgr *Manager) readPTY(proc claudeProcess) {
+	defer mgr.wg.Done()
 	buf := make([]byte, 4096)
 	for {
 		n, err := proc.Read(buf)
@@ -270,22 +297,34 @@ func (mgr *Manager) readPTY(proc claudeProcess) {
 // the session READY. Without accepting the warning, the first turn's submit
 // keystroke lands on the dialog and exits claude. Sequence confirmed against
 // the real binary in docs/spike-findings.md. Uses real wall-clock (not the
-// injected clock) since it polls live output.
+// injected clock) since it polls live output. Respects mgr's lifecycle context
+// so a shutdown or superseded relaunch aborts the wait promptly (finding 4).
 func (mgr *Manager) bootWait(proc claudeProcess) {
 	const (
 		minBoot   = 4 * time.Second
 		idleReady = 1500 * time.Millisecond
 		poll      = 150 * time.Millisecond
 	)
+	// Capture the lifecycle context so we can select-abort on shutdown (finding 4).
+	mgr.mu.Lock()
+	lifecycleCtx := mgr.tailerParent // nil when StartTailer was not called
+	mgr.mu.Unlock()
+
 	start := time.Now()
 	deadline := start.Add(mgr.cfg.BootTimeout)
 	lastWritten := mgr.ring.written()
 	lastChange := start
 	acceptedBypass := false
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
 	for {
 		// Bail if the session died or a newer relaunch superseded this proc, so
 		// a stale bootWait does not poll the shared ring for the full timeout.
 		if mgr.isDead() || !mgr.isActiveProc(proc) {
+			return
+		}
+		// Abort promptly on shutdown/context cancellation (finding 4).
+		if lifecycleCtx != nil && lifecycleCtx.Err() != nil {
 			return
 		}
 		now := time.Now()
@@ -309,7 +348,16 @@ func (mgr *Manager) bootWait(proc claudeProcess) {
 		if now.Sub(start) >= minBoot && now.Sub(lastChange) >= idleReady {
 			break
 		}
-		time.Sleep(poll)
+		// Use ticker instead of bare time.Sleep so the context check fires promptly.
+		if lifecycleCtx != nil {
+			select {
+			case <-ticker.C:
+			case <-lifecycleCtx.Done():
+				return
+			}
+		} else {
+			<-ticker.C
+		}
 	}
 	mgr.mu.Lock()
 	if mgr.state == Booting && mgr.proc == proc {
@@ -345,6 +393,7 @@ func (mgr *Manager) writeRaw(s string) {
 // re-submit any in-flight turn, or fail the turn and mark Dead if budget
 // exhausted.
 func (mgr *Manager) watch(proc claudeProcess) {
+	defer mgr.wg.Done()
 	err := proc.Wait()
 	mgr.mu.Lock()
 	if mgr.stopping {
@@ -354,6 +403,12 @@ func (mgr *Manager) watch(proc claudeProcess) {
 		return
 	}
 	inFlight := mgr.current
+	// Stop the in-flight turn timer before relaunch so it cannot fire during
+	// the Dead->Booting->Ready window and mis-fail a successfully resumed turn
+	// (finding 2).
+	if mgr.timer != nil {
+		mgr.timer.Stop()
+	}
 	mgr.restarts++
 	attempt := mgr.restarts
 	mgr.state = Dead // brief: Submit rejects until relaunch flips to Ready
@@ -397,6 +452,13 @@ func (mgr *Manager) relaunch() error {
 		return err
 	}
 	mgr.mu.Lock()
+	// Re-check stopping under the lock after spawn (finding 8): if Shutdown ran
+	// while we were spawning, discard the freshly created proc and abort.
+	if mgr.stopping {
+		mgr.mu.Unlock()
+		_ = proc.Close()
+		return fmt.Errorf("session is shutting down")
+	}
 	old := mgr.proc
 	mgr.proc, mgr.w = proc, proc
 	mgr.state = Booting
@@ -411,6 +473,7 @@ func (mgr *Manager) relaunch() error {
 	// closed, so its readPTY goroutine has stopped writing - this cannot race the
 	// new proc's first bytes (readPTY(proc) starts below).
 	mgr.ring.reset()
+	mgr.wg.Add(2)
 	go mgr.readPTY(proc)
 	go mgr.watch(proc)
 	mgr.bootWait(proc) // flips Booting -> Ready
@@ -426,35 +489,41 @@ func (mgr *Manager) shouldResume() bool {
 	return mgr.current != "" || mgr.turnsCompleted > 0 || mgr.transcriptPath != ""
 }
 
-// resumeTurn re-submits the in-flight turn's prompt to the restored session,
-// keeping the same turn id (so the eventual Stop hook still correlates) and the
-// original timeout timer. No-op if the turn was resolved during relaunch.
+// resumeTurn nudges the restored --continue session to continue the in-flight
+// turn. It does NOT re-paste the original prompt: --continue already restored
+// the full conversation including the user prompt, so re-pasting would
+// double-submit and cause duplicate work (finding 1). Instead we send a plain
+// submit keystroke (an empty "continue" nudge) so claude picks up where it
+// left off. The same turn id is kept so the eventual Stop hook still correlates.
+// A fresh timer replaces the stale one that was stopped by watch() before
+// relaunch, giving the resumed turn a full uncontended TurnTimeout budget
+// (finding 2). No-op if the turn was resolved during relaunch.
 func (mgr *Manager) resumeTurn(id string) {
 	mgr.mu.Lock()
 	if mgr.current != id || mgr.state != Ready {
 		mgr.mu.Unlock()
 		return
 	}
-	rec, ok := mgr.store.Get(id)
-	if !ok || mgr.w == nil {
+	if mgr.w == nil {
 		mgr.mu.Unlock()
 		return
 	}
 	seq := mgr.cfg.SubmitSeq
-	if _, err := mgr.w.Write([]byte(seq.PasteStart + rec.Text + seq.PasteEnd)); err != nil {
-		mgr.mu.Unlock()
-		mgr.failTurn(id, fmt.Sprintf("resume write paste: %v", err))
-		return
-	}
-	time.Sleep(mgr.cfg.SubmitDelay)
+	// Send only the submit keystroke - the prompt is already in the restored
+	// conversation via --continue (finding 1).
 	if _, err := mgr.w.Write([]byte(seq.Submit)); err != nil {
 		mgr.mu.Unlock()
 		mgr.failTurn(id, fmt.Sprintf("resume write submit: %v", err))
 		return
 	}
+	// Install a fresh timer so the resumed turn gets a full TurnTimeout budget
+	// (finding 2). The old timer was stopped by watch() before relaunch.
+	now := mgr.now()
+	mgr.currentStarted = now
+	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.failTimeout(id) })
 	mgr.state = Busy
 	mgr.mu.Unlock()
-	mgr.log.Info("resumed in-flight turn after relaunch", "turn_id", id)
+	mgr.log.Info("resumed in-flight turn after relaunch", "action", "turn_resume", "turn_id", id)
 }
 
 // failTurn fails the in-flight turn immediately (used when claude died and the
@@ -471,50 +540,21 @@ func (mgr *Manager) failTurn(id, reason string) {
 	}
 	now := mgr.now()
 	started := mgr.currentStarted
-	_ = mgr.store.Fail(id, reason, now)
+	if err := mgr.store.Fail(id, reason, now); err != nil {
+		// Correlation bug: the record is missing. Do not bump metrics or fire
+		// a phantom callback (finding 6).
+		mgr.mu.Unlock()
+		mgr.log.Error("store.Fail returned error in failTurn; skipping metrics and callback",
+			"action", "turn_fail", "turn_id", id, "reason", reason, "err", err)
+		return
+	}
 	mgr.clearCurrentLocked(Dead)
+	mgr.currentSessionID = ""
 	mgr.m.TurnsTotal.WithLabelValues("failed").Inc()
 	mgr.m.TurnDuration.Observe(now.Sub(started).Seconds())
 	rec, _ := mgr.store.Get(id)
 	mgr.mu.Unlock()
 	mgr.log.Warn("turn failed", "action", "turn_fail", "turn_id", id, "reason", reason, "duration_ms", now.Sub(started).Milliseconds())
-	mgr.fireDone(rec)
-}
-
-// handleExit is kept for backwards compatibility with SimulateExitForTest.
-// It drives the old "fail immediately on exit" path used by unit tests that
-// test the legacy behaviour (prior to the restart loop). The new path goes
-// through watch(). The test helper calls this directly, bypassing watch().
-func (mgr *Manager) handleExit(err error) {
-	mgr.mu.Lock()
-	if mgr.stopping {
-		mgr.state = Dead
-		mgr.mu.Unlock()
-		mgr.log.Info("claude stopped (shutdown)")
-		return
-	}
-	id := mgr.current
-	var rec *turn.Record
-	var durMs int64
-	if id != "" {
-		if mgr.timer != nil {
-			mgr.timer.Stop()
-		}
-		now := mgr.now()
-		durMs = now.Sub(mgr.currentStarted).Milliseconds()
-		_ = mgr.store.Fail(id, "claude exited", now)
-		mgr.clearCurrentLocked(Ready) // sets state = Ready; overridden to Dead below
-		mgr.m.TurnsTotal.WithLabelValues("failed").Inc()
-		rec, _ = mgr.store.Get(id)
-	}
-	mgr.state = Dead
-	mgr.mu.Unlock()
-
-	mgr.m.ClaudeRestarts.Inc()
-	if id != "" {
-		mgr.log.Warn("turn failed: claude exited", "action", "turn_fail", "turn_id", id, "duration_ms", durMs)
-	}
-	mgr.log.Error("claude exited", "err", err, "pty_tail", mgr.ring.tail(800))
 	mgr.fireDone(rec)
 }
 
@@ -559,28 +599,39 @@ func (mgr *Manager) Submit(text, callbackURL string) (string, error) {
 // touch the current turn id, state, or timeout: the running turn absorbs the
 // input and still completes with a single Stop hook. Returns ErrNotBusy when no
 // turn is in flight (callers should Submit a fresh turn instead).
+//
+// The lock is released before the SubmitDelay sleep so that concurrent callers
+// (Complete, Snapshot, failTimeout) are not blocked during the deliberate
+// keystroke pause (finding 9).
 func (mgr *Manager) Interject(text string) error {
 	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
 	switch mgr.state {
 	case Dead:
+		mgr.mu.Unlock()
 		return fmt.Errorf("session dead")
 	case Booting:
+		mgr.mu.Unlock()
 		return fmt.Errorf("session not ready")
 	}
 	if mgr.current == "" {
+		mgr.mu.Unlock()
 		return ErrNotBusy
 	}
+	turnID := mgr.current
+	w := mgr.w
 	seq := mgr.cfg.SubmitSeq
-	if _, err := mgr.w.Write([]byte(seq.PasteStart + text + seq.PasteEnd)); err != nil {
+	mgr.mu.Unlock()
+
+	// Writes and sleep happen outside the lock (finding 9).
+	if _, err := w.Write([]byte(seq.PasteStart + text + seq.PasteEnd)); err != nil {
 		return fmt.Errorf("write pty paste: %w", err)
 	}
 	time.Sleep(mgr.cfg.SubmitDelay)
-	if _, err := mgr.w.Write([]byte(seq.Submit)); err != nil {
+	if _, err := w.Write([]byte(seq.Submit)); err != nil {
 		return fmt.Errorf("write pty submit: %w", err)
 	}
 	mgr.m.Interjections.Inc()
-	mgr.log.Info("turn interjection", "action", "interject", "turn_id", mgr.current)
+	mgr.log.Info("turn interjection", "action", "interject", "turn_id", turnID)
 	return nil
 }
 
@@ -591,6 +642,19 @@ func (mgr *Manager) Complete(r HookResult) error {
 	if id == "" {
 		mgr.mu.Unlock()
 		return fmt.Errorf("no in-flight turn")
+	}
+	// Reject stale/duplicate hooks: if this is not the first hook for this turn
+	// and the session already has a recorded SessionID that differs, the hook
+	// is for a previously completed turn or a dead process (finding 3).
+	if r.SessionID != "" && mgr.currentSessionID != "" && r.SessionID != mgr.currentSessionID {
+		mgr.mu.Unlock()
+		mgr.log.Warn("hook session id mismatch; rejecting stale hook",
+			"turn_id", id, "expected_session_id", mgr.currentSessionID, "got_session_id", r.SessionID)
+		return fmt.Errorf("hook session id mismatch: stale or duplicate hook")
+	}
+	// Record the SessionID on first hook so subsequent duplicates can be detected.
+	if r.SessionID != "" && mgr.currentSessionID == "" {
+		mgr.currentSessionID = r.SessionID
 	}
 	if mgr.timer != nil {
 		mgr.timer.Stop()
@@ -608,7 +672,9 @@ func (mgr *Manager) Complete(r HookResult) error {
 				path := mgr.transcriptPath
 				tailer := mgr.tailer
 				tailerCtx := mgr.tailerCtx
+				mgr.wg.Add(1)
 				go func() {
+					defer mgr.wg.Done()
 					if err := tailer.Follow(tailerCtx, path); err != nil && tailerCtx.Err() == nil {
 						mgr.log.Error("transcript tailer error", "err", err)
 					}
@@ -624,7 +690,9 @@ func (mgr *Manager) Complete(r HookResult) error {
 				mgr.tailerCancel = newCancel
 				path := mgr.transcriptPath
 				tailer := mgr.tailer
+				mgr.wg.Add(1)
 				go func() {
+					defer mgr.wg.Done()
 					if err := tailer.Follow(newCtx, path); err != nil && newCtx.Err() == nil {
 						mgr.log.Error("transcript tailer error", "err", err)
 					}
@@ -635,15 +703,21 @@ func (mgr *Manager) Complete(r HookResult) error {
 			}
 		}
 	}
-	_ = mgr.store.Complete(id, r.FinalText, r.ResultJSON, r.Usage, r.StopReason, now)
+	if err := mgr.store.Complete(id, r.FinalText, r.ResultJSON, r.Usage, r.StopReason, now); err != nil {
+		// Record not found means a correlation bug (e.g. stale hook after store
+		// reset). Do not bump success metrics or fire a phantom completion (finding 6).
+		mgr.mu.Unlock()
+		mgr.log.Error("store.Complete returned error; skipping metrics and callback",
+			"action", "turn_complete", "turn_id", id, "err", err)
+		return fmt.Errorf("store Complete %s: %w", id, err)
+	}
 	mgr.clearCurrentLocked(Ready)
-	mgr.restarts = 0 // a completed turn proves the session healthy
+	mgr.turnsSucceeded++
+	mgr.restarts = 0          // a completed turn proves the session healthy
+	mgr.currentSessionID = "" // clear for next turn
 	mgr.m.HookReceived.Inc()
 	mgr.m.TurnsTotal.WithLabelValues("complete").Inc()
 	mgr.m.TurnDuration.Observe(now.Sub(started).Seconds())
-	if r.SessionID != "" {
-		mgr.log.Debug("hook session id", "session_id", r.SessionID)
-	}
 	rec, _ := mgr.store.Get(id)
 	mgr.mu.Unlock()
 	mgr.log.Info("turn complete", "action", "turn_complete", "turn_id", id, "duration_ms", now.Sub(started).Milliseconds())
@@ -659,8 +733,16 @@ func (mgr *Manager) failTimeout(id string) {
 	}
 	now := mgr.now()
 	started := mgr.currentStarted
-	_ = mgr.store.Fail(id, "turn timed out", now)
+	if err := mgr.store.Fail(id, "turn timed out", now); err != nil {
+		// Correlation bug: record missing. Do not bump metrics or fire a phantom
+		// callback (finding 6).
+		mgr.mu.Unlock()
+		mgr.log.Error("store.Fail returned error in failTimeout; skipping metrics and callback",
+			"action", "turn_timeout", "turn_id", id, "err", err)
+		return
+	}
 	mgr.clearCurrentLocked(Ready)
+	mgr.currentSessionID = ""
 	mgr.m.TurnsTotal.WithLabelValues("failed").Inc()
 	mgr.m.TurnDuration.Observe(now.Sub(started).Seconds())
 	rec, _ := mgr.store.Get(id)
@@ -671,7 +753,7 @@ func (mgr *Manager) failTimeout(id string) {
 
 func (mgr *Manager) clearCurrentLocked(next State) {
 	mgr.current = ""
-	mgr.turnsCompleted++
+	mgr.turnsCompleted++ // all terminal turns (success + failed + timed-out)
 	mgr.state = next
 	mgr.m.TurnInFlight.Set(0)
 }
@@ -685,7 +767,13 @@ func (mgr *Manager) fireDone(rec *turn.Record) {
 func (mgr *Manager) Snapshot() Snapshot {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
-	return Snapshot{State: mgr.state, TurnsCompleted: mgr.turnsCompleted, Model: mgr.cfg.Model, Repo: mgr.cfg.Repo}
+	return Snapshot{
+		State:          mgr.state,
+		TurnsCompleted: mgr.turnsSucceeded, // successful turns only (finding 11)
+		TurnsFinished:  mgr.turnsCompleted, // all terminal turns
+		Model:          mgr.cfg.Model,
+		Repo:           mgr.cfg.Repo,
+	}
 }
 
 func (mgr *Manager) Alive() bool {
@@ -723,6 +811,16 @@ func (mgr *Manager) Shutdown(ctx context.Context) error {
 		if cp, ok := proc.(*claudeProc); ok {
 			_ = cp.cmd.Process.Kill()
 		}
+	}
+	// Wait for lifecycle goroutines (readPTY, watch, tailer Follow) to drain,
+	// with a bounded timeout so Shutdown does not hang forever (finding 13).
+	done := make(chan struct{})
+	go func() { mgr.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(goroutineJoinTimeout):
+		mgr.log.Warn("shutdown: goroutine join timed out", "timeout", goroutineJoinTimeout)
+	case <-ctx.Done():
 	}
 	return nil
 }
