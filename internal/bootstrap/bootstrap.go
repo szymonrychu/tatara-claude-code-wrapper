@@ -81,37 +81,43 @@ func Render(p Params, git GitRunner) error {
 		if err := configureGit(p, git); err != nil {
 			return err
 		}
-		for _, r := range p.Repos {
+		for i, r := range p.Repos {
+			// Primary repo is always Repos[0], identified by position rather than
+			// URL comparison so that an empty p.RepoURL never masks a clone failure.
+			isPrimary := i == 0
 			ns := namespacePath(r.URL)
 			// Guard: an empty namespace path would resolve to the workspace root,
 			// overwriting session config files (.mcp.json, CLAUDE.md, settings).
 			if ns == "" || filepath.Clean(filepath.Join(p.Workspace, ns)) == filepath.Clean(p.Workspace) {
-				if r.URL == p.RepoURL {
+				if isPrimary {
 					return fmt.Errorf("cannot derive namespace path from URL %q: would clone into workspace root", r.URL)
 				}
 				continue // non-primary: skip silently
 			}
 			dest := filepath.Join(p.Workspace, ns)
 			if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-				if r.URL == p.RepoURL {
+				if isPrimary {
 					return fmt.Errorf("mkdir parent for primary repo %s: %w", r.Name, err)
 				}
 				continue // non-primary parent-dir failure: skip
 			}
 			cloneStart := time.Now()
-			args := []string{"clone", "--depth", "1"}
-			if r.Branch != "" {
-				args = append(args, "--branch", r.Branch)
-			}
-			args = append(args, r.URL, dest)
-			if err := git(p.Workspace, args...); err != nil {
-				if p.M != nil {
-					p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
+			// Skip clone when the repo is already present (pod restart with persistent workspace).
+			if _, statErr := os.Stat(filepath.Join(dest, ".git")); os.IsNotExist(statErr) {
+				args := []string{"clone", "--depth", "1"}
+				if r.Branch != "" {
+					args = append(args, "--branch", r.Branch)
 				}
-				if r.URL == p.RepoURL {
-					return fmt.Errorf("clone primary repo %s: %w", r.Name, err)
+				args = append(args, r.URL, dest)
+				if err := git(p.Workspace, args...); err != nil {
+					if p.M != nil {
+						p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
+					}
+					if isPrimary {
+						return fmt.Errorf("clone primary repo %s: %w", r.Name, err)
+					}
+					continue // non-primary clone failure: skip
 				}
-				continue // non-primary clone failure: skip
 			}
 			action := "clone"
 			if p.TaskBranch != "" {

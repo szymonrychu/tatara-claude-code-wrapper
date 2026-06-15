@@ -414,6 +414,56 @@ func TestRender_WithoutLogAndMetrics(t *testing.T) {
 	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { return nil }))
 }
 
+// TestRender_MCPJsonPermissions verifies that .mcp.json is written 0644
+// (non-secret config) rather than 0600 (finding 7).
+func TestRender_MCPJsonPermissions(t *testing.T) {
+	ws := t.TempDir()
+	p := bootstrap.Params{
+		HomeDir:        t.TempDir(),
+		Workspace:      ws,
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+	}
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { return nil }))
+	info, err := os.Stat(filepath.Join(ws, ".mcp.json"))
+	require.NoError(t, err)
+	got := info.Mode().Perm()
+	require.Equal(t, os.FileMode(0o644), got, ".mcp.json must be 0644, got %o", got)
+}
+
+// TestRender_MultiRepo_PrimaryIdentifiedByPosition verifies that a clone failure
+// of the first repo (index 0) is escalated even when p.RepoURL is empty
+// (finding 2: primary by position, not URL match).
+func TestRender_MultiRepo_PrimaryIdentifiedByPosition(t *testing.T) {
+	fakeGit := func(dir string, args ...string) error {
+		// Fail all clone calls to trigger the primary escalation path.
+		for _, a := range args {
+			if a == "clone" {
+				return fmt.Errorf("clone failed: network unreachable")
+			}
+		}
+		return nil
+	}
+
+	p := bootstrap.Params{
+		HomeDir:        t.TempDir(),
+		Workspace:      t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+		RepoURL:        "", // intentionally empty
+		Repos: []bootstrap.RepoSpec{
+			{Name: "primary", URL: "https://github.com/owner/primary.git", Branch: "main"},
+			{Name: "secondary", URL: "https://github.com/owner/secondary.git", Branch: "main"},
+		},
+	}
+
+	err := bootstrap.Render(p, fakeGit)
+	require.Error(t, err, "clone failure of Repos[0] must return an error even when p.RepoURL is empty")
+	require.Contains(t, err.Error(), "primary")
+}
+
 var _ = io.Discard // keep io import if unused
 
 func TestRender_ConfiguresGitCredentialsAndIdentityBeforeClone(t *testing.T) {

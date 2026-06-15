@@ -34,7 +34,7 @@ projectClaudeMd: ""
 allowedTools: []
 extraMcpServers: {}
 baseMcp: |
-  {"mcpServers":{"tatara-memory":{"type":"stdio","command":"tatara","args":["mcp"]}}}
+  {"mcpServers":{}}
 
 # secrets via external Secret (sops); set existingSecret to override
 existingSecret: ""

@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 )
 
@@ -49,7 +50,11 @@ func CommitAndPush(dir, branch, message string, git GitRunner) error {
 // CommitAndPushAll runs CommitAndPush in each repo dir under workspace.
 func CommitAndPushAll(workspace string, repos []RepoSpec, branch, message string, git GitRunner) error {
 	for _, r := range repos {
-		dir := filepath.Join(workspace, namespacePath(r.URL))
+		ns := namespacePath(r.URL)
+		if ns == "" || filepath.Clean(filepath.Join(workspace, ns)) == filepath.Clean(workspace) {
+			continue // no valid namespace: skip to avoid operating on the workspace root
+		}
+		dir := filepath.Join(workspace, ns)
 		if err := CommitAndPush(dir, branch, message, git); err != nil {
 			return fmt.Errorf("commit/push %s: %w", r.Name, err)
 		}
@@ -58,14 +63,16 @@ func CommitAndPushAll(workspace string, repos []RepoSpec, branch, message string
 }
 
 // cloneRepo shallow-clones RepoURL@RepoBranch into the workspace.
+// On pod restart with a persistent workspace the .git dir already exists;
+// skip the clone in that case and let checkoutTaskBranch handle the resume.
 func cloneRepo(p Params, git GitRunner) error {
+	if _, err := os.Stat(filepath.Join(p.Workspace, ".git")); err == nil {
+		return nil // already cloned; resume path handles the rest
+	}
 	args := []string{"clone", "--depth", "1"}
 	if p.RepoBranch != "" {
 		args = append(args, "--branch", p.RepoBranch)
 	}
 	args = append(args, p.RepoURL, p.Workspace)
-	if err := git(p.Workspace, args...); err != nil {
-		return err
-	}
-	return nil
+	return git(p.Workspace, args...)
 }

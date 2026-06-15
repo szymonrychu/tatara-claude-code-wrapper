@@ -37,6 +37,32 @@ func TestDiscoverySkillsPresentAndValid(t *testing.T) {
 	}
 }
 
+// TestInstallSkills_PreservesExecutableBit verifies that copyFile/copyTree keep
+// the source file mode (finding 1: exec bit on skill scripts must survive).
+func TestInstallSkills_PreservesExecutableBit(t *testing.T) {
+	src := t.TempDir()
+	skillDir := filepath.Join(src, "brainstorming", "scripts")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(skillDir, "start-server.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ws := t.TempDir()
+	if err := installSkills(Params{Workspace: ws, SkillsSrc: []string{src}}); err != nil {
+		t.Fatalf("installSkills: %v", err)
+	}
+	dst := filepath.Join(ws, ".claude", "skills", "brainstorming", "scripts", "start-server.sh")
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("stat copied script: %v", err)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("exec bit lost: got mode %o, expected at least 0o111 set", info.Mode().Perm())
+	}
+}
+
 func TestInstallSkills_CopiesDeployHarness(t *testing.T) {
 	src := t.TempDir()
 	// mimic the baked layout: <src>/tatara-deploy-harness/SKILL.md

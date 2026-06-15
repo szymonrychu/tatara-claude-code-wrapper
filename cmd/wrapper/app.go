@@ -40,11 +40,9 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		return nil, err
 	}
 	bootstrap.InstallHooks(cfg.Workspace, cfg.Repos, cfg.RepoURL, execRunnerDir(log))
-	if os.Getenv("TATARA_MEMORY_URL") != "" {
-		if _, lookErr := exec.LookPath("tatara"); lookErr == nil {
-			if err := bootstrap.RegisterTataraMCP(cfg.Workspace, execRunner(log)); err != nil {
-				log.Error("tatara mcp-config failed", "error", err)
-			}
+	if _, lookErr := exec.LookPath("tatara"); lookErr == nil {
+		if err := bootstrap.RegisterTataraMCP(cfg.Workspace, execRunner(log)); err != nil {
+			log.Error("tatara mcp-config failed", "error", err)
 		}
 	}
 
