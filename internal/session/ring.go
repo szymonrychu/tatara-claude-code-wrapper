@@ -35,6 +35,17 @@ func (r *ringBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// reset clears the buffered output so dialog detection starts fresh, while
+// leaving total monotonic. Called once per relaunch: each freshly-booted claude
+// must navigate against only its own output, not the dead proc's stale dialog
+// text still resident in the buffer. total is preserved so bootWait's
+// written() quiescence baseline keeps working across the relaunch.
+func (r *ringBuffer) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.buf = nil
+}
+
 // written returns the monotonic byte count, used to detect when output settles.
 func (r *ringBuffer) written() int {
 	r.mu.Lock()
