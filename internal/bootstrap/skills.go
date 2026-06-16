@@ -8,7 +8,10 @@ import (
 )
 
 // installSkills copies every skill tree under each SkillsSrc dir into
-// /workspace/.claude/skills, so baked + custom skills coexist.
+// /workspace/.claude/skills, so baked + custom skills coexist. Sources are
+// processed in order; later sources win on name collision (custom overrides
+// baked). A debug log is emitted when an existing target is overwritten so
+// the shadowing is visible in agent logs.
 func installSkills(p Params) error {
 	dst := filepath.Join(p.Workspace, ".claude", "skills")
 	if err := os.MkdirAll(dst, 0o755); err != nil {
@@ -21,14 +24,14 @@ func installSkills(p Params) error {
 		if _, err := os.Stat(src); os.IsNotExist(err) {
 			continue
 		}
-		if err := copyTree(src, dst); err != nil {
+		if err := copyTreeWithLog(src, dst, p); err != nil {
 			return fmt.Errorf("install skills from %s: %w", src, err)
 		}
 	}
 	return nil
 }
 
-func copyTree(src, dst string) error {
+func copyTreeWithLog(src, dst string, p Params) error {
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -40,6 +43,10 @@ func copyTree(src, dst string) error {
 		target := filepath.Join(dst, rel)
 		if info.IsDir() {
 			return os.MkdirAll(target, 0o755)
+		}
+		if _, statErr := os.Stat(target); statErr == nil && p.Log != nil {
+			// Target exists: later source is shadowing an earlier one.
+			p.Log.Info("skill shadowed", "action", "install_skills", "rel", rel, "src", src)
 		}
 		return copyFile(path, target, info.Mode().Perm())
 	})

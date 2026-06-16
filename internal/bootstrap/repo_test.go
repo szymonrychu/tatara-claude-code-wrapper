@@ -65,12 +65,15 @@ func TestCommitAndPushAll_SkipsEmptyNamespace(t *testing.T) {
 	require.Len(t, addCalls, 1, "git add must run exactly once (for good repo only)")
 }
 
-// TestCloneRepo_SkipsWhenGitDirExists asserts that cloneRepo is a no-op when
-// the workspace already contains a .git directory (pod restart resume, finding 6).
+// TestCloneRepo_SkipsWhenGitDirExists asserts that Render skips clone when the
+// repo's namespace subdir already contains a .git directory (pod restart
+// resume, finding 6). The .git dir is at workspace/owner/repo/.git, not at
+// workspace root, because single-repo mode now clones into a namespace subdir.
 func TestCloneRepo_SkipsWhenGitDirExists(t *testing.T) {
 	ws := t.TempDir()
-	// Pre-create a .git marker to simulate an already-cloned workspace.
-	if err := os.MkdirAll(filepath.Join(ws, ".git"), 0o755); err != nil {
+	// Pre-create a .git marker at the namespace-subdir path for
+	// "https://github.com/x/y" to simulate an already-cloned workspace.
+	if err := os.MkdirAll(filepath.Join(ws, "x", "y", ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 

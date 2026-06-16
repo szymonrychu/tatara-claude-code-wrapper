@@ -37,8 +37,11 @@ func namespacePath(cloneURL string) string {
 	s = strings.Trim(s, "/")
 	// Now s is host[:port]/owner[/subgroups]/repo OR owner[/subgroups]/repo.
 	parts := strings.Split(s, "/")
-	// If the first segment looks like a host (contains '.' or ':'), drop it.
-	if len(parts) > 1 && (strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":")) {
+	// When the URL had an explicit scheme (hasSchemeSep) the first segment is
+	// always the host and must be dropped unconditionally. The old dot/colon
+	// heuristic incorrectly kept dotless hostnames (e.g. "gitea") as the owner
+	// segment, producing three-segment paths like gitea/owner/repo.
+	if hasSchemeSep && len(parts) > 0 {
 		parts = parts[1:]
 	}
 	out := strings.Join(parts, "/")

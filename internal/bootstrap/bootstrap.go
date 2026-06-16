@@ -55,7 +55,7 @@ func checkoutTaskBranch(dir, taskBranch string, git GitRunner) (resumed bool, er
 	branchExists := git(dir, "ls-remote", "--exit-code", "--heads", "origin", taskBranch) == nil
 	if branchExists {
 		// Unshallow so the rebase against origin/<default> has a merge base. The
-		// clone is always --depth 1 (cloneRepo / the multi-repo clone above), so
+		// clone is always --depth 1 (single-repo or multi-repo clone above), so
 		// unshallow always applies and a failure here is real (network), not the
 		// benign "already complete" case -- propagate it rather than proceed with a
 		// shallow clone whose rebase would fail with no merge base.
@@ -159,16 +159,35 @@ func Render(p Params, git GitRunner) error {
 		if err := configureGit(p, git); err != nil {
 			return err
 		}
+		// Clone into a namespace subdir (workspace/owner/repo) rather than the
+		// workspace root. This keeps injected session files (CLAUDE.md, .mcp.json)
+		// at the workspace root outside the repo's working tree, so they are
+		// never staged by CommitAndPush's `git add -A` and cannot pollute the PR.
+		ns := namespacePath(p.RepoURL)
+		if ns == "" || filepath.Clean(filepath.Join(p.Workspace, ns)) == filepath.Clean(p.Workspace) {
+			return fmt.Errorf("cannot derive namespace path from URL %q: would clone into workspace root", p.RepoURL)
+		}
+		repoDest := filepath.Join(p.Workspace, ns)
+		if err := os.MkdirAll(filepath.Dir(repoDest), 0o755); err != nil {
+			return fmt.Errorf("mkdir parent for repo %s: %w", p.RepoURL, err)
+		}
 		cloneStart := time.Now()
-		if err := cloneRepo(p, git); err != nil {
-			if p.M != nil {
-				p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
+		if _, statErr := os.Stat(filepath.Join(repoDest, ".git")); os.IsNotExist(statErr) {
+			args := []string{"clone", "--depth", "1"}
+			if p.RepoBranch != "" {
+				args = append(args, "--branch", p.RepoBranch)
 			}
-			return err
+			args = append(args, p.RepoURL, repoDest)
+			if err := git(p.Workspace, args...); err != nil {
+				if p.M != nil {
+					p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
+				}
+				return fmt.Errorf("clone repo %s: %w", p.RepoURL, err)
+			}
 		}
 		action := "clone"
 		if p.TaskBranch != "" {
-			resumed, err := checkoutTaskBranch(p.Workspace, p.TaskBranch, git)
+			resumed, err := checkoutTaskBranch(repoDest, p.TaskBranch, git)
 			if err != nil {
 				if p.M != nil {
 					p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
