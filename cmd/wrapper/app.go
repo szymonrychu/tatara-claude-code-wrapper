@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/auth"
@@ -29,6 +30,10 @@ type app struct {
 	sess     *session.Manager
 	sender   *webhook.Sender
 	pusher   *pushclient.Pusher
+	// turnWG tracks the per-turn finalisation goroutines (commit/push then
+	// callback) spawned by OnTurnDone so shutdown can drain them and never lose
+	// the agent's commits to a pod teardown mid-push.
+	turnWG sync.WaitGroup
 }
 
 func newApp(ctx context.Context, cfg config) (*app, error) {
@@ -66,43 +71,52 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 
 	sender := webhook.New(webhook.Config{Retries: cfg.WebhookRetries}, m, log)
 	defaultCB := cfg.DefaultCallbackURL
-	sess.OnTurnDone = func(rec *turn.Record) {
-		// Deliver the webhook callback immediately, before the (potentially
-		// slow) git push, so cc-stop-hook's POST /internal/turn-complete
-		// returns well within its 5s per-attempt budget.
-		url := rec.CallbackURL
-		if url == "" {
-			url = defaultCB
-		}
-		sender.Deliver(url, rec)
 
-		// Enforce the branch+commit+push contract the agent is asked to follow
-		// but does not reliably perform, so the operator's write-back finds the
-		// branch. Run in a background goroutine: git push can take many seconds
-		// (network, large diffs) and must not block the cc-stop-hook HTTP path.
-		if cfg.TaskBranch != "" {
-			go func() {
+	a := &app{
+		log:      log,
+		sess:     sess,
+		sender:   sender,
+		pub:      &http.Server{Addr: cfg.HTTPAddr, ReadHeaderTimeout: 10 * time.Second},
+		internal: &http.Server{Addr: cfg.InternalAddr, ReadHeaderTimeout: 10 * time.Second},
+	}
+
+	sess.OnTurnDone = func(rec *turn.Record) {
+		// Run the whole finalisation off the cc-stop-hook HTTP request goroutine:
+		// OnTurnDone is invoked synchronously inside Complete, so a slow git push
+		// here would block POST /internal/turn-complete past cc-stop-hook's 5s
+		// per-attempt budget and trigger spurious retries. Tracked by turnWG so
+		// shutdown drains it and the agent's commits are never lost to a pod
+		// teardown that races the push.
+		a.turnWG.Add(1)
+		go func() {
+			defer a.turnWG.Done()
+			// Push BEFORE the callback: the operator's write-back reads the task
+			// branch on receipt of the callback, so the branch must already carry
+			// the agent's commits. A push failure is logged but must not drop the
+			// callback (the operator still needs to learn the turn finished).
+			if cfg.TaskBranch != "" {
+				pushStart := time.Now()
+				var err error
 				if len(cfg.Repos) > 0 {
-					pushStart := time.Now()
-					if err := bootstrap.CommitAndPushAll(cfg.Workspace, cfg.Repos, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner()); err != nil {
-						m.CommitPushTotal.WithLabelValues("fail").Inc()
-						log.Error("commit/push failed", "action", "commit_push", "error", err, "duration_ms", time.Since(pushStart).Milliseconds())
-					} else {
-						m.CommitPushTotal.WithLabelValues("ok").Inc()
-						log.Info("commit/push succeeded", "action", "commit_push", "branch", cfg.TaskBranch, "duration_ms", time.Since(pushStart).Milliseconds())
-					}
+					err = bootstrap.CommitAndPushAll(cfg.Workspace, cfg.Repos, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
 				} else {
-					pushStart := time.Now()
-					if err := bootstrap.CommitAndPush(cfg.Workspace, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner()); err != nil {
-						m.CommitPushTotal.WithLabelValues("fail").Inc()
-						log.Error("commit/push task branch failed", "action", "commit_push", "branch", cfg.TaskBranch, "error", err, "duration_ms", time.Since(pushStart).Milliseconds())
-					} else {
-						m.CommitPushTotal.WithLabelValues("ok").Inc()
-						log.Info("commit/push succeeded", "action", "commit_push", "branch", cfg.TaskBranch, "duration_ms", time.Since(pushStart).Milliseconds())
-					}
+					err = bootstrap.CommitAndPush(cfg.Workspace, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
 				}
-			}()
-		}
+				if err != nil {
+					m.CommitPushTotal.WithLabelValues("fail").Inc()
+					log.Error("commit/push failed", "action", "commit_push", "branch", cfg.TaskBranch, "error", err, "duration_ms", time.Since(pushStart).Milliseconds())
+				} else {
+					m.CommitPushTotal.WithLabelValues("ok").Inc()
+					log.Info("commit/push succeeded", "action", "commit_push", "branch", cfg.TaskBranch, "duration_ms", time.Since(pushStart).Milliseconds())
+				}
+			}
+
+			url := rec.CallbackURL
+			if url == "" {
+				url = defaultCB
+			}
+			sender.Deliver(url, rec)
+		}()
 	}
 
 	sess.StartTailer(ctx)
@@ -121,25 +135,20 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	}
 
 	api := httpapi.New(httpapi.Deps{Ctl: sess, Store: store, Verifier: verifier, Log: log, Registry: reg, Metrics: m})
+	a.pub.Handler = api.Router()
+	a.internal.Handler = api.InternalRouter()
 
 	// Push-metrics client: this Pod is too short-lived to be reliably scraped,
 	// so it pushes its /metrics to the operator's push-receiver. A no-op unless
 	// the operator wired OPERATOR_PUSH_URL + RUN_ID.
-	pusher := pushclient.New(pushclient.Config{
+	a.pusher = pushclient.New(pushclient.Config{
 		URL:      cfg.OperatorPushURL,
 		RunID:    cfg.RunID,
 		Pod:      cfg.PodName,
 		Interval: time.Duration(cfg.PushIntervalSeconds) * time.Second,
 	}, reg, log, m)
 
-	return &app{
-		log:      log,
-		sess:     sess,
-		sender:   sender,
-		pusher:   pusher,
-		pub:      &http.Server{Addr: cfg.HTTPAddr, Handler: api.Router(), ReadHeaderTimeout: 10 * time.Second},
-		internal: &http.Server{Addr: cfg.InternalAddr, Handler: api.InternalRouter(), ReadHeaderTimeout: 10 * time.Second},
-	}, nil
+	return a, nil
 }
 
 func (a *app) run() error {
@@ -155,6 +164,17 @@ func (a *app) shutdown(ctx context.Context) error {
 	// the operator drops them immediately rather than waiting for the TTL.
 	a.pusher.Shutdown(ctx)
 	_ = a.sess.Shutdown(ctx)
+	// Drain the per-turn finalisation goroutines (commit/push then callback)
+	// before tearing down the sender, so a push in flight is allowed to finish
+	// and its callback is enqueued rather than dropped. Bounded by ctx via the
+	// select below so a hung push cannot block shutdown indefinitely.
+	turnsDone := make(chan struct{})
+	go func() { a.turnWG.Wait(); close(turnsDone) }()
+	select {
+	case <-turnsDone:
+	case <-ctx.Done():
+		a.log.Warn("shutdown: turn finalisation goroutines did not drain in time", "err", ctx.Err())
+	}
 	// Drain in-flight webhook deliveries within a bounded window so retries
 	// either complete or log a clean abort instead of being orphaned at exit.
 	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)

@@ -6,7 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,70 +64,84 @@ func TestTataraLookAndRegister_OK(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Finding 2: OnTurnDone must not block: commit/push runs in a background
-// goroutine; Deliver (webhook) is called before the push completes.
+// Finding 2: OnTurnDone must not block the cc-stop-hook HTTP request goroutine,
+// AND must push the agent's commits BEFORE firing the operator callback (the
+// operator's write-back reads the task branch on callback receipt). The whole
+// finalisation runs in a tracked background goroutine.
 // ---------------------------------------------------------------------------
 
-func TestOnTurnDoneOrder_DeliverBeforePushCompletes(t *testing.T) {
-	delivered := make(chan struct{})
-	var pushStarted atomic.Bool
+func TestOnTurnDoneOrder_PushBeforeDeliver_NonBlocking(t *testing.T) {
+	var (
+		mu        sync.Mutex
+		order     []string
+		pushBegan = make(chan struct{})
+		pushHold  = make(chan struct{})
+		delivered = make(chan struct{})
+	)
 
-	// Slow push: blocks until the test releases it.
-	pushDone := make(chan struct{})
 	pushFn := func() error {
-		pushStarted.Store(true)
-		<-pushDone // simulate slow network push
+		close(pushBegan)
+		<-pushHold // simulate a slow network push
+		mu.Lock()
+		order = append(order, "push")
+		mu.Unlock()
 		return nil
 	}
-
-	// deliverFn records when the callback fires.
 	deliverFn := func() {
+		mu.Lock()
+		order = append(order, "deliver")
+		mu.Unlock()
 		close(delivered)
 	}
 
-	// Build a handler equivalent to the fixed OnTurnDone.
 	handler := buildOnTurnDoneHandler("branch-123", pushFn, deliverFn)
 
-	// Call handler (simulates fireDone on the request goroutine).
-	done := make(chan struct{})
+	// Call handler on a separate goroutine and assert it returns immediately:
+	// it must NOT block the caller (the HTTP request goroutine) on the push.
+	handlerReturned := make(chan struct{})
 	go func() {
 		handler()
-		close(done)
+		close(handlerReturned)
 	}()
+	select {
+	case <-handlerReturned:
+	case <-time.After(time.Second):
+		t.Fatal("OnTurnDone blocked the caller; finalisation must run in a background goroutine")
+	}
 
-	// deliverFn must be called promptly (before push finishes).
+	// The push must start, and the callback must NOT fire until the push completes.
+	<-pushBegan
 	select {
 	case <-delivered:
-		// good: deliver called
-	case <-time.After(2 * time.Second):
-		t.Fatal("deliver was not called within 2s; handler is blocking on push")
+		t.Fatal("deliver fired before push completed; operator may write-back a branch missing the agent's commits")
+	case <-time.After(100 * time.Millisecond):
+		// good: deliver is still waiting on the push
 	}
 
-	// The handler goroutine must have returned by now (non-blocking).
+	// Release the push; deliver must then fire, and order must be push then deliver.
+	close(pushHold)
 	select {
-	case <-done:
-		// good
+	case <-delivered:
 	case <-time.After(2 * time.Second):
-		t.Fatal("OnTurnDone handler goroutine did not return; still blocking")
+		t.Fatal("deliver never fired after push completed")
 	}
 
-	// Unblock the push and verify it ran.
-	close(pushDone)
-	// Wait a moment for the background goroutine to complete.
-	time.Sleep(50 * time.Millisecond)
-	assert.True(t, pushStarted.Load(), "push should have started in background")
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{"push", "deliver"}, order, "push must precede deliver")
 }
 
 // buildOnTurnDoneHandler returns a closure mirroring the fixed OnTurnDone
-// logic: Deliver synchronously first, then push in a background goroutine.
+// logic: the whole finalisation runs in a background goroutine (so the caller
+// returns immediately) and pushes BEFORE delivering the callback.
 func buildOnTurnDoneHandler(taskBranch string, pushFn func() error, deliverFn func()) func() {
 	return func() {
-		// Deliver first (synchronous, matches fixed app.go).
-		deliverFn()
-		// Push in background so the handler returns immediately.
-		if taskBranch != "" {
-			go func() { _ = pushFn() }()
-		}
+		go func() {
+			if taskBranch != "" {
+				_ = pushFn()
+			}
+			deliverFn()
+		}()
 	}
 }
 

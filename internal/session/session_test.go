@@ -496,6 +496,52 @@ func TestWritePTYStoreFail_DistinctMessages(t *testing.T) {
 	require.Contains(t, rec.Error, "paste", "store.Fail message should say 'paste', not generic 'write pty'")
 }
 
+// TestSubmit_WriteFailure_CountsFailedTurn verifies that a Submit that fails on
+// the PTY write (after reserving the turn slot) records ccw_turns_total{result=failed}
+// so the terminal-result metric stays consistent with turnsCompleted (which
+// clearCurrentLocked increments). A reserved-but-not-counted turn was invisible
+// in ccw_turns_total before the fix.
+func TestSubmit_WriteFailure_CountsFailedTurn(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	store := turn.NewStore()
+	mgr := session.New(
+		session.Config{TurnTimeout: time.Second, SubmitSeq: session.DefaultSubmitSeq},
+		store, m,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return "turn-1" },
+	)
+	mgr.SetWriterForTest(&failingPTY{failOn: 0}) // fail the paste write
+
+	_, err := mgr.Submit("hi", "")
+	require.Error(t, err)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	var failed float64
+	for _, mf := range mfs {
+		if mf.GetName() == "ccw_turns_total" {
+			for _, metric := range mf.GetMetric() {
+				for _, lp := range metric.GetLabel() {
+					if lp.GetName() == "result" && lp.GetValue() == "failed" {
+						failed = metric.GetCounter().GetValue()
+					}
+				}
+			}
+		}
+	}
+	require.Equal(t, float64(1), failed, "Submit write failure must increment ccw_turns_total{result=failed}")
+
+	// The in-flight gauge must be cleared back to 0 after the failure.
+	for _, mf := range mfs {
+		if mf.GetName() == "ccw_turn_in_flight" {
+			require.Equal(t, float64(0), mf.GetMetric()[0].GetGauge().GetValue(),
+				"TurnInFlight must be reset to 0 after a Submit write failure")
+		}
+	}
+}
+
 type failingPTY struct {
 	mu     sync.Mutex
 	writes int

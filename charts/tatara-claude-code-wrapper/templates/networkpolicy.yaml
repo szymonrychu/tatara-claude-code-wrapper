@@ -21,11 +21,18 @@ spec:
       ports:
         - port: 8080
           protocol: TCP
-    # Allow Prometheus scrape of /metrics from any namespace (monitoring ns is
-    # cluster-specific; open ingress on http port matches tatara-chat pattern).
-    - ports:
+    {{- if .Values.networkPolicy.monitoringNamespace }}
+    # Allow Prometheus scrape of /metrics from the monitoring namespace only.
+    # /metrics shares the public API port (8080), so a from-less rule here would
+    # open the control API cluster-wide; restrict it to the monitoring ns instead.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.monitoringNamespace }}
+      ports:
         - port: http
           protocol: TCP
+    {{- end }}
   egress:
     - to:
         - namespaceSelector: {}

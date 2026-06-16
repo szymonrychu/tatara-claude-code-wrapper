@@ -86,21 +86,20 @@ type Manager struct {
 
 	spawn func(cfg Config, resume bool) (claudeProcess, error)
 
-	mu                    sync.Mutex
-	w                     ptyWriter
-	proc                  claudeProcess
-	ring                  *ringBuffer
-	stopping              bool
-	state                 State
-	current               string    // in-flight turn id, "" when idle
-	currentStarted        time.Time // original Submit time; basis for TurnDuration metric
-	currentTimeoutStarted time.Time // reset by resumeTurn for a fresh TurnTimeout budget
-	currentSessionID      string    // claude's sessionId for the current turn (from hook); used for correlation
-	timer                 *time.Timer
-	turnsCompleted        int // all terminal turns (success + failed + timed-out)
-	turnsSucceeded        int // successful turns only (Complete path)
-	transcriptPath        string
-	restarts              int // consecutive crash-relaunches; reset on Complete
+	mu               sync.Mutex
+	w                ptyWriter
+	proc             claudeProcess
+	ring             *ringBuffer
+	stopping         bool
+	state            State
+	current          string    // in-flight turn id, "" when idle
+	currentStarted   time.Time // original Submit time; basis for TurnDuration metric
+	currentSessionID string    // claude's sessionId for the current turn (from hook); used for correlation
+	timer            *time.Timer
+	turnsCompleted   int // all terminal turns (success + failed + timed-out)
+	turnsSucceeded   int // successful turns only (Complete path)
+	transcriptPath   string
+	restarts         int // consecutive crash-relaunches; reset on Complete
 
 	// wg tracks lifecycle goroutines (readPTY, watch, tailer Follow) so
 	// Shutdown can wait for them to drain after cancellation.
@@ -541,12 +540,10 @@ func (mgr *Manager) resumeTurn(id string) {
 		return
 	}
 	// Install a fresh timer so the resumed turn gets a full TurnTimeout budget
-	// (finding 2). The old timer was stopped by watch() before relaunch.
-	// Only reset currentTimeoutStarted (the timer anchor), NOT currentStarted
-	// (the duration anchor), so TurnDuration reflects the full wall-clock including
-	// pre-crash time (audit finding 3).
-	now := mgr.now()
-	mgr.currentTimeoutStarted = now
+	// (finding 2). The old timer was stopped by watch() before relaunch. The timer
+	// is a relative AfterFunc, so the fresh budget needs no separate anchor field;
+	// crucially we do NOT touch currentStarted, so TurnDuration still reflects the
+	// full wall-clock including pre-crash time (audit finding 3).
 	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.failTimeout(id) })
 	mgr.state = Busy
 	mgr.mu.Unlock()
@@ -604,7 +601,7 @@ func (mgr *Manager) Submit(text, callbackURL string) (string, error) {
 	mgr.store.Create(id, text, callbackURL, now)
 	// Reserve the turn slot immediately so a concurrent Submit sees ErrBusy even
 	// while we are sleeping between the paste and the submit keystroke.
-	mgr.current, mgr.currentStarted, mgr.currentTimeoutStarted, mgr.state = id, now, now, Busy
+	mgr.current, mgr.currentStarted, mgr.state = id, now, Busy
 	mgr.m.TurnInFlight.Set(1)
 	w := mgr.w
 	seq := mgr.cfg.SubmitSeq
@@ -616,18 +613,12 @@ func (mgr *Manager) Submit(text, callbackURL string) (string, error) {
 	// that only one goroutine (this one) drives the paste+submit sequence at a time
 	// (the turn slot above guarantees no concurrent Submit).
 	if _, err := w.Write([]byte(seq.PasteStart + text + seq.PasteEnd)); err != nil {
-		mgr.mu.Lock()
-		_ = mgr.store.Fail(id, fmt.Sprintf("write pty paste: %v", err), now)
-		mgr.clearCurrentLocked(Ready)
-		mgr.mu.Unlock()
+		mgr.failSubmitWrite(id, "write pty paste", err, now)
 		return "", fmt.Errorf("write pty paste: %w", err)
 	}
 	time.Sleep(mgr.cfg.SubmitDelay)
 	if _, err := w.Write([]byte(seq.Submit)); err != nil {
-		mgr.mu.Lock()
-		_ = mgr.store.Fail(id, fmt.Sprintf("write pty submit: %v", err), now)
-		mgr.clearCurrentLocked(Ready)
-		mgr.mu.Unlock()
+		mgr.failSubmitWrite(id, "write pty submit", err, now)
 		return "", fmt.Errorf("write pty submit: %w", err)
 	}
 
@@ -816,6 +807,20 @@ func (mgr *Manager) clearCurrentLocked(next State) {
 	mgr.turnsCompleted++ // all terminal turns (success + failed + timed-out)
 	mgr.state = next
 	mgr.m.TurnInFlight.Set(0)
+}
+
+// failSubmitWrite records a turn that failed during the Submit paste/submit
+// write, after the slot was already reserved. It keeps ccw_turns_total
+// consistent with turnsCompleted (incremented by clearCurrentLocked) so a
+// write-failed turn is not invisible in the terminal-result metric.
+func (mgr *Manager) failSubmitWrite(id, stage string, werr error, now time.Time) {
+	mgr.mu.Lock()
+	started := mgr.currentStarted
+	_ = mgr.store.Fail(id, fmt.Sprintf("%s: %v", stage, werr), now)
+	mgr.clearCurrentLocked(Ready)
+	mgr.m.TurnsTotal.WithLabelValues("failed").Inc()
+	mgr.m.TurnDuration.Observe(now.Sub(started).Seconds())
+	mgr.mu.Unlock()
 }
 
 func (mgr *Manager) fireDone(rec *turn.Record) {
