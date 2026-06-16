@@ -88,12 +88,24 @@ tests:
       - template: deployment.yaml
         exists:
           path: spec.template.spec.containers[0].resources.limits.memory
-  - it: pod security context sets runAsNonRoot
+  - it: pod security context sets runAsNonRoot with numeric runAsUser to avoid CreateContainerConfigError
     asserts:
       - template: deployment.yaml
         equal:
           path: spec.template.spec.securityContext.runAsNonRoot
           value: true
+      - template: deployment.yaml
+        equal:
+          path: spec.template.spec.securityContext.runAsUser
+          value: 10001
+      - template: deployment.yaml
+        equal:
+          path: spec.template.spec.securityContext.runAsGroup
+          value: 10001
+      - template: deployment.yaml
+        equal:
+          path: spec.template.spec.securityContext.fsGroup
+          value: 10001
   - it: container security context drops all capabilities and disables privilege escalation
     asserts:
       - template: deployment.yaml
