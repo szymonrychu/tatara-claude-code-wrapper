@@ -20,6 +20,21 @@ type Metrics struct {
 	BootstrapHookInstall *prometheus.CounterVec // labels: result=ok|fail, tool=mise|pre-commit
 	HookOutcome          *prometheus.CounterVec // labels: result=ok|bad_payload|rejected|store_error
 	MetricPushTotal      *prometheus.CounterVec // labels: result=ok|encode_fail|transport_fail|rejected
+
+	// HTTP-layer metrics (rule 13: request count/latency/in-flight/panics).
+	HTTPRequestsTotal   *prometheus.CounterVec   // labels: route, method, status_code
+	HTTPRequestDuration *prometheus.HistogramVec // labels: route
+	HTTPInFlight        prometheus.Gauge
+	HTTPPanicsTotal     prometheus.Counter
+
+	// Auth outcome metric (rule 13: everything that can fail).
+	AuthTotal *prometheus.CounterVec // label: result=ok|rejected
+
+	// Turn resume counter (rule 13: distinct fallible business action).
+	TurnResumes *prometheus.CounterVec // label: result=ok|write_fail
+
+	// Bootstrap render counter (rule 13: per-step observability).
+	BootstrapRenderTotal *prometheus.CounterVec // label: result=ok|fail
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -54,10 +69,29 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_hook_outcome_total", Help: "Stop-hook callback outcomes at every decision point."}, []string{"result"}),
 		MetricPushTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_metric_push_total", Help: "Metric push attempts by result."}, []string{"result"}),
+		HTTPRequestsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_http_requests_total", Help: "HTTP requests by route, method, and status code."}, []string{"route", "method", "status_code"}),
+		HTTPRequestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "ccw_http_request_duration_seconds",
+			Help:    "HTTP request latency by route.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"route"}),
+		HTTPInFlight: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "ccw_http_in_flight", Help: "HTTP requests currently in flight."}),
+		HTTPPanicsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ccw_http_panics_total", Help: "HTTP handler panics recovered."}),
+		AuthTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_auth_total", Help: "Auth outcomes by result (ok|rejected)."}, []string{"result"}),
+		TurnResumes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_turn_resumes_total", Help: "Turn resume attempts by result (ok|write_fail)."}, []string{"result"}),
+		BootstrapRenderTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_bootstrap_render_total", Help: "Bootstrap config-render steps by result (ok|fail)."}, []string{"result"}),
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
 		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal, m.Interjections,
 		m.BootstrapCloneTotal, m.BootstrapDuration, m.CommitPushTotal,
-		m.BootstrapHookInstall, m.HookOutcome, m.MetricPushTotal)
+		m.BootstrapHookInstall, m.HookOutcome, m.MetricPushTotal,
+		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.HTTPInFlight, m.HTTPPanicsTotal,
+		m.AuthTotal, m.TurnResumes, m.BootstrapRenderTotal)
 	return m
 }

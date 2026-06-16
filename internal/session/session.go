@@ -531,12 +531,29 @@ func (mgr *Manager) resumeTurn(id string) {
 		mgr.mu.Unlock()
 		return
 	}
+	// Capture w and seq under the lock, then release before the write.
+	// This mirrors the Submit/Interject lock discipline: PTY writes happen
+	// outside the lock so a slow/wedged PTY during crash recovery cannot block
+	// Snapshot, Alive, or Complete (finding 3).
+	w := mgr.w
 	seq := mgr.cfg.SubmitSeq
+	started := mgr.currentStarted
+	mgr.mu.Unlock()
+
 	// Send only the submit keystroke - the prompt is already in the restored
 	// conversation via --continue (finding 1).
-	if _, err := mgr.w.Write([]byte(seq.Submit)); err != nil {
-		mgr.mu.Unlock()
+	if _, err := w.Write([]byte(seq.Submit)); err != nil {
+		mgr.m.TurnResumes.WithLabelValues("write_fail").Inc()
 		mgr.failTurn(id, fmt.Sprintf("resume write submit: %v", err))
+		return
+	}
+
+	// Re-acquire to install the fresh timer and flip state. Re-check that the
+	// turn is still current (a concurrent failTurn/Complete may have cleared it
+	// during the write). If it's no longer current, do nothing.
+	mgr.mu.Lock()
+	if mgr.current != id {
+		mgr.mu.Unlock()
 		return
 	}
 	// Install a fresh timer so the resumed turn gets a full TurnTimeout budget
@@ -546,8 +563,11 @@ func (mgr *Manager) resumeTurn(id string) {
 	// full wall-clock including pre-crash time (audit finding 3).
 	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.failTimeout(id) })
 	mgr.state = Busy
+	now := mgr.now()
 	mgr.mu.Unlock()
-	mgr.log.Info("resumed in-flight turn after relaunch", "action", "turn_resume", "turn_id", id)
+	mgr.m.TurnResumes.WithLabelValues("ok").Inc()
+	mgr.log.Info("resumed in-flight turn after relaunch", "action", "turn_resume", "turn_id", id,
+		"duration_ms", now.Sub(started).Milliseconds())
 }
 
 // failTurn fails the in-flight turn immediately (used when claude died and the
@@ -815,12 +835,28 @@ func (mgr *Manager) clearCurrentLocked(next State) {
 // write-failed turn is not invisible in the terminal-result metric.
 func (mgr *Manager) failSubmitWrite(id, stage string, werr error, now time.Time) {
 	mgr.mu.Lock()
+	if mgr.current != id {
+		// The turn was taken over by a concurrent code path (watch/resumeTurn/failTurn)
+		// while Submit's PTY write was in progress outside the lock. Do not mutate
+		// state or bump metrics: that path already owns the record (finding 1).
+		mgr.mu.Unlock()
+		return
+	}
 	started := mgr.currentStarted
-	_ = mgr.store.Fail(id, fmt.Sprintf("%s: %v", stage, werr), now)
+	if err := mgr.store.Fail(id, fmt.Sprintf("%s: %v", stage, werr), now); err != nil {
+		// Correlation bug: record is missing or already terminal. Skip metrics to
+		// avoid phantom counts (matches failTurn/failTimeout behaviour).
+		mgr.mu.Unlock()
+		mgr.log.Error("store.Fail returned error in failSubmitWrite; skipping metrics",
+			"action", "turn_fail", "turn_id", id, "stage", stage, "err", err)
+		return
+	}
 	mgr.clearCurrentLocked(Ready)
 	mgr.m.TurnsTotal.WithLabelValues("failed").Inc()
 	mgr.m.TurnDuration.Observe(now.Sub(started).Seconds())
 	mgr.mu.Unlock()
+	mgr.log.Warn("turn submit write failed", "action", "turn_fail", "turn_id", id,
+		"stage", stage, "err", werr, "duration_ms", now.Sub(started).Milliseconds())
 }
 
 func (mgr *Manager) fireDone(rec *turn.Record) {
@@ -874,7 +910,12 @@ func (mgr *Manager) Shutdown(ctx context.Context) error {
 		// which causes the process to receive SIGHUP, completing the shutdown.
 		// For real procs we also send SIGKILL via the concrete type assertion.
 		if cp, ok := proc.(*claudeProc); ok {
-			_ = cp.cmd.Process.Kill()
+			if err := cp.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				// A failed SIGKILL means the child may survive across pod restart.
+				// Log at WARN so the operator knows to investigate (finding 6).
+				mgr.log.Warn("shutdown: SIGKILL failed; child process may survive",
+					"err", err)
+			}
 		}
 	}
 	// Wait for lifecycle goroutines (readPTY, watch, tailer Follow) to drain,
@@ -886,6 +927,9 @@ func (mgr *Manager) Shutdown(ctx context.Context) error {
 	case <-time.After(goroutineJoinTimeout):
 		mgr.log.Warn("shutdown: goroutine join timed out", "timeout", goroutineJoinTimeout)
 	case <-ctx.Done():
+		// Context cancelled before goroutines drained: drain is incomplete.
+		// Log so an aborted shutdown is observable and distinct from a clean join.
+		mgr.log.Warn("shutdown: ctx cancelled before goroutines drained")
 	}
 	return nil
 }

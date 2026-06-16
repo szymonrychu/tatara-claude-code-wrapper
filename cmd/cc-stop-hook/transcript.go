@@ -45,8 +45,9 @@ func lastAssistantText(path string) (string, json.RawMessage, string, error) {
 				text += c.Text
 			}
 		}
+		lastUsage, lastStop = al.Message.Usage, al.Message.StopReason
 		if text != "" {
-			lastText, lastUsage, lastStop = text, al.Message.Usage, al.Message.StopReason
+			lastText = text
 		}
 	}
 	if err := sc.Err(); err != nil {

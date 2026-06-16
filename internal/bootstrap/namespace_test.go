@@ -24,9 +24,16 @@ func TestNamespacePath(t *testing.T) {
 		{"host only", "https://github.com/", ""},
 		// empty URL
 		{"empty url", "", ""},
-		// URL with host that has no dot/colon (treated as owner, not host),
-		// giving owner/repo -> valid two-segment path.
-		{"host no dot", "https://host/repo.git", "host/repo"},
+		// finding 2: dotless host with scheme present - host must be stripped
+		// unconditionally (not via dot/colon heuristic). After stripping "host",
+		// only "repo" remains (single segment, no owner) -> return "".
+		{"host no dot scheme present", "https://host/repo.git", ""},
+		// dotless host with owner/repo: after stripping host "gitea" we get
+		// owner/repo which is valid.
+		{"dotless host with owner repo", "https://gitea/owner/repo.git", "owner/repo"},
+		// scp-like with dotless host (no scheme): host stripping goes via colon
+		// split, not the hasSchemeSep path -> owner/repo unchanged.
+		{"scp dotless host", "git@gitea:owner/repo.git", "owner/repo"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

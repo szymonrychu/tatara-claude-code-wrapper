@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,6 +87,33 @@ func TestInstallSkills_CopiesDeployHarness(t *testing.T) {
 // TestInstallSkills_CopiesDiscoverySkills asserts that the two wrapper agent
 // skills (tatara-deep-research and tatara-research-followup) install correctly
 // via installSkills, matching the baked templates/skills layout.
+// TestInstallSkills_LogsShadowedSkill asserts that when two SkillsSrc dirs
+// contain the same skill file, a log entry is emitted for the shadowed file
+// (finding 4: silent overwrite must be visible in logs).
+func TestInstallSkills_LogsShadowedSkill(t *testing.T) {
+	src1 := t.TempDir()
+	src2 := t.TempDir()
+	// Both sources contain the same skill file.
+	for _, src := range []string{src1, src2} {
+		d := filepath.Join(src, "my-skill")
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "SKILL.md"), []byte("# content from "+src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ws := t.TempDir()
+	var logBuf strings.Builder
+	log := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	if err := installSkills(Params{Workspace: ws, SkillsSrc: []string{src1, src2}, Log: log}); err != nil {
+		t.Fatalf("installSkills: %v", err)
+	}
+	if !strings.Contains(logBuf.String(), "my-skill") {
+		t.Fatalf("expected a shadow log mentioning skill name, got: %q", logBuf.String())
+	}
+}
+
 func TestInstallSkills_CopiesDiscoverySkills(t *testing.T) {
 	for _, name := range []string{"tatara-deep-research", "tatara-research-followup"} {
 		name := name

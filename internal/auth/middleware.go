@@ -5,6 +5,9 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type ctxKey struct{}
@@ -15,26 +18,43 @@ func ClaimsFromContext(ctx context.Context) (*Claims, bool) {
 	return c, ok
 }
 
-const wwwAuthenticate = `Bearer realm="tatara-memory"`
+const wwwAuthenticate = `Bearer realm="tatara-claude-code-wrapper"`
 
 // Middleware returns a chi-compatible middleware that verifies the Bearer token
-// and injects parsed Claims into the request context.
-func Middleware(v *Verifier) func(http.Handler) http.Handler {
+// and injects parsed Claims into the request context. authTotal is optional;
+// when non-nil it is incremented with result=ok|rejected.
+func Middleware(v *Verifier, authTotal ...*prometheus.CounterVec) func(http.Handler) http.Handler {
+	var ctr *prometheus.CounterVec
+	if len(authTotal) > 0 {
+		ctr = authTotal[0]
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reqID := middleware.GetReqID(r.Context())
 			raw, reason := bearerToken(r)
 			if raw == "" {
-				slog.WarnContext(r.Context(), "auth: rejected", "reason", reason)
+				if ctr != nil {
+					ctr.WithLabelValues("rejected").Inc()
+				}
+				slog.WarnContext(r.Context(), "auth: rejected",
+					"action", "auth_reject", "request_id", reqID, "reason", reason)
 				w.Header().Set("WWW-Authenticate", wwwAuthenticate)
 				http.Error(w, "missing bearer token", http.StatusUnauthorized)
 				return
 			}
 			claims, err := v.Verify(r.Context(), raw)
 			if err != nil {
-				slog.WarnContext(r.Context(), "auth: rejected", "reason", "invalid_token")
+				if ctr != nil {
+					ctr.WithLabelValues("rejected").Inc()
+				}
+				slog.WarnContext(r.Context(), "auth: rejected",
+					"action", "auth_reject", "request_id", reqID, "reason", "invalid_token")
 				w.Header().Set("WWW-Authenticate", wwwAuthenticate)
 				http.Error(w, "invalid token", http.StatusUnauthorized)
 				return
+			}
+			if ctr != nil {
+				ctr.WithLabelValues("ok").Inc()
 			}
 			ctx := context.WithValue(r.Context(), ctxKey{}, claims)
 			next.ServeHTTP(w, r.WithContext(ctx))

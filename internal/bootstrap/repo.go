@@ -2,7 +2,6 @@ package bootstrap
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 )
 
@@ -28,6 +27,18 @@ func configureGit(p Params, git GitRunner) error {
 		}
 	}
 	return nil
+}
+
+// RepoDir returns the on-disk directory a single-repo clone lives in:
+// workspace/<namespacePath(repoURL)>. It mirrors the single-repo clone target
+// in Render. Returns "" when the URL yields no valid namespace (the same
+// condition under which Render refuses to clone), so callers can skip safely.
+func RepoDir(workspace, repoURL string) string {
+	ns := namespacePath(repoURL)
+	if ns == "" || filepath.Clean(filepath.Join(workspace, ns)) == filepath.Clean(workspace) {
+		return ""
+	}
+	return filepath.Join(workspace, ns)
 }
 
 // CommitAndPush stages all changes, and when something is staged commits and
@@ -60,19 +71,4 @@ func CommitAndPushAll(workspace string, repos []RepoSpec, branch, message string
 		}
 	}
 	return nil
-}
-
-// cloneRepo shallow-clones RepoURL@RepoBranch into the workspace.
-// On pod restart with a persistent workspace the .git dir already exists;
-// skip the clone in that case and let checkoutTaskBranch handle the resume.
-func cloneRepo(p Params, git GitRunner) error {
-	if _, err := os.Stat(filepath.Join(p.Workspace, ".git")); err == nil {
-		return nil // already cloned; resume path handles the rest
-	}
-	args := []string{"clone", "--depth", "1"}
-	if p.RepoBranch != "" {
-		args = append(args, "--branch", p.RepoBranch)
-	}
-	args = append(args, p.RepoURL, p.Workspace)
-	return git(p.Workspace, args...)
 }
