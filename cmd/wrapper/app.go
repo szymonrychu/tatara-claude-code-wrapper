@@ -40,10 +40,9 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		return nil, err
 	}
 	bootstrap.InstallHooks(cfg.Workspace, cfg.Repos, cfg.RepoURL, execRunnerDir(log), log, m)
-	if _, lookErr := exec.LookPath("tatara"); lookErr == nil {
-		if err := bootstrap.RegisterTataraMCP(cfg.Workspace, execRunner(log)); err != nil {
-			log.Error("tatara mcp-config failed", "error", err)
-		}
+	if err := tataraLookAndRegister(cfg.Workspace, execRunner(log)); err != nil {
+		log.Error("tatara MCP registration failed; agent will have no operator tools", "error", err)
+		return nil, err
 	}
 
 	// Primary repo the pod is bound to: first entry in cross-repo mode
@@ -68,35 +67,42 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	sender := webhook.New(webhook.Config{Retries: cfg.WebhookRetries}, m, log)
 	defaultCB := cfg.DefaultCallbackURL
 	sess.OnTurnDone = func(rec *turn.Record) {
-		// Enforce the branch+commit+push contract the agent is asked to follow
-		// but does not reliably perform, so the operator's write-back finds the
-		// branch. Best-effort: a failure here must not drop the turn callback.
-		if cfg.TaskBranch != "" {
-			if len(cfg.Repos) > 0 {
-				pushStart := time.Now()
-				if err := bootstrap.CommitAndPushAll(cfg.Workspace, cfg.Repos, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner()); err != nil {
-					m.CommitPushTotal.WithLabelValues("fail").Inc()
-					log.Error("commit/push failed", "action", "commit_push", "error", err, "duration_ms", time.Since(pushStart).Milliseconds())
-				} else {
-					m.CommitPushTotal.WithLabelValues("ok").Inc()
-					log.Info("commit/push succeeded", "action", "commit_push", "branch", cfg.TaskBranch, "duration_ms", time.Since(pushStart).Milliseconds())
-				}
-			} else {
-				pushStart := time.Now()
-				if err := bootstrap.CommitAndPush(cfg.Workspace, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner()); err != nil {
-					m.CommitPushTotal.WithLabelValues("fail").Inc()
-					log.Error("commit/push task branch failed", "action", "commit_push", "branch", cfg.TaskBranch, "error", err, "duration_ms", time.Since(pushStart).Milliseconds())
-				} else {
-					m.CommitPushTotal.WithLabelValues("ok").Inc()
-					log.Info("commit/push succeeded", "action", "commit_push", "branch", cfg.TaskBranch, "duration_ms", time.Since(pushStart).Milliseconds())
-				}
-			}
-		}
+		// Deliver the webhook callback immediately, before the (potentially
+		// slow) git push, so cc-stop-hook's POST /internal/turn-complete
+		// returns well within its 5s per-attempt budget.
 		url := rec.CallbackURL
 		if url == "" {
 			url = defaultCB
 		}
 		sender.Deliver(url, rec)
+
+		// Enforce the branch+commit+push contract the agent is asked to follow
+		// but does not reliably perform, so the operator's write-back finds the
+		// branch. Run in a background goroutine: git push can take many seconds
+		// (network, large diffs) and must not block the cc-stop-hook HTTP path.
+		if cfg.TaskBranch != "" {
+			go func() {
+				if len(cfg.Repos) > 0 {
+					pushStart := time.Now()
+					if err := bootstrap.CommitAndPushAll(cfg.Workspace, cfg.Repos, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner()); err != nil {
+						m.CommitPushTotal.WithLabelValues("fail").Inc()
+						log.Error("commit/push failed", "action", "commit_push", "error", err, "duration_ms", time.Since(pushStart).Milliseconds())
+					} else {
+						m.CommitPushTotal.WithLabelValues("ok").Inc()
+						log.Info("commit/push succeeded", "action", "commit_push", "branch", cfg.TaskBranch, "duration_ms", time.Since(pushStart).Milliseconds())
+					}
+				} else {
+					pushStart := time.Now()
+					if err := bootstrap.CommitAndPush(cfg.Workspace, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner()); err != nil {
+						m.CommitPushTotal.WithLabelValues("fail").Inc()
+						log.Error("commit/push task branch failed", "action", "commit_push", "branch", cfg.TaskBranch, "error", err, "duration_ms", time.Since(pushStart).Milliseconds())
+					} else {
+						m.CommitPushTotal.WithLabelValues("ok").Inc()
+						log.Info("commit/push succeeded", "action", "commit_push", "branch", cfg.TaskBranch, "duration_ms", time.Since(pushStart).Milliseconds())
+					}
+				}
+			}()
+		}
 	}
 
 	sess.StartTailer(ctx)
@@ -205,13 +211,26 @@ func claudeEnv(cfg config) []string {
 	return env
 }
 
+// tataraLookAndRegister checks tatara is on PATH and wires its MCP server.
+// Both the LookPath miss and the mcp-config failure are fatal: the agent cannot
+// fulfil the operator contract (propose_issue, review_verdict,
+// decline_implementation) without this registration.
+func tataraLookAndRegister(workspace string, run bootstrap.CmdRunner) error {
+	if _, err := exec.LookPath("tatara"); err != nil {
+		return fmt.Errorf("tatara not found on PATH; MCP tools unavailable: %w", err)
+	}
+	return bootstrap.RegisterTataraMCP(workspace, run)
+}
+
 func gitRunner() bootstrap.GitRunner {
 	return func(dir string, args ...string) error {
 		cmd := exec.Command("git", args...) //nolint:gosec // git is a fixed binary; args are operator-supplied config, not user input
 		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
+		_, err := cmd.CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("git -C %s %v: %v: %w", dir, args, string(out), err)
+			// Deliberately omit raw combined output: git stderr can contain
+			// credential-helper expansions or remote URLs with tokens.
+			return fmt.Errorf("git -C %s %v: %w", dir, args, err)
 		}
 		return nil
 	}
