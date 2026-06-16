@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1276,6 +1277,267 @@ func TestFailSubmitWrite_EmitsWarnLog(t *testing.T) {
 		}
 	}
 	require.True(t, found, "no WARN 'turn submit write failed' log from failSubmitWrite")
+}
+
+// blockingWritePTY is a PTY whose Write blocks on the first call until unblocked.
+// Subsequent writes succeed immediately. Used to pause Submit mid-flight.
+type blockingWritePTY struct {
+	mu      sync.Mutex
+	written []byte
+	gate    chan struct{} // closed by release() to unblock the first write
+	failOn  int           // fail on this write index (-1 = never)
+	writes  int
+}
+
+func newBlockingWritePTY(failFirstWrite bool) *blockingWritePTY {
+	failOn := -1
+	if failFirstWrite {
+		failOn = 0
+	}
+	return &blockingWritePTY{gate: make(chan struct{}), failOn: failOn}
+}
+
+func (b *blockingWritePTY) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	idx := b.writes
+	b.writes++
+	b.mu.Unlock()
+	if idx == 0 {
+		<-b.gate // block first write until release() is called
+	}
+	if idx == b.failOn {
+		return 0, fmt.Errorf("simulated write failure")
+	}
+	b.mu.Lock()
+	b.written = append(b.written, p...)
+	b.mu.Unlock()
+	return len(p), nil
+}
+
+func (b *blockingWritePTY) release()     { close(b.gate) }
+func (b *blockingWritePTY) Close() error { return nil }
+
+// TestFailSubmitWrite_NoopWhenCurrentCleared verifies finding 1: failSubmitWrite
+// must be a no-op when mgr.current != id, i.e. the turn slot was cleared by a
+// concurrent code path before the PTY write failed.
+//
+// Setup: blocking PTY (paste write blocks). While the write is blocked, the proc
+// crashes and watch() calls failTurn (budget exhausted: MaxRestarts=0), which
+// clears mgr.current. Then we release the blocking write to fail. failSubmitWrite
+// runs with mgr.current=="" != "turn-1". Without the mgr.current!=id guard,
+// failSubmitWrite calls store.Fail on an already-failed record; with the guard
+// it returns immediately. Either way the metric must be exactly 1 (from failTurn),
+// not 2 (double-count). The store.Fail error guard (finding 2) also catches this,
+// but the id-guard is required per spec.
+func TestFailSubmitWrite_NoopWhenCurrentCleared(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	store := turn.NewStore()
+
+	// blockingWritePTY: first write (paste) blocks until released, then fails.
+	bPTY := newBlockingWritePTY(true)
+
+	proc := newFakeProc() // fakeProc serves as the watcher (watch goroutine)
+
+	done := make(chan *turn.Record, 1)
+	mgr := session.New(
+		// MaxRestarts=0: first death exhausts budget -> failTurn clears current.
+		session.Config{TurnTimeout: 10 * time.Second, SubmitSeq: session.DefaultSubmitSeq, SubmitDelay: 0, MaxRestarts: 0},
+		store, m,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return "turn-1" },
+	)
+	// InjectProcForTest sets mgr.w = proc AND starts watch(proc). Then we
+	// immediately override mgr.w with the blockingPTY so Submit's paste write
+	// goes to the blockingPTY, while watch() is still watching proc.
+	mgr.InjectProcForTest(proc)
+	mgr.SetWriterForTest(bPTY) // overrides w; watch goroutine still on proc
+	mgr.OnTurnDone = func(r *turn.Record) { done <- r }
+
+	submitErr := make(chan error, 1)
+	go func() {
+		_, err := mgr.Submit("hi", "")
+		submitErr <- err
+	}()
+
+	// Wait for Submit to flip state to Busy (slot reserved, paste write blocking).
+	require.Eventually(t, func() bool {
+		return mgr.Snapshot().State == session.Busy
+	}, time.Second, 5*time.Millisecond, "Submit did not reserve slot")
+
+	// Kill the proc: watch() fires, MaxRestarts=0 so budget exhausted immediately,
+	// failTurn("turn-1") clears mgr.current and fires OnTurnDone.
+	proc.kill()
+	select {
+	case r := <-done:
+		require.Equal(t, turn.Failed, r.State)
+	case <-time.After(3 * time.Second):
+		t.Fatal("failTurn did not fire after proc kill")
+	}
+
+	// Now release the blocking write (which fails) -> failSubmitWrite runs with
+	// mgr.current=="" != "turn-1". The guard must prevent any mutation.
+	bPTY.release()
+	<-submitErr // drain
+
+	// ccw_turns_total{failed} must be exactly 1: failTurn counted it, failSubmitWrite must not.
+	mfs, _ := reg.Gather()
+	var failedCount float64
+	for _, mf := range mfs {
+		if mf.GetName() != "ccw_turns_total" {
+			continue
+		}
+		for _, mm := range mf.GetMetric() {
+			for _, lp := range mm.GetLabel() {
+				if lp.GetName() == "result" && lp.GetValue() == "failed" {
+					failedCount = mm.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	require.Equal(t, float64(1), failedCount,
+		"ccw_turns_total{failed} must be 1: failSubmitWrite must not double-count after failTurn cleared current")
+}
+
+// slowProc is a ClaudeProcess whose Write blocks until unblocked. It wraps
+// fakeProc for Wait/Read/Close, so the watch goroutine works normally.
+// writeStarted is closed when the first Write call enters (before blocking).
+type slowProc struct {
+	fakeProc
+	gate         chan struct{} // closed by unblock() to let Write proceed
+	writeStarted chan struct{} // closed when Write is first entered
+	once         sync.Once     // ensures writeStarted is closed exactly once
+}
+
+func newSlowProc() *slowProc {
+	return &slowProc{
+		fakeProc:     fakeProc{deadCh: make(chan struct{})},
+		gate:         make(chan struct{}),
+		writeStarted: make(chan struct{}),
+	}
+}
+
+func (s *slowProc) Write(p []byte) (int, error) {
+	s.once.Do(func() { close(s.writeStarted) }) // signal that write has started
+	<-s.gate                                    // block until unblock() is called
+	_, _ = s.fakeProc.Write(p)
+	return len(p), nil
+}
+
+func (s *slowProc) unblock() { close(s.gate) }
+
+// TestResumeTurn_DoesNotHoldLockDuringWrite verifies finding 3: resumeTurn must
+// release mgr.mu before the PTY write so Snapshot/Alive are not blocked during
+// crash recovery even when the proc's Write is slow/wedged.
+//
+// We use a slowProc as the second process: its Write blocks until explicitly
+// released and signals writeStarted when it first enters. We synchronize on
+// writeStarted to know exactly when resumeTurn is blocked on the write, then
+// attempt Snapshot(). If resumeTurn holds the lock during the write, Snapshot
+// will time out. If it releases the lock first (the fix), Snapshot returns fast.
+func TestResumeTurn_DoesNotHoldLockDuringWrite(t *testing.T) {
+	firstProc := newFakeProc()
+	secondProc := newSlowProc()
+
+	store := turn.NewStore()
+	mgr := session.New(
+		session.Config{
+			TurnTimeout: 10 * time.Second,
+			BootTimeout: 30 * time.Millisecond,
+			SubmitDelay: 0,
+			SubmitSeq:   session.DefaultSubmitSeq,
+			MaxRestarts: 3,
+		},
+		store,
+		metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return "turn-1" },
+	)
+	mgr.SetSpawnForTest(func(_ session.Config, _ bool) (session.ClaudeProcess, error) {
+		return secondProc, nil
+	})
+	mgr.InjectProcForTest(firstProc)
+
+	_, err := mgr.Submit("hi", "")
+	require.NoError(t, err)
+
+	// Kill first proc -> watch -> relaunch -> sets mgr.w=secondProc -> resumeTurn
+	// tries to write to secondProc.Write (which blocks and signals writeStarted).
+	firstProc.kill()
+
+	// Wait until secondProc.Write is actually entered (resumeTurn is blocked on write).
+	select {
+	case <-secondProc.writeStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("resumeTurn did not attempt to write to second proc")
+	}
+
+	// Now resumeTurn is inside secondProc.Write (blocked on gate).
+	// Snapshot must return quickly: if resumeTurn holds the lock during the write,
+	// Snapshot will block for up to 500ms; if it released the lock first, it is instant.
+	snapshotDone := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		mgr.Snapshot()
+		snapshotDone <- time.Since(start)
+	}()
+
+	select {
+	case d := <-snapshotDone:
+		// With the fix (lock released before write) Snapshot is nearly instant.
+		// Allow 200ms margin.
+		require.Less(t, d, 200*time.Millisecond,
+			"Snapshot blocked for %v; resumeTurn must release mgr.mu before Write", d)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Snapshot never returned: resumeTurn is holding mgr.mu during Write")
+	}
+
+	// Unblock the write so the test cleans up without leak.
+	secondProc.unblock()
+}
+
+// TestShutdown_CtxCancelledLogsWarn verifies finding 6:
+// when Shutdown's context is cancelled before goroutines drain, a WARN is logged
+// so an incomplete drain is observable (not silently identical to clean shutdown).
+func TestShutdown_CtxCancelledLogsWarn(t *testing.T) {
+	buf := &syncBuffer{}
+	log := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	store := turn.NewStore()
+	mgr := session.New(
+		session.Config{TurnTimeout: 10 * time.Second, SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()), log,
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return "turn-1" },
+	)
+
+	// Inject a real proc (cat) so goroutines are started and will NOT drain
+	// immediately (cat's readPTY blocks until EOF/PTY close, but we cancel ctx fast).
+	// Use a fakeProc that never dies to keep goroutines alive past Shutdown.
+	proc := newFakeProc()
+	mgr.InjectProcForTest(proc)
+
+	// Cancel context immediately so Shutdown's goroutine-join hits ctx.Done().
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	_ = mgr.Shutdown(ctx)
+
+	// The goroutine-join select must have logged a WARN on ctx.Done().
+	data := buf.Bytes()
+	lines := bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
+	found := false
+	for _, ln := range lines {
+		var rec map[string]any
+		if json.Unmarshal(ln, &rec) == nil && rec["level"] == "WARN" {
+			if msg, ok := rec["msg"].(string); ok && strings.Contains(msg, "shutdown") && strings.Contains(msg, "ctx") {
+				found = true
+			}
+		}
+	}
+	require.True(t, found, "Shutdown must log a WARN when ctx is cancelled before goroutines drain")
 }
 
 // TestResumeTurn_EmitsTurnResumesMetricAndDurationMs verifies that resumeTurn
