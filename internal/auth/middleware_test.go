@@ -66,7 +66,7 @@ func TestMiddleware_MissingTokenReturns401(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
-	require.Equal(t, `Bearer realm="tatara-memory"`, rec.Header().Get("WWW-Authenticate"))
+	require.Equal(t, `Bearer realm="tatara-claude-code-wrapper"`, rec.Header().Get("WWW-Authenticate"))
 }
 
 func TestMiddleware_InvalidTokenReturns401(t *testing.T) {
@@ -85,7 +85,7 @@ func TestMiddleware_InvalidTokenReturns401(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
-	require.Equal(t, `Bearer realm="tatara-memory"`, rec.Header().Get("WWW-Authenticate"))
+	require.Equal(t, `Bearer realm="tatara-claude-code-wrapper"`, rec.Header().Get("WWW-Authenticate"))
 }
 
 // TestMiddleware_AuthTotalCounterAndRequestIDInLog verifies that Middleware

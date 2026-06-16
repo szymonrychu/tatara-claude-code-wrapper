@@ -18,7 +18,7 @@ func ClaimsFromContext(ctx context.Context) (*Claims, bool) {
 	return c, ok
 }
 
-const wwwAuthenticate = `Bearer realm="tatara-memory"`
+const wwwAuthenticate = `Bearer realm="tatara-claude-code-wrapper"`
 
 // Middleware returns a chi-compatible middleware that verifies the Bearer token
 // and injects parsed Claims into the request context. authTotal is optional;
