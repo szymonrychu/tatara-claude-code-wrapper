@@ -107,6 +107,57 @@ func timeZero() time.Time { return time.Unix(0, 0) }
 
 var _ = errors.New // keep errors import if unused after edits
 
+// TestPostMessage_SSRFValidation verifies that postMessage rejects callbackUrl
+// values that would enable SSRF (finding 2): non-https schemes, loopback, and
+// link-local/metadata addresses must all return 400.
+func TestPostMessage_SSRFValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"http scheme", "http://operator.example.com/cb"},
+		{"loopback IPv4", "https://127.0.0.1/cb"},
+		{"loopback localhost", "https://localhost/cb"},
+		{"link-local metadata", "https://169.254.169.254/latest/meta-data/"},
+		{"link-local other", "https://169.254.1.1/cb"},
+		{"private 10.x", "https://10.0.0.1/cb"},
+		{"private 172.16.x", "https://172.16.0.1/cb"},
+		{"private 192.168.x", "https://192.168.1.1/cb"},
+		{"loopback IPv6", "https://[::1]/cb"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newAPI(&fakeCtl{submitID: "t"}, turn.NewStore())
+			body, _ := json.Marshal(map[string]string{"text": "hi", "callbackUrl": tc.url})
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+			rec := httptest.NewRecorder()
+			api.TestRouter().ServeHTTP(rec, req)
+			require.Equal(t, http.StatusBadRequest, rec.Code, "expected 400 for unsafe callbackUrl: %s", tc.url)
+		})
+	}
+}
+
+// TestPostMessage_EmptyCallbackAllowed verifies an empty callbackUrl is accepted
+// (finding 2): empty means "use server default", not an attack vector.
+func TestPostMessage_EmptyCallbackAllowed(t *testing.T) {
+	api := newAPI(&fakeCtl{submitID: "t"}, turn.NewStore())
+	body, _ := json.Marshal(map[string]string{"text": "hi", "callbackUrl": ""})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+}
+
+// TestPostMessage_HTTPSCallbackAccepted verifies a valid https callbackUrl passes (finding 2).
+func TestPostMessage_HTTPSCallbackAccepted(t *testing.T) {
+	api := newAPI(&fakeCtl{submitID: "t"}, turn.NewStore())
+	body, _ := json.Marshal(map[string]string{"text": "hi", "callbackUrl": "https://operator.example.com/cb"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+}
+
 // newAPIWithLog builds an API that writes structured logs to logBuf.
 func newAPIWithLog(ctl httpapi.SessionController, store *turn.Store, logBuf io.Writer) *httpapi.API {
 	log := slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
