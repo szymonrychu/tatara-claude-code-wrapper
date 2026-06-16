@@ -55,6 +55,21 @@ type HookResult struct {
 	Usage          json.RawMessage `json:"usage,omitempty"`
 	StopReason     string          `json:"stopReason"`
 	TranscriptPath string          `json:"transcriptPath,omitempty"`
+	// TurnTokens is the token usage summed across every assistant message of the
+	// just-completed turn, grouped by model. The single last-message Usage above
+	// undercounts agentic turns (it keeps only the final step), so the metric is
+	// driven by this summed view instead. Computed by the stop hook, which already
+	// reads the whole transcript.
+	TurnTokens []TurnTokens `json:"turnTokens,omitempty"`
+}
+
+// TurnTokens is the per-model token total for one turn.
+type TurnTokens struct {
+	Model         string `json:"model"`
+	Input         int64  `json:"input"`
+	Output        int64  `json:"output"`
+	CacheRead     int64  `json:"cacheRead"`
+	CacheCreation int64  `json:"cacheCreation"`
 }
 
 type State string
@@ -791,9 +806,39 @@ func (mgr *Manager) Complete(r HookResult) error {
 	mgr.m.TurnDuration.Observe(now.Sub(started).Seconds())
 	rec, _ := mgr.store.Get(id)
 	mgr.mu.Unlock()
+	mgr.meterTokens(r)
 	mgr.log.Info("turn complete", "action", "turn_complete", "turn_id", id, "duration_ms", now.Sub(started).Milliseconds())
 	mgr.fireDone(rec)
 	return nil
+}
+
+// meterTokens turns the already-captured per-turn usage into Prometheus
+// counters. It runs after the lock is released (the counters are goroutine
+// safe) and must never fail a turn: a missing or malformed field is logged and
+// skipped, never propagated. Token counts come from the summed-per-turn
+// TurnTokens (the last-message Usage undercounts agentic turns); cost comes from
+// result.json's total_cost_usd when the agent wrote one.
+func (mgr *Manager) meterTokens(r HookResult) {
+	for _, t := range r.TurnTokens {
+		model := t.Model
+		if model == "" {
+			model = "unknown"
+		}
+		mgr.m.TurnTokensTotal.WithLabelValues("input", model).Add(float64(t.Input))
+		mgr.m.TurnTokensTotal.WithLabelValues("output", model).Add(float64(t.Output))
+		mgr.m.TurnTokensTotal.WithLabelValues("cache_read", model).Add(float64(t.CacheRead))
+		mgr.m.TurnTokensTotal.WithLabelValues("cache_creation", model).Add(float64(t.CacheCreation))
+	}
+	if len(r.ResultJSON) > 0 {
+		var rj struct {
+			TotalCostUSD *float64 `json:"total_cost_usd"`
+		}
+		if err := json.Unmarshal(r.ResultJSON, &rj); err != nil {
+			mgr.log.Warn("turn cost: malformed result.json, skipping", "err", err)
+		} else if rj.TotalCostUSD != nil {
+			mgr.m.TurnCostUSD.Add(*rj.TotalCostUSD)
+		}
+	}
 }
 
 func (mgr *Manager) failTimeout(id string) {

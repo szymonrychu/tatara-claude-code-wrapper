@@ -35,6 +35,9 @@ func buildResult(payload []byte, resultJSONPath string) (session.HookResult, err
 				res.FinalText = text
 			}
 		}
+		if tokens, err := turnTokens(hp.TranscriptPath); err == nil {
+			res.TurnTokens = tokens
+		}
 	}
 	if b, err := os.ReadFile(resultJSONPath); err == nil && json.Valid(b) {
 		res.ResultJSON = b

@@ -212,6 +212,8 @@ JSON logs (`slog`) for every state transition and business action with
 - `ccw_claude_restarts_total` - counter (claude process exits, excluding clean shutdown)
 - `ccw_webhook_delivery_total{result="ok|dropped"}` - counter
 - `ccw_hook_received_total` - counter
+- `ccw_turn_tokens_total{type="input|output|cache_read|cache_creation", model}` - counter (tokens summed across every assistant message of the turn; the last-message usage alone undercounts agentic turns)
+- `ccw_turn_cost_usd_total` - counter (cumulative turn cost; emitted only when `/workspace/result.json` carries `total_cost_usd`)
 
 When claude exits unexpectedly, the last ~800 bytes of de-ANSI'd PTY output are
 logged as `pty_tail` - the single most useful field for diagnosing a boot or
