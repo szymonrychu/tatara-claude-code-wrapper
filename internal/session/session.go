@@ -534,8 +534,10 @@ func (mgr *Manager) resumeTurn(id string) {
 	seq := mgr.cfg.SubmitSeq
 	// Send only the submit keystroke - the prompt is already in the restored
 	// conversation via --continue (finding 1).
+	started := mgr.currentStarted
 	if _, err := mgr.w.Write([]byte(seq.Submit)); err != nil {
 		mgr.mu.Unlock()
+		mgr.m.TurnResumes.WithLabelValues("write_fail").Inc()
 		mgr.failTurn(id, fmt.Sprintf("resume write submit: %v", err))
 		return
 	}
@@ -546,8 +548,11 @@ func (mgr *Manager) resumeTurn(id string) {
 	// full wall-clock including pre-crash time (audit finding 3).
 	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.failTimeout(id) })
 	mgr.state = Busy
+	now := mgr.now()
 	mgr.mu.Unlock()
-	mgr.log.Info("resumed in-flight turn after relaunch", "action", "turn_resume", "turn_id", id)
+	mgr.m.TurnResumes.WithLabelValues("ok").Inc()
+	mgr.log.Info("resumed in-flight turn after relaunch", "action", "turn_resume", "turn_id", id,
+		"duration_ms", now.Sub(started).Milliseconds())
 }
 
 // failTurn fails the in-flight turn immediately (used when claude died and the
@@ -816,11 +821,20 @@ func (mgr *Manager) clearCurrentLocked(next State) {
 func (mgr *Manager) failSubmitWrite(id, stage string, werr error, now time.Time) {
 	mgr.mu.Lock()
 	started := mgr.currentStarted
-	_ = mgr.store.Fail(id, fmt.Sprintf("%s: %v", stage, werr), now)
+	if err := mgr.store.Fail(id, fmt.Sprintf("%s: %v", stage, werr), now); err != nil {
+		// Correlation bug: record is missing or already terminal. Skip metrics to
+		// avoid phantom counts (matches failTurn/failTimeout behaviour).
+		mgr.mu.Unlock()
+		mgr.log.Error("store.Fail returned error in failSubmitWrite; skipping metrics",
+			"action", "turn_fail", "turn_id", id, "stage", stage, "err", err)
+		return
+	}
 	mgr.clearCurrentLocked(Ready)
 	mgr.m.TurnsTotal.WithLabelValues("failed").Inc()
 	mgr.m.TurnDuration.Observe(now.Sub(started).Seconds())
 	mgr.mu.Unlock()
+	mgr.log.Warn("turn submit write failed", "action", "turn_fail", "turn_id", id,
+		"stage", stage, "err", werr, "duration_ms", now.Sub(started).Milliseconds())
 }
 
 func (mgr *Manager) fireDone(rec *turn.Record) {

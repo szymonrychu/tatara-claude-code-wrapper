@@ -187,26 +187,50 @@ func Render(p Params, git GitRunner) error {
 				"task_branch", p.TaskBranch, "duration_ms", time.Since(cloneStart).Milliseconds())
 		}
 	}
+	renderConfigStart := time.Now()
 	if err := writeIfSet(filepath.Join(p.Workspace, "CLAUDE.md"), p.ProjectClaudeMd); err != nil {
+		if p.M != nil {
+			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
+		}
 		return err
 	}
 	if err := writeIfSet(filepath.Join(claudeHome, "CLAUDE.md"), p.GlobalClaudeMd); err != nil {
+		if p.M != nil {
+			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
+		}
 		return err
 	}
 	if err := mergeMCP(p); err != nil {
+		if p.M != nil {
+			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
+		}
 		return err
 	}
 	if err := writeSettings(p, claudeHome); err != nil {
+		if p.M != nil {
+			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
+		}
 		return err
 	}
 	if err := writeClaudeJSON(p); err != nil {
+		if p.M != nil {
+			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
+		}
 		return err
 	}
 	if err := installSkills(p); err != nil {
+		if p.M != nil {
+			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
+		}
 		return err
 	}
 	if p.M != nil {
+		p.M.BootstrapRenderTotal.WithLabelValues("ok").Inc()
 		p.M.BootstrapDuration.Observe(time.Since(renderStart).Seconds())
+	}
+	if p.Log != nil {
+		p.Log.Info("bootstrap config rendered", "action", "bootstrap_render",
+			"duration_ms", time.Since(renderConfigStart).Milliseconds())
 	}
 	return nil
 }

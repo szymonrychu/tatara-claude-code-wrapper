@@ -4,6 +4,7 @@ package httpapi
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -80,14 +81,49 @@ func (a *API) requestLogger(next http.Handler) http.Handler {
 	})
 }
 
+// httpMetrics returns the HTTP metrics middleware stack (in-flight gauge,
+// request counter + latency histogram, panic recovery counter).
+func (a *API) httpMetrics() func(http.Handler) http.Handler {
+	if a.m == nil {
+		return func(next http.Handler) http.Handler { return next }
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					a.m.HTTPPanicsTotal.Inc()
+					http.Error(w, "internal server error", http.StatusInternalServerError)
+				}
+			}()
+			a.m.HTTPInFlight.Inc()
+			defer a.m.HTTPInFlight.Dec()
+			start := time.Now()
+			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+			next.ServeHTTP(ww, r)
+			route := chi.RouteContext(r.Context()).RoutePattern()
+			if route == "" {
+				route = r.URL.Path
+			}
+			status := fmt.Sprintf("%d", ww.Status())
+			a.m.HTTPRequestsTotal.WithLabelValues(route, r.Method, status).Inc()
+			a.m.HTTPRequestDuration.WithLabelValues(route).Observe(time.Since(start).Seconds())
+		})
+	}
+}
+
 // Router is the public surface: OIDC-gated /v1/* plus open operator endpoints.
 func (a *API) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
+	r.Use(a.httpMetrics())
 	r.Use(a.requestLogger)
 	r.Group(func(pr chi.Router) {
 		if a.v != nil {
-			pr.Use(auth.Middleware(a.v))
+			if a.m != nil {
+				pr.Use(auth.Middleware(a.v, a.m.AuthTotal))
+			} else {
+				pr.Use(auth.Middleware(a.v))
+			}
 		}
 		a.mountV1(pr)
 	})

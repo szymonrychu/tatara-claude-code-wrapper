@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -18,13 +19,14 @@ const (
 )
 
 func main() {
-	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "cc-stop-hook:", err)
+	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	if err := run(log); err != nil {
+		log.Error("cc-stop-hook failed", "action", "hook_post", "err", err)
 	}
 	os.Exit(0) // never block or alter claude
 }
 
-func run() error {
+func run(log *slog.Logger) error {
 	payload, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return fmt.Errorf("read stdin: %w", err)
@@ -40,7 +42,23 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("marshal result: %w", err)
 	}
-	return postWithRetry(internalURL, body)
+	start := time.Now()
+	postErr := postWithRetry(internalURL, body)
+	durationMs := time.Since(start).Milliseconds()
+	if postErr != nil {
+		log.Error("hook post exhausted all attempts",
+			"action", "hook_post",
+			"session_id", res.SessionID,
+			"attempts", maxPostAttempts,
+			"duration_ms", durationMs,
+			"err", postErr)
+		return postErr
+	}
+	log.Info("hook post succeeded",
+		"action", "hook_post",
+		"session_id", res.SessionID,
+		"duration_ms", durationMs)
+	return nil
 }
 
 // postWithRetry POSTs body to url, retrying up to maxPostAttempts times on

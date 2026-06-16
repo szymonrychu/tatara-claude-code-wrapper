@@ -586,3 +586,55 @@ func TestRender_MultiRepo_SameOwnerRepoDifferentHostsCollisionDetected(t *testin
 	require.Error(t, err, "same namespace path from different hosts must cause an error")
 	require.Contains(t, err.Error(), "collision")
 }
+
+// TestRender_EmitsBootstrapRenderLog verifies that a successful config-render phase
+// emits an INFO log with action=bootstrap_render and duration_ms, and increments
+// BootstrapRenderTotal{result=ok} (finding 5).
+func TestRender_EmitsBootstrapRenderLog(t *testing.T) {
+	var logBuf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+
+	p := bootstrap.Params{
+		HomeDir:        t.TempDir(),
+		Workspace:      t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+		Log:            log,
+		M:              m,
+	}
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { return nil }))
+
+	// Verify INFO log with action=bootstrap_render and duration_ms.
+	data := logBuf.Bytes()
+	lines := bytes.Split(bytes.TrimRight(data, "\n"), []byte("\n"))
+	found := false
+	for _, ln := range lines {
+		var rec map[string]any
+		if json.Unmarshal(ln, &rec) == nil && rec["msg"] == "bootstrap config rendered" {
+			require.Equal(t, "bootstrap_render", rec["action"], "action field must be bootstrap_render")
+			require.NotNil(t, rec["duration_ms"], "duration_ms must be present")
+			found = true
+		}
+	}
+	require.True(t, found, "no 'bootstrap config rendered' INFO log from Render")
+
+	// Verify BootstrapRenderTotal{result=ok} incremented.
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	var renderOK float64
+	for _, mf := range mfs {
+		if mf.GetName() == "ccw_bootstrap_render_total" {
+			for _, mm := range mf.GetMetric() {
+				for _, lp := range mm.GetLabel() {
+					if lp.GetName() == "result" && lp.GetValue() == "ok" {
+						renderOK = mm.GetCounter().GetValue()
+					}
+				}
+			}
+		}
+	}
+	require.Equal(t, float64(1), renderOK, "BootstrapRenderTotal{result=ok} must be 1 after successful render")
+}
