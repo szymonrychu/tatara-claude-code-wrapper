@@ -164,8 +164,20 @@ func (t *Tailer) Follow(ctx context.Context, path string) error {
 			continue
 		}
 
-		// Unexpected read error
-		return err
+		// Unexpected read error - log, reset partial, and retry rather than
+		// permanently killing the tail. A single transient I/O error must not
+		// end transcript streaming for the rest of the session.
+		t.log.Warn("transcript read error, reopening",
+			"action", "tailer_reopen",
+			"err", err.Error(),
+		)
+		partial = nil
+		_ = openFile()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollInterval):
+		}
 	}
 }
 
@@ -357,7 +369,7 @@ func (t *Tailer) processLine(raw []byte) {
 			"turn_id", turnID,
 			"role", msg.Role,
 			"stop_reason", msg.StopReason,
-			"usage", string(msg.Usage),
+			"usage", t.redactor.Scrub(string(msg.Usage)),
 		)
 		t.incCounter("message_end")
 	}
