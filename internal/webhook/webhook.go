@@ -103,6 +103,9 @@ func (s *Sender) deliver(ctx context.Context, url, turnID string, body []byte) {
 	for attempt := 0; attempt <= s.cfg.Retries; attempt++ {
 		if err := s.post(ctx, url, body); err != nil {
 			s.log.Warn("webhook: attempt failed", "err", err, "turn_id", turnID, "attempt", attempt)
+			if attempt == s.cfg.Retries {
+				break
+			}
 			select {
 			case <-ctx.Done():
 				s.m.WebhookDelivery.WithLabelValues("dropped").Inc()
