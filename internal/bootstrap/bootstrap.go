@@ -49,7 +49,9 @@ type GitRunner func(dir string, args ...string) error
 // out with -B <branch> FETCH_HEAD so the agent has its prior commits and a
 // full history to rebase against. If the branch does not exist, it falls back
 // to the fresh-task path: plain "checkout -b <branch>".
-func checkoutTaskBranch(dir, taskBranch string, git GitRunner) error {
+// Returns (resumed=true, nil) on the resume path, (false, nil) on the fresh
+// path, so callers can set action="resume" without a second ls-remote call.
+func checkoutTaskBranch(dir, taskBranch string, git GitRunner) (resumed bool, err error) {
 	branchExists := git(dir, "ls-remote", "--exit-code", "--heads", "origin", taskBranch) == nil
 	if branchExists {
 		// Unshallow so the rebase against origin/<default> has a merge base. The
@@ -58,14 +60,14 @@ func checkoutTaskBranch(dir, taskBranch string, git GitRunner) error {
 		// benign "already complete" case -- propagate it rather than proceed with a
 		// shallow clone whose rebase would fail with no merge base.
 		if err := git(dir, "fetch", "--unshallow", "origin"); err != nil {
-			return fmt.Errorf("unshallow for resume of %s: %w", taskBranch, err)
+			return false, fmt.Errorf("unshallow for resume of %s: %w", taskBranch, err)
 		}
 		if err := git(dir, "fetch", "origin", taskBranch); err != nil {
-			return fmt.Errorf("fetch remote task branch %s: %w", taskBranch, err)
+			return false, fmt.Errorf("fetch remote task branch %s: %w", taskBranch, err)
 		}
-		return git(dir, "checkout", "-B", taskBranch, "FETCH_HEAD")
+		return true, git(dir, "checkout", "-B", taskBranch, "FETCH_HEAD")
 	}
-	return git(dir, "checkout", "-b", taskBranch)
+	return false, git(dir, "checkout", "-b", taskBranch)
 }
 
 func Render(p Params, git GitRunner) error {
@@ -81,6 +83,7 @@ func Render(p Params, git GitRunner) error {
 		if err := configureGit(p, git); err != nil {
 			return err
 		}
+		seenDest := make(map[string]string) // dest -> URL that claimed it first
 		for i, r := range p.Repos {
 			// Primary repo is always Repos[0], identified by position rather than
 			// URL comparison so that an empty p.RepoURL never masks a clone failure.
@@ -95,6 +98,14 @@ func Render(p Params, git GitRunner) error {
 				continue // non-primary: skip silently
 			}
 			dest := filepath.Join(p.Workspace, ns)
+			// Guard: two distinct URLs with the same owner/repo on different hosts
+			// map to the same dest; the second would be silently skipped (the .git
+			// guard treats it as a restart of the first). Fail loudly to avoid
+			// operating on the wrong repo or pushing to the wrong remote.
+			if first, exists := seenDest[dest]; exists {
+				return fmt.Errorf("namespace collision: repos %q and %q resolve to the same dest %s", first, r.URL, dest)
+			}
+			seenDest[dest] = r.URL
 			if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 				if isPrimary {
 					return fmt.Errorf("mkdir parent for primary repo %s: %w", r.Name, err)
@@ -125,13 +136,14 @@ func Render(p Params, git GitRunner) error {
 				// primary): a secondary repo silently left on the wrong branch
 				// would make the agent commit the wrong state. Fail loud so the
 				// operator retries the run.
-				if err := checkoutTaskBranch(dest, p.TaskBranch, git); err != nil {
+				resumed, err := checkoutTaskBranch(dest, p.TaskBranch, git)
+				if err != nil {
 					if p.M != nil {
 						p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
 					}
 					return fmt.Errorf("checkout task branch in %s: %w", r.Name, err)
 				}
-				if branchExists := git(dest, "ls-remote", "--exit-code", "--heads", "origin", p.TaskBranch) == nil; branchExists {
+				if resumed {
 					action = "resume"
 				}
 			}
@@ -156,13 +168,14 @@ func Render(p Params, git GitRunner) error {
 		}
 		action := "clone"
 		if p.TaskBranch != "" {
-			if err := checkoutTaskBranch(p.Workspace, p.TaskBranch, git); err != nil {
+			resumed, err := checkoutTaskBranch(p.Workspace, p.TaskBranch, git)
+			if err != nil {
 				if p.M != nil {
 					p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
 				}
 				return err
 			}
-			if branchExists := git(p.Workspace, "ls-remote", "--exit-code", "--heads", "origin", p.TaskBranch) == nil; branchExists {
+			if resumed {
 				action = "resume"
 			}
 		}
