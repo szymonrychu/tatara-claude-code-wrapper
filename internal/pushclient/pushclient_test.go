@@ -210,6 +210,50 @@ func TestMetricPushTotal_TransportFailIncremented(t *testing.T) {
 	p.Shutdown(context.Background())
 }
 
+// TestPushHonorsPerPushDeadline verifies that a push goroutine never stalls
+// beyond Interval: the loop context derived from pushWithTimeout is bounded by
+// Interval so a stalled push returns promptly when the deadline fires (audit
+// finding 2). A short Shutdown context ensures the delete call also returns fast.
+func TestPushHonorsPerPushDeadline(t *testing.T) {
+	// Server that hangs until the client disconnects.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	interval := 100 * time.Millisecond
+	p := pushclient.New(pushclient.Config{
+		URL:      srv.URL + "/push",
+		RunID:    "r",
+		Interval: interval,
+	}, testRegistry(t), discardLog())
+	p.Start()
+
+	// Give the initial push time to start stalling, then shut down.
+	time.Sleep(20 * time.Millisecond)
+
+	// Shutdown with a short deadline so the delete call also cancels promptly.
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), interval)
+	defer shutCancel()
+
+	done := make(chan struct{})
+	go func() {
+		p.Shutdown(shutCtx)
+		close(done)
+	}()
+	select {
+	case <-done:
+		// success: Shutdown completed within the allotted time
+	case <-time.After(3 * interval):
+		t.Fatal("Shutdown blocked longer than 3x interval; per-push deadline not enforced")
+	}
+}
+
 // A custom job label overrides the default.
 func TestJobOverride(t *testing.T) {
 	cap := &capture{}

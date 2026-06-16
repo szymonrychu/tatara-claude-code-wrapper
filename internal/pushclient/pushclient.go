@@ -91,15 +91,23 @@ func (p *Pusher) Start() {
 func (p *Pusher) loop() {
 	t := time.NewTicker(p.cfg.Interval)
 	defer t.Stop()
-	p.pushOnce(p.ctx) // push immediately so a fast-exiting run is not lost
+	p.pushWithTimeout() // push immediately so a fast-exiting run is not lost
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
 		case <-t.C:
-			p.pushOnce(p.ctx)
+			p.pushWithTimeout()
 		}
 	}
+}
+
+// pushWithTimeout wraps pushOnce in a per-push deadline equal to the configured
+// interval, ensuring a stalled push can never overlap with the next tick.
+func (p *Pusher) pushWithTimeout() {
+	ctx, cancel := context.WithTimeout(p.ctx, p.cfg.Interval)
+	defer cancel()
+	p.pushOnce(ctx)
 }
 
 // Shutdown stops the loop and best-effort deletes this run's series so they are
