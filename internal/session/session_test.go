@@ -472,6 +472,64 @@ func TestFailTimeout_HasActionAndDurationMs(t *testing.T) {
 	t.Fatal("ccw_turn_duration_seconds metric not found")
 }
 
+// TestComplete_MetersTokensAndCost verifies that a completed turn moves the
+// per-turn token counters (summed by type and model) and the cost counter when
+// result.json carries total_cost_usd.
+func TestComplete_MetersTokensAndCost(t *testing.T) {
+	store := turn.NewStore()
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	ids := make(chan string, 2)
+	ids <- "turn-1"
+	mgr := session.New(
+		session.Config{TurnTimeout: 10 * time.Second, SubmitSeq: session.DefaultSubmitSeq},
+		store, m, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return <-ids },
+	)
+	mgr.SetWriterForTest(&fakePTY{})
+
+	_, err := mgr.Submit("hi", "")
+	require.NoError(t, err)
+	require.NoError(t, mgr.Complete(session.HookResult{
+		FinalText:  "ok",
+		StopReason: "end_turn",
+		TurnTokens: []session.TurnTokens{
+			{Model: "claude-opus-4-8", Input: 100, Output: 10, CacheRead: 200, CacheCreation: 50},
+		},
+		ResultJSON: json.RawMessage(`{"total_cost_usd":0.42}`),
+	}))
+
+	tokens := map[string]float64{}
+	var cost float64
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		switch mf.GetName() {
+		case "ccw_turn_tokens_total":
+			for _, metric := range mf.GetMetric() {
+				var typ, model string
+				for _, lp := range metric.GetLabel() {
+					switch lp.GetName() {
+					case "type":
+						typ = lp.GetValue()
+					case "model":
+						model = lp.GetValue()
+					}
+				}
+				tokens[typ+"/"+model] = metric.GetCounter().GetValue()
+			}
+		case "ccw_turn_cost_usd_total":
+			cost = mf.GetMetric()[0].GetCounter().GetValue()
+		}
+	}
+	require.Equal(t, float64(100), tokens["input/claude-opus-4-8"])
+	require.Equal(t, float64(10), tokens["output/claude-opus-4-8"])
+	require.Equal(t, float64(200), tokens["cache_read/claude-opus-4-8"])
+	require.Equal(t, float64(50), tokens["cache_creation/claude-opus-4-8"])
+	require.Equal(t, 0.42, cost)
+}
+
 // TestWritePTYStoreFail_DistinctMessages verifies paste vs submit store.Fail messages differ (finding 10).
 func TestWritePTYStoreFail_DistinctMessages(t *testing.T) {
 	// Use a PTY that fails on the first write (paste) and then succeeds

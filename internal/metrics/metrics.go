@@ -35,6 +35,12 @@ type Metrics struct {
 
 	// Bootstrap render counter (rule 13: per-step observability).
 	BootstrapRenderTotal *prometheus.CounterVec // label: result=ok|fail
+
+	// Per-turn token/cost metrics (rule 13: tokens are the loop's primary cost
+	// driver and the clearest runaway signal). Counters keep the cumulative-spend
+	// property the operator can later budget on.
+	TurnTokensTotal *prometheus.CounterVec // labels: type=input|output|cache_read|cache_creation, model
+	TurnCostUSD     prometheus.Counter     // emitted only when result.json carries total_cost_usd
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -86,12 +92,17 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_turn_resumes_total", Help: "Turn resume attempts by result (ok|write_fail)."}, []string{"result"}),
 		BootstrapRenderTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_bootstrap_render_total", Help: "Bootstrap config-render steps by result (ok|fail)."}, []string{"result"}),
+		TurnTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_turn_tokens_total", Help: "Claude tokens consumed per turn, summed across the turn, by token type and model."}, []string{"type", "model"}),
+		TurnCostUSD: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ccw_turn_cost_usd_total", Help: "Cumulative Claude turn cost in USD (from result.json total_cost_usd when present)."}),
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
 		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal, m.Interjections,
 		m.BootstrapCloneTotal, m.BootstrapDuration, m.CommitPushTotal,
 		m.BootstrapHookInstall, m.HookOutcome, m.MetricPushTotal,
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.HTTPInFlight, m.HTTPPanicsTotal,
-		m.AuthTotal, m.TurnResumes, m.BootstrapRenderTotal)
+		m.AuthTotal, m.TurnResumes, m.BootstrapRenderTotal,
+		m.TurnTokensTotal, m.TurnCostUSD)
 	return m
 }
