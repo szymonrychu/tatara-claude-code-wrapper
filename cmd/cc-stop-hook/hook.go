@@ -28,8 +28,9 @@ func buildResult(payload []byte, resultJSONPath string) (session.HookResult, err
 	}
 	res := session.HookResult{SessionID: hp.SessionID, FinalText: hp.LastAssistantMessage, TranscriptPath: hp.TranscriptPath}
 	if hp.TranscriptPath != "" {
-		if text, usage, err := lastAssistantText(hp.TranscriptPath); err == nil {
+		if text, usage, stop, err := lastAssistantText(hp.TranscriptPath); err == nil {
 			res.Usage = usage
+			res.StopReason = stop
 			if res.FinalText == "" {
 				res.FinalText = text
 			}

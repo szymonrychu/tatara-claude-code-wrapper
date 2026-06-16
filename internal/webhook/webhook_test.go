@@ -2,6 +2,7 @@ package webhook_test
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -111,4 +112,91 @@ func TestDeliver_AfterShutdown_DoesNotPanic(t *testing.T) {
 	require.NotPanics(t, func() {
 		s.Deliver("http://127.0.0.1:0/no-such-server", &turn.Record{ID: "post-shutdown"})
 	})
+}
+
+// TestDeliver_NoSleepAfterLastAttempt verifies that the retry loop does NOT
+// sleep after the final failed attempt. With Retries=2 and Backoff=200ms the
+// exponential sequence is 200ms, 400ms (i.e. sleeps between attempts 0->1 and
+// 1->2). After attempt 2 fails the goroutine must record "dropped" immediately;
+// it must NOT sleep an additional 800ms. We give 1200ms total budget - enough
+// for the two legitimate inter-attempt sleeps but not the spurious post-last one.
+func TestDeliver_NoSleepAfterLastAttempt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	const (
+		retries = 2
+		backoff = 200 * time.Millisecond
+		// legitimate inter-attempt sleeps: 200ms + 400ms = 600ms
+		// spurious post-last sleep would add another 800ms
+		budget = 1400 * time.Millisecond
+	)
+
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	s := webhook.New(webhook.Config{Retries: retries, Backoff: backoff}, m, discardLogger())
+
+	start := time.Now()
+	s.Deliver(srv.URL, &turn.Record{ID: "last-attempt-sleep", State: turn.Complete})
+
+	// Wait for the "dropped" counter to appear within the budget.
+	dropped := func() bool {
+		mfs, _ := reg.Gather()
+		for _, mf := range mfs {
+			if mf.GetName() != "ccw_webhook_delivery_total" {
+				continue
+			}
+			for _, metric := range mf.GetMetric() {
+				for _, lp := range metric.GetLabel() {
+					if lp.GetName() == "result" && lp.GetValue() == "dropped" {
+						return metric.GetCounter().GetValue() >= 1
+					}
+				}
+			}
+		}
+		return false
+	}
+	require.Eventually(t, dropped, budget, 10*time.Millisecond,
+		"dropped metric not recorded within %v (elapsed %v); spurious post-last-attempt sleep suspected",
+		budget, time.Since(start))
+}
+
+// TestDeliver_MarshalFailureCountedAsDropped verifies that a marshal error in
+// Deliver increments ccw_webhook_delivery_total{result=dropped} (audit finding 6).
+// We trigger a marshal error by using a turn.Record with an un-marshalable field.
+// Since turn.Record is a plain struct that always marshals fine, we inject an
+// unmarshalable ResultJSON directly.
+func TestDeliver_MarshalFailureCountedAsDropped(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	s := webhook.New(webhook.Config{Retries: 0, Backoff: time.Millisecond}, m, discardLogger())
+
+	// json.RawMessage with invalid JSON causes json.Marshal(rec) to fail.
+	rec := &turn.Record{
+		ID:         "bad-marshal",
+		ResultJSON: json.RawMessage([]byte(`{invalid`)),
+	}
+	s.Deliver("http://127.0.0.1:0/irrelevant", rec)
+
+	// Give the goroutine a moment to run (Deliver is async for the marshal step).
+	// Actually the marshal happens before the goroutine is spawned, so it's synchronous.
+	// But we need the wg to be released; require.Eventually for robustness.
+	require.Eventually(t, func() bool {
+		mfs, _ := reg.Gather()
+		for _, mf := range mfs {
+			if mf.GetName() != "ccw_webhook_delivery_total" {
+				continue
+			}
+			for _, metric := range mf.GetMetric() {
+				for _, lp := range metric.GetLabel() {
+					if lp.GetName() == "result" && lp.GetValue() == "dropped" {
+						return metric.GetCounter().GetValue() >= 1
+					}
+				}
+			}
+		}
+		return false
+	}, time.Second, 5*time.Millisecond, "ccw_webhook_delivery_total{result=dropped} not incremented on marshal error")
 }

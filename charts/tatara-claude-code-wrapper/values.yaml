@@ -53,6 +53,10 @@ serviceMonitor:
 networkPolicy:
   enabled: true
   callerNamespace: ""
+  # Namespace Prometheus scrapes /metrics from. Cluster-specific, so the
+  # helmfile sets it (kubernetes.io/metadata.name label match). Empty disables
+  # the scrape ingress rule rather than opening the API port cluster-wide.
+  monitoringNamespace: ""
 
 podSecurityContext:
   runAsNonRoot: true

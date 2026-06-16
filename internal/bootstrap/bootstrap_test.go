@@ -503,3 +503,86 @@ func TestRender_ConfiguresGitCredentialsAndIdentityBeforeClone(t *testing.T) {
 	require.GreaterOrEqual(t, cloneIdx, 0, "repo not cloned")
 	require.Less(t, credIdx, cloneIdx, "credentials must be set before clone")
 }
+
+// TestRender_ResumeDoesNotDuplicateLsRemote asserts that when a task branch
+// already exists on the remote, Render calls ls-remote exactly ONCE, not twice
+// (finding 2: checkoutTaskBranch called it, then Render called it again to set
+// action="resume", doubling the network round-trip).
+func TestRender_ResumeDoesNotDuplicateLsRemote(t *testing.T) {
+	taskBranch := "tatara/task-dedup"
+	sg := &scriptedGit{}
+	// ls-remote -> nil (branch exists on remote) for all calls
+	sg.scripts = append(sg.scripts, struct {
+		match func([]string) bool
+		err   error
+	}{argsContainAll("ls-remote", "--exit-code"), nil})
+
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		RepoURL:        "https://github.com/x/y",
+		RepoBranch:     "main",
+		TaskBranch:     taskBranch,
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+	}
+	require.NoError(t, bootstrap.Render(p, sg.run))
+
+	lsRemoteCalls := callsContainingAll(sg.Calls, "ls-remote", "--exit-code")
+	require.Equal(t, 1, len(lsRemoteCalls),
+		"ls-remote must be called exactly once per repo (no duplicate after checkoutTaskBranch); got %d calls", len(lsRemoteCalls))
+}
+
+// TestRender_MultiRepo_ResumeDoesNotDuplicateLsRemote asserts the same
+// dedup property in multi-repo mode (two repos, each ls-remote called once).
+func TestRender_MultiRepo_ResumeDoesNotDuplicateLsRemote(t *testing.T) {
+	taskBranch := "tatara/task-multidedup"
+	sg := &scriptedGit{}
+	sg.scripts = append(sg.scripts, struct {
+		match func([]string) bool
+		err   error
+	}{argsContainAll("ls-remote", "--exit-code"), nil})
+
+	p := bootstrap.Params{
+		HomeDir:        t.TempDir(),
+		Workspace:      t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+		TaskBranch:     taskBranch,
+		Repos: []bootstrap.RepoSpec{
+			{Name: "a", URL: "https://github.com/owner/repo-a", Branch: "main"},
+			{Name: "b", URL: "https://github.com/owner/repo-b", Branch: "main"},
+		},
+	}
+	require.NoError(t, bootstrap.Render(p, sg.run))
+
+	lsRemoteCalls := callsContainingAll(sg.Calls, "ls-remote", "--exit-code")
+	require.Equal(t, 2, len(lsRemoteCalls),
+		"ls-remote must be called exactly once per repo (2 repos = 2 calls); got %d", len(lsRemoteCalls))
+}
+
+// TestRender_MultiRepo_SameOwnerRepoDifferentHostsAreDetected asserts that
+// when two distinct repo URLs map to the same namespace path (same owner/repo
+// on different hosts), Render returns an error rather than silently skipping
+// the second clone (finding 4).
+func TestRender_MultiRepo_SameOwnerRepoDifferentHostsCollisionDetected(t *testing.T) {
+	fakeGit := func(dir string, args ...string) error { return nil }
+
+	p := bootstrap.Params{
+		HomeDir:        t.TempDir(),
+		Workspace:      t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+		Repos: []bootstrap.RepoSpec{
+			{Name: "github-repo", URL: "https://github.com/owner/repo", Branch: "main"},
+			// Same owner/repo on a different host -> same namespace path
+			{Name: "gitlab-repo", URL: "https://gitlab.com/owner/repo", Branch: "main"},
+		},
+	}
+
+	err := bootstrap.Render(p, fakeGit)
+	require.Error(t, err, "same namespace path from different hosts must cause an error")
+	require.Contains(t, err.Error(), "collision")
+}

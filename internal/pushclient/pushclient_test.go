@@ -13,6 +13,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/pushclient"
 )
 
@@ -127,6 +128,130 @@ func TestShutdownDeletesSeries(t *testing.T) {
 	defer mu.Unlock()
 	require.True(t, deleted, "expected a DELETE on shutdown")
 	require.Contains(t, delQ, "run_id=run-9")
+}
+
+// TestMetricPushTotal_OkIncremented verifies that a successful push increments
+// ccw_metric_push_total{result=ok} (audit finding 7).
+func TestMetricPushTotal_OkIncremented(t *testing.T) {
+	cap := &capture{}
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+
+	appReg := prometheus.NewRegistry()
+	appReg.MustRegister(prometheus.NewCounter(prometheus.CounterOpts{Name: "ccw_turns_total", Help: "h"}))
+
+	pusherReg := prometheus.NewRegistry()
+	m := metrics.New(pusherReg)
+
+	p := pushclient.New(pushclient.Config{
+		URL:      srv.URL + "/internal/metrics/push",
+		RunID:    "run-ok",
+		Interval: time.Hour,
+	}, appReg, discardLog(), m)
+	p.Start()
+	require.Eventually(t, func() bool {
+		cap.mu.Lock()
+		defer cap.mu.Unlock()
+		return cap.hits >= 1
+	}, time.Second, 5*time.Millisecond)
+	p.Shutdown(context.Background())
+
+	mfs, err := pusherReg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() == "ccw_metric_push_total" {
+			for _, metric := range mf.GetMetric() {
+				for _, lp := range metric.GetLabel() {
+					if lp.GetName() == "result" && lp.GetValue() == "ok" {
+						require.GreaterOrEqual(t, metric.GetCounter().GetValue(), float64(1))
+						return
+					}
+				}
+			}
+		}
+	}
+	t.Fatal("ccw_metric_push_total{result=ok} not found")
+}
+
+// TestMetricPushTotal_TransportFailIncremented verifies that a transport error
+// increments ccw_metric_push_total{result=transport_fail} (audit finding 7).
+func TestMetricPushTotal_TransportFailIncremented(t *testing.T) {
+	appReg := prometheus.NewRegistry()
+	appReg.MustRegister(prometheus.NewCounter(prometheus.CounterOpts{Name: "ccw_turns_total", Help: "h"}))
+
+	pusherReg := prometheus.NewRegistry()
+	m := metrics.New(pusherReg)
+
+	// Use a closed server so the push fails with a transport error.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close() // immediately close so transport fails
+
+	p := pushclient.New(pushclient.Config{
+		URL:      srv.URL + "/internal/metrics/push",
+		RunID:    "run-fail",
+		Interval: time.Hour,
+	}, appReg, discardLog(), m)
+	p.Start()
+	require.Eventually(t, func() bool {
+		mfs, _ := pusherReg.Gather()
+		for _, mf := range mfs {
+			if mf.GetName() == "ccw_metric_push_total" {
+				for _, metric := range mf.GetMetric() {
+					for _, lp := range metric.GetLabel() {
+						if lp.GetName() == "result" && lp.GetValue() == "transport_fail" {
+							return metric.GetCounter().GetValue() >= 1
+						}
+					}
+				}
+			}
+		}
+		return false
+	}, time.Second, 5*time.Millisecond, "transport_fail not incremented")
+	p.Shutdown(context.Background())
+}
+
+// TestPushHonorsPerPushDeadline verifies that a push goroutine never stalls
+// beyond Interval: the loop context derived from pushWithTimeout is bounded by
+// Interval so a stalled push returns promptly when the deadline fires (audit
+// finding 2). A short Shutdown context ensures the delete call also returns fast.
+func TestPushHonorsPerPushDeadline(t *testing.T) {
+	// Server that hangs until the client disconnects.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	interval := 100 * time.Millisecond
+	p := pushclient.New(pushclient.Config{
+		URL:      srv.URL + "/push",
+		RunID:    "r",
+		Interval: interval,
+	}, testRegistry(t), discardLog())
+	p.Start()
+
+	// Give the initial push time to start stalling, then shut down.
+	time.Sleep(20 * time.Millisecond)
+
+	// Shutdown with a short deadline so the delete call also cancels promptly.
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), interval)
+	defer shutCancel()
+
+	done := make(chan struct{})
+	go func() {
+		p.Shutdown(shutCtx)
+		close(done)
+	}()
+	select {
+	case <-done:
+		// success: Shutdown completed within the allotted time
+	case <-time.After(3 * interval):
+		t.Fatal("Shutdown blocked longer than 3x interval; per-push deadline not enforced")
+	}
 }
 
 // A custom job label overrides the default.
