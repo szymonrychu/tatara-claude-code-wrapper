@@ -3,6 +3,9 @@ package bootstrap
 import (
 	"log/slog"
 	"path/filepath"
+	"time"
+
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 )
 
 // InstallHooks runs `mise install` and `pre-commit install` in each cloned
@@ -12,14 +15,29 @@ import (
 // Directory resolution mirrors Render:
 //   - When repos is non-empty: workspace/<namespacePath(r.URL)> for each entry.
 //   - When repos is empty and repoURL is set: workspace itself.
-func InstallHooks(workspace string, repos []RepoSpec, repoURL string, cmd CmdRunnerDir) {
+func InstallHooks(workspace string, repos []RepoSpec, repoURL string, cmd CmdRunnerDir, log *slog.Logger, m *metrics.Metrics) {
 	dirs := repoDirs(workspace, repos, repoURL)
 	for _, dir := range dirs {
-		if err := cmd(dir, "mise", "install"); err != nil {
-			slog.Warn("mise install failed (best-effort)", "dir", dir, "error", err)
-		}
-		if err := cmd(dir, "pre-commit", "install", "--hook-type", "pre-commit", "--hook-type", "pre-push"); err != nil {
-			slog.Warn("pre-commit install failed (best-effort)", "dir", dir, "error", err)
+		runHookInstall(dir, "mise", []string{"install"}, cmd, log, m)
+		runHookInstall(dir, "pre-commit", []string{"install", "--hook-type", "pre-commit", "--hook-type", "pre-push"}, cmd, log, m)
+	}
+}
+
+func runHookInstall(dir, tool string, args []string, cmd CmdRunnerDir, log *slog.Logger, m *metrics.Metrics) {
+	start := time.Now()
+	err := cmd(dir, tool, args...)
+	result := "ok"
+	if err != nil {
+		result = "fail"
+	}
+	if m != nil {
+		m.BootstrapHookInstall.WithLabelValues(result, tool).Inc()
+	}
+	if log != nil {
+		if err != nil {
+			log.Warn("hook install failed (best-effort)", "action", "hook_install", "tool", tool, "dir", dir, "error", err, "duration_ms", time.Since(start).Milliseconds())
+		} else {
+			log.Info("hook install ok", "action", "hook_install", "tool", tool, "dir", dir, "duration_ms", time.Since(start).Milliseconds())
 		}
 	}
 }

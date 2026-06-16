@@ -21,6 +21,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
+
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 )
 
 // Config holds the inputs the operator injects into the wrapper Pod env. Push
@@ -38,6 +40,7 @@ type Config struct {
 type Pusher struct {
 	cfg    Config
 	g      prometheus.Gatherer
+	m      *metrics.Metrics
 	client *http.Client
 	log    *slog.Logger
 
@@ -48,7 +51,7 @@ type Pusher struct {
 
 // New builds a Pusher gathering from g. It applies defaults for Job and
 // Interval; call Enabled to check whether pushing is configured.
-func New(cfg Config, g prometheus.Gatherer, log *slog.Logger) *Pusher {
+func New(cfg Config, g prometheus.Gatherer, log *slog.Logger, m ...*metrics.Metrics) *Pusher {
 	if cfg.Job == "" {
 		cfg.Job = "tatara-claude-code-wrapper"
 	}
@@ -56,7 +59,7 @@ func New(cfg Config, g prometheus.Gatherer, log *slog.Logger) *Pusher {
 		cfg.Interval = 15 * time.Second
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Pusher{
+	p := &Pusher{
 		cfg:    cfg,
 		g:      g,
 		client: &http.Client{Timeout: 10 * time.Second},
@@ -64,6 +67,10 @@ func New(cfg Config, g prometheus.Gatherer, log *slog.Logger) *Pusher {
 		ctx:    ctx,
 		cancel: cancel,
 	}
+	if len(m) > 0 {
+		p.m = m[0]
+	}
+	return p
 }
 
 // Enabled reports whether the operator wired a push URL and run_id.
@@ -110,22 +117,38 @@ func (p *Pusher) pushOnce(ctx context.Context) {
 	body, err := encode(p.g)
 	if err != nil {
 		p.log.Warn("pushclient: gather/encode failed", "err", err)
+		if p.m != nil {
+			p.m.MetricPushTotal.WithLabelValues("encode_fail").Inc()
+		}
 		return
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint(), bytes.NewReader(body))
 	if err != nil {
 		p.log.Warn("pushclient: build request failed", "err", err)
+		if p.m != nil {
+			p.m.MetricPushTotal.WithLabelValues("encode_fail").Inc()
+		}
 		return
 	}
 	req.Header.Set("Content-Type", string(expfmt.NewFormat(expfmt.TypeTextPlain)))
 	resp, err := p.client.Do(req)
 	if err != nil {
 		p.log.Warn("pushclient: push failed", "err", err, "run_id", p.cfg.RunID)
+		if p.m != nil {
+			p.m.MetricPushTotal.WithLabelValues("transport_fail").Inc()
+		}
 		return
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		p.log.Warn("pushclient: push rejected", "status", resp.StatusCode, "run_id", p.cfg.RunID)
+		if p.m != nil {
+			p.m.MetricPushTotal.WithLabelValues("rejected").Inc()
+		}
+		return
+	}
+	if p.m != nil {
+		p.m.MetricPushTotal.WithLabelValues("ok").Inc()
 	}
 }
 

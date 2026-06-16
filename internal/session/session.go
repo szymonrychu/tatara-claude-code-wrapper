@@ -86,20 +86,21 @@ type Manager struct {
 
 	spawn func(cfg Config, resume bool) (claudeProcess, error)
 
-	mu               sync.Mutex
-	w                ptyWriter
-	proc             claudeProcess
-	ring             *ringBuffer
-	stopping         bool
-	state            State
-	current          string // in-flight turn id, "" when idle
-	currentStarted   time.Time
-	currentSessionID string // claude's sessionId for the current turn (from hook); used for correlation
-	timer            *time.Timer
-	turnsCompleted   int // all terminal turns (success + failed + timed-out)
-	turnsSucceeded   int // successful turns only (Complete path)
-	transcriptPath   string
-	restarts         int // consecutive crash-relaunches; reset on Complete
+	mu                    sync.Mutex
+	w                     ptyWriter
+	proc                  claudeProcess
+	ring                  *ringBuffer
+	stopping              bool
+	state                 State
+	current               string    // in-flight turn id, "" when idle
+	currentStarted        time.Time // original Submit time; basis for TurnDuration metric
+	currentTimeoutStarted time.Time // reset by resumeTurn for a fresh TurnTimeout budget
+	currentSessionID      string    // claude's sessionId for the current turn (from hook); used for correlation
+	timer                 *time.Timer
+	turnsCompleted        int // all terminal turns (success + failed + timed-out)
+	turnsSucceeded        int // successful turns only (Complete path)
+	transcriptPath        string
+	restarts              int // consecutive crash-relaunches; reset on Complete
 
 	// wg tracks lifecycle goroutines (readPTY, watch, tailer Follow) so
 	// Shutdown can wait for them to drain after cancellation.
@@ -414,7 +415,6 @@ func (mgr *Manager) watch(proc claudeProcess) {
 	mgr.state = Dead // brief: Submit rejects until relaunch flips to Ready
 	mgr.mu.Unlock()
 
-	mgr.m.ClaudeRestarts.Inc()
 	mgr.log.Error("claude exited unexpectedly", "err", err, "in_flight_turn", inFlight,
 		"attempt", attempt, "max_restarts", mgr.cfg.MaxRestarts, "pty_tail", mgr.ring.tail(800))
 
@@ -426,6 +426,10 @@ func (mgr *Manager) watch(proc claudeProcess) {
 		}
 		return // state stays Dead
 	}
+
+	// Increment only on actual relaunch attempts (finding 4: must not count the
+	// terminal death where no relaunch occurs).
+	mgr.m.ClaudeRestarts.Inc()
 
 	if rerr := mgr.relaunch(); rerr != nil {
 		mgr.mu.Lock()
@@ -518,8 +522,11 @@ func (mgr *Manager) resumeTurn(id string) {
 	}
 	// Install a fresh timer so the resumed turn gets a full TurnTimeout budget
 	// (finding 2). The old timer was stopped by watch() before relaunch.
+	// Only reset currentTimeoutStarted (the timer anchor), NOT currentStarted
+	// (the duration anchor), so TurnDuration reflects the full wall-clock including
+	// pre-crash time (audit finding 3).
 	now := mgr.now()
-	mgr.currentStarted = now
+	mgr.currentTimeoutStarted = now
 	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.failTimeout(id) })
 	mgr.state = Busy
 	mgr.mu.Unlock()
@@ -586,7 +593,7 @@ func (mgr *Manager) Submit(text, callbackURL string) (string, error) {
 		_ = mgr.store.Fail(id, fmt.Sprintf("write pty submit: %v", err), now)
 		return "", fmt.Errorf("write pty submit: %w", err)
 	}
-	mgr.current, mgr.currentStarted, mgr.state = id, now, Busy
+	mgr.current, mgr.currentStarted, mgr.currentTimeoutStarted, mgr.state = id, now, now, Busy
 	mgr.m.TurnInFlight.Set(1)
 	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.failTimeout(id) })
 	mgr.log.Info("turn submitted", "action", "turn_submit", "turn_id", id)
@@ -638,8 +645,11 @@ func (mgr *Manager) Interject(text string) error {
 // Complete is invoked from the internal endpoint when a Stop hook fires.
 func (mgr *Manager) Complete(r HookResult) error {
 	mgr.mu.Lock()
+	// Every delivery is a received hook regardless of outcome (finding 5).
+	mgr.m.HookReceived.Inc()
 	id := mgr.current
 	if id == "" {
+		mgr.m.HookOutcome.WithLabelValues("no_turn").Inc()
 		mgr.mu.Unlock()
 		return fmt.Errorf("no in-flight turn")
 	}
@@ -647,6 +657,7 @@ func (mgr *Manager) Complete(r HookResult) error {
 	// and the session already has a recorded SessionID that differs, the hook
 	// is for a previously completed turn or a dead process (finding 3).
 	if r.SessionID != "" && mgr.currentSessionID != "" && r.SessionID != mgr.currentSessionID {
+		mgr.m.HookOutcome.WithLabelValues("rejected").Inc()
 		mgr.mu.Unlock()
 		mgr.log.Warn("hook session id mismatch; rejecting stale hook",
 			"turn_id", id, "expected_session_id", mgr.currentSessionID, "got_session_id", r.SessionID)
@@ -706,6 +717,7 @@ func (mgr *Manager) Complete(r HookResult) error {
 	if err := mgr.store.Complete(id, r.FinalText, r.ResultJSON, r.Usage, r.StopReason, now); err != nil {
 		// Record not found means a correlation bug (e.g. stale hook after store
 		// reset). Do not bump success metrics or fire a phantom completion (finding 6).
+		mgr.m.HookOutcome.WithLabelValues("store_error").Inc()
 		mgr.mu.Unlock()
 		mgr.log.Error("store.Complete returned error; skipping metrics and callback",
 			"action", "turn_complete", "turn_id", id, "err", err)
@@ -715,7 +727,7 @@ func (mgr *Manager) Complete(r HookResult) error {
 	mgr.turnsSucceeded++
 	mgr.restarts = 0          // a completed turn proves the session healthy
 	mgr.currentSessionID = "" // clear for next turn
-	mgr.m.HookReceived.Inc()
+	mgr.m.HookOutcome.WithLabelValues("ok").Inc()
 	mgr.m.TurnsTotal.WithLabelValues("complete").Inc()
 	mgr.m.TurnDuration.Observe(now.Sub(started).Seconds())
 	rec, _ := mgr.store.Get(id)

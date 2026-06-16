@@ -66,6 +66,7 @@ func (s *Sender) Deliver(url string, rec *turn.Record) {
 
 	body, err := json.Marshal(rec)
 	if err != nil {
+		s.m.WebhookDelivery.WithLabelValues("dropped").Inc()
 		s.wg.Done()
 		s.log.Error("webhook: marshal", "err", err, "turn_id", rec.ID)
 		return

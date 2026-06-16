@@ -1,11 +1,17 @@
 package bootstrap_test
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"log/slog"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 )
 
 // TestInstallHooks_SingleRepo asserts that InstallHooks calls mise install and
@@ -25,7 +31,7 @@ func TestInstallHooks_SingleRepo(t *testing.T) {
 	}
 
 	workspace := "/tmp/ws"
-	bootstrap.InstallHooks(workspace, nil, "https://github.com/x/y", fakeCmd)
+	bootstrap.InstallHooks(workspace, nil, "https://github.com/x/y", fakeCmd, nil, nil)
 
 	require.Len(t, calls, 2, "expected 2 calls: mise install + pre-commit install")
 
@@ -59,7 +65,7 @@ func TestInstallHooks_MultiRepo(t *testing.T) {
 		{Name: "cli", URL: "https://github.com/owner/tatara-cli"},
 		{Name: "memory", URL: "https://github.com/owner/tatara-memory"},
 	}
-	bootstrap.InstallHooks(workspace, repos, "", fakeCmd)
+	bootstrap.InstallHooks(workspace, repos, "", fakeCmd, nil, nil)
 
 	// 2 repos * 2 commands = 4 calls
 	require.Len(t, calls, 4)
@@ -93,7 +99,7 @@ func TestInstallHooks_BestEffort(t *testing.T) {
 
 	workspace := "/tmp/ws"
 	// Must not panic or return error - InstallHooks is void
-	bootstrap.InstallHooks(workspace, nil, "https://github.com/x/y", fakeCmd)
+	bootstrap.InstallHooks(workspace, nil, "https://github.com/x/y", fakeCmd, nil, nil)
 
 	// Even though mise failed, pre-commit install must still be attempted
 	require.Len(t, calls, 2, "both calls must be attempted even when mise fails")
@@ -109,8 +115,91 @@ func TestInstallHooks_NoRepo(t *testing.T) {
 		called = true
 		return nil
 	}
-	bootstrap.InstallHooks("/tmp/ws", nil, "", fakeCmd)
+	bootstrap.InstallHooks("/tmp/ws", nil, "", fakeCmd, nil, nil)
 	require.False(t, called, "no commands must run when no repo is configured")
+}
+
+// TestInstallHooks_MetricOk verifies that a successful hook install increments
+// BootstrapHookInstall with result=ok for both mise and pre-commit.
+func TestInstallHooks_MetricOk(t *testing.T) {
+	fakeCmd := func(dir, name string, args ...string) error { return nil }
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	bootstrap.InstallHooks("/tmp/ws", nil, "https://github.com/x/y", fakeCmd, slog.New(slog.NewTextHandler(io.Discard, nil)), m)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	var total float64
+	for _, mf := range mfs {
+		if mf.GetName() == "ccw_bootstrap_hook_install_total" {
+			for _, metric := range mf.GetMetric() {
+				total += metric.GetCounter().GetValue()
+			}
+		}
+	}
+	require.Equal(t, float64(2), total, "expected 2 ok increments (mise + pre-commit)")
+}
+
+// TestInstallHooks_MetricFail verifies that a failing hook install increments
+// BootstrapHookInstall with result=fail and still attempts the next command.
+func TestInstallHooks_MetricFail(t *testing.T) {
+	fakeCmd := func(dir, name string, args ...string) error {
+		if name == "mise" {
+			return errFake("mise not found")
+		}
+		return nil
+	}
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	bootstrap.InstallHooks("/tmp/ws", nil, "https://github.com/x/y", fakeCmd, slog.New(slog.NewTextHandler(io.Discard, nil)), m)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	okCount := float64(0)
+	failCount := float64(0)
+	for _, mf := range mfs {
+		if mf.GetName() == "ccw_bootstrap_hook_install_total" {
+			for _, metric := range mf.GetMetric() {
+				for _, lp := range metric.GetLabel() {
+					if lp.GetName() == "result" {
+						if lp.GetValue() == "ok" {
+							okCount += metric.GetCounter().GetValue()
+						} else if lp.GetValue() == "fail" {
+							failCount += metric.GetCounter().GetValue()
+						}
+					}
+				}
+			}
+		}
+	}
+	require.Equal(t, float64(1), failCount, "expected 1 fail increment (mise)")
+	require.Equal(t, float64(1), okCount, "expected 1 ok increment (pre-commit)")
+}
+
+// TestInstallHooks_LogsViaInjectedLogger verifies that InstallHooks uses the
+// injected *slog.Logger rather than the package-global slog (finding 1).
+func TestInstallHooks_LogsViaInjectedLogger(t *testing.T) {
+	fakeCmd := func(dir, name string, args ...string) error {
+		if name == "mise" {
+			return errFake("mise not found")
+		}
+		return nil
+	}
+	buf := &bytes.Buffer{}
+	log := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	bootstrap.InstallHooks("/tmp/ws", nil, "https://github.com/x/y", fakeCmd, log, nil)
+
+	// Expect at least one structured log line with action=hook_install
+	lines := bytes.Split(bytes.TrimRight(buf.Bytes(), "\n"), []byte("\n"))
+	found := false
+	for _, ln := range lines {
+		var rec map[string]any
+		if json.Unmarshal(ln, &rec) == nil && rec["action"] == "hook_install" {
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "no hook_install log line emitted by injected logger")
 }
 
 // errFake is a simple error type for tests.

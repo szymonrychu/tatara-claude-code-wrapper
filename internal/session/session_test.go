@@ -870,3 +870,174 @@ func TestRelaunch_StoppingAbortsFreshProc(t *testing.T) {
 	snap := m.Snapshot()
 	require.Equal(t, session.Dead, snap.State, "session must stay Dead when relaunch aborted due to stopping")
 }
+
+// TestComplete_TurnDurationUsesOriginalStartTime verifies that TurnDuration is
+// observed with the original Submit time as the anchor (audit finding 3).
+// A fixed clock returns t0 on the first call (Submit) and t1 on the second (Complete);
+// the observed duration must be t1-t0, not zero.
+func TestComplete_TurnDurationUsesOriginalStartTime(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	t1 := time.Unix(1010, 0) // 10s later
+
+	calls := 0
+	clock := func() time.Time {
+		calls++
+		if calls == 1 {
+			return t0
+		}
+		return t1
+	}
+
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	store := turn.NewStore()
+	mgr := session.New(
+		session.Config{TurnTimeout: 10 * time.Second, SubmitSeq: session.DefaultSubmitSeq},
+		store, m, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		clock, func() string { return "turn-1" },
+	)
+	mgr.SetWriterForTest(&fakePTY{})
+
+	_, err := mgr.Submit("hi", "")
+	require.NoError(t, err)
+	require.NoError(t, mgr.Complete(session.HookResult{FinalText: "ok", StopReason: "end_turn"}))
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() == "ccw_turn_duration_seconds" {
+			hist := mf.GetMetric()[0].GetHistogram()
+			require.Greater(t, hist.GetSampleCount(), uint64(0), "TurnDuration not observed")
+			// Sum should reflect 10s (t1-t0); 0 would indicate currentStarted was
+			// overwritten with t1 before being captured in Complete.
+			require.Greater(t, hist.GetSampleSum(), float64(0),
+				"TurnDuration sum is 0; currentStarted may have been overwritten (finding 3)")
+			return
+		}
+	}
+	t.Fatal("ccw_turn_duration_seconds not found")
+}
+
+// TestWatch_ClaudeRestartsMetricOnlyOnActualRelaunch verifies that
+// ClaudeRestarts is NOT incremented when the restart budget is exhausted and no
+// relaunch actually happens (audit finding 4).
+// MaxRestarts=1: first death triggers relaunch (ClaudeRestarts+=1), second death
+// exceeds budget (no relaunch; ClaudeRestarts must stay at 1, not 2).
+func TestWatch_ClaudeRestartsMetricOnlyOnActualRelaunch(t *testing.T) {
+	first := newFakeProc()
+	second := newFakeProc()
+
+	st := newSpawnTracker(second)
+
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+
+	store := turn.NewStore()
+	idx := 0
+	ids := []string{"turn-1"}
+	mgr := session.New(
+		session.Config{
+			TurnTimeout: 10 * time.Second,
+			BootTimeout: 30 * time.Millisecond,
+			SubmitDelay: 0,
+			SubmitSeq:   session.DefaultSubmitSeq,
+			MaxRestarts: 1,
+		},
+		store, m, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { s := ids[idx]; idx++; return s },
+	)
+	mgr.SetSpawnForTest(st.spawn)
+
+	done := make(chan *turn.Record, 2)
+	mgr.OnTurnDone = func(r *turn.Record) { done <- r }
+	mgr.InjectProcForTest(first)
+
+	_, err := mgr.Submit("hello", "")
+	require.NoError(t, err)
+
+	// First death: MaxRestarts=1, attempt=1 <= 1 -> relaunch happens, ClaudeRestarts=1.
+	first.kill()
+	require.Eventually(t, func() bool { return st.calls() >= 1 }, 2*time.Second, 10*time.Millisecond,
+		"first relaunch not triggered")
+	require.Eventually(t, func() bool { return len(second.bytes()) > 0 }, 2*time.Second, 10*time.Millisecond,
+		"second proc did not get resume nudge")
+
+	// Second death: attempt=2 > MaxRestarts=1 -> budget exhausted, NO relaunch.
+	second.kill()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnTurnDone not fired after budget exhausted")
+	}
+
+	// ClaudeRestarts must be exactly 1: only the first death triggered a relaunch.
+	// The second death exceeded the budget and must not increment the counter.
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() == "ccw_claude_restarts_total" {
+			v := mf.GetMetric()[0].GetCounter().GetValue()
+			require.Equal(t, float64(1), v, "ClaudeRestarts must be 1 (only relaunch increments, not the terminal death)")
+			return
+		}
+	}
+	t.Fatal("ccw_claude_restarts_total not found")
+}
+
+// TestComplete_HookOutcomeCounters verifies that HookOutcome is incremented with
+// the correct result label on each Complete branch (audit finding 5).
+func TestComplete_HookOutcomeCounters(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	store := turn.NewStore()
+	ids := make(chan string, 4)
+	ids <- "turn-1"
+	mgr := session.New(
+		session.Config{TurnTimeout: 10 * time.Second, SubmitSeq: session.DefaultSubmitSeq},
+		store, m, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return <-ids },
+	)
+	mgr.SetWriterForTest(&fakePTY{})
+
+	// Case 1: no in-flight turn -> no_turn
+	err := mgr.Complete(session.HookResult{FinalText: "x", StopReason: "end_turn"})
+	require.Error(t, err)
+
+	// Case 2: successful complete -> ok
+	_, err = mgr.Submit("hi", "")
+	require.NoError(t, err)
+	require.NoError(t, mgr.Complete(session.HookResult{FinalText: "ok", StopReason: "end_turn"}))
+
+	labelVal := func(name, result string) float64 {
+		mfs, _ := reg.Gather()
+		for _, mf := range mfs {
+			if mf.GetName() != name {
+				continue
+			}
+			for _, metric := range mf.GetMetric() {
+				for _, lp := range metric.GetLabel() {
+					if lp.GetName() == "result" && lp.GetValue() == result {
+						return metric.GetCounter().GetValue()
+					}
+				}
+			}
+		}
+		return 0
+	}
+
+	require.Equal(t, float64(1), labelVal("ccw_hook_outcome_total", "no_turn"), "expected 1 no_turn")
+	require.Equal(t, float64(1), labelVal("ccw_hook_outcome_total", "ok"), "expected 1 ok")
+	// HookReceived must count both deliveries (no_turn + ok).
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() == "ccw_hook_received_total" {
+			v := mf.GetMetric()[0].GetCounter().GetValue()
+			require.Equal(t, float64(2), v, "HookReceived must count every delivery")
+			return
+		}
+	}
+	t.Fatal("ccw_hook_received_total not found")
+}

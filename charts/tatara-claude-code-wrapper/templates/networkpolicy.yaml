@@ -21,6 +21,11 @@ spec:
       ports:
         - port: 8080
           protocol: TCP
+    # Allow Prometheus scrape of /metrics from any namespace (monitoring ns is
+    # cluster-specific; open ingress on http port matches tatara-chat pattern).
+    - ports:
+        - port: http
+          protocol: TCP
   egress:
     - to:
         - namespaceSelector: {}

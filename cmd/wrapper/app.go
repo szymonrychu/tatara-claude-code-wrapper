@@ -39,7 +39,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	if err := bootstrap.Render(buildBootstrapParams(cfg, log, m), gitRunner()); err != nil {
 		return nil, err
 	}
-	bootstrap.InstallHooks(cfg.Workspace, cfg.Repos, cfg.RepoURL, execRunnerDir(log))
+	bootstrap.InstallHooks(cfg.Workspace, cfg.Repos, cfg.RepoURL, execRunnerDir(log), log, m)
 	if _, lookErr := exec.LookPath("tatara"); lookErr == nil {
 		if err := bootstrap.RegisterTataraMCP(cfg.Workspace, execRunner(log)); err != nil {
 			log.Error("tatara mcp-config failed", "error", err)
@@ -114,7 +114,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		verifier = v
 	}
 
-	api := httpapi.New(httpapi.Deps{Ctl: sess, Store: store, Verifier: verifier, Log: log, Registry: reg})
+	api := httpapi.New(httpapi.Deps{Ctl: sess, Store: store, Verifier: verifier, Log: log, Registry: reg, Metrics: m})
 
 	// Push-metrics client: this Pod is too short-lived to be reliably scraped,
 	// so it pushes its /metrics to the operator's push-receiver. A no-op unless
@@ -124,7 +124,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		RunID:    cfg.RunID,
 		Pod:      cfg.PodName,
 		Interval: time.Duration(cfg.PushIntervalSeconds) * time.Second,
-	}, reg, log)
+	}, reg, log, m)
 
 	return &app{
 		log:      log,

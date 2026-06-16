@@ -13,6 +13,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/pushclient"
 )
 
@@ -127,6 +128,86 @@ func TestShutdownDeletesSeries(t *testing.T) {
 	defer mu.Unlock()
 	require.True(t, deleted, "expected a DELETE on shutdown")
 	require.Contains(t, delQ, "run_id=run-9")
+}
+
+// TestMetricPushTotal_OkIncremented verifies that a successful push increments
+// ccw_metric_push_total{result=ok} (audit finding 7).
+func TestMetricPushTotal_OkIncremented(t *testing.T) {
+	cap := &capture{}
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+
+	appReg := prometheus.NewRegistry()
+	appReg.MustRegister(prometheus.NewCounter(prometheus.CounterOpts{Name: "ccw_turns_total", Help: "h"}))
+
+	pusherReg := prometheus.NewRegistry()
+	m := metrics.New(pusherReg)
+
+	p := pushclient.New(pushclient.Config{
+		URL:      srv.URL + "/internal/metrics/push",
+		RunID:    "run-ok",
+		Interval: time.Hour,
+	}, appReg, discardLog(), m)
+	p.Start()
+	require.Eventually(t, func() bool {
+		cap.mu.Lock()
+		defer cap.mu.Unlock()
+		return cap.hits >= 1
+	}, time.Second, 5*time.Millisecond)
+	p.Shutdown(context.Background())
+
+	mfs, err := pusherReg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() == "ccw_metric_push_total" {
+			for _, metric := range mf.GetMetric() {
+				for _, lp := range metric.GetLabel() {
+					if lp.GetName() == "result" && lp.GetValue() == "ok" {
+						require.GreaterOrEqual(t, metric.GetCounter().GetValue(), float64(1))
+						return
+					}
+				}
+			}
+		}
+	}
+	t.Fatal("ccw_metric_push_total{result=ok} not found")
+}
+
+// TestMetricPushTotal_TransportFailIncremented verifies that a transport error
+// increments ccw_metric_push_total{result=transport_fail} (audit finding 7).
+func TestMetricPushTotal_TransportFailIncremented(t *testing.T) {
+	appReg := prometheus.NewRegistry()
+	appReg.MustRegister(prometheus.NewCounter(prometheus.CounterOpts{Name: "ccw_turns_total", Help: "h"}))
+
+	pusherReg := prometheus.NewRegistry()
+	m := metrics.New(pusherReg)
+
+	// Use a closed server so the push fails with a transport error.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close() // immediately close so transport fails
+
+	p := pushclient.New(pushclient.Config{
+		URL:      srv.URL + "/internal/metrics/push",
+		RunID:    "run-fail",
+		Interval: time.Hour,
+	}, appReg, discardLog(), m)
+	p.Start()
+	require.Eventually(t, func() bool {
+		mfs, _ := pusherReg.Gather()
+		for _, mf := range mfs {
+			if mf.GetName() == "ccw_metric_push_total" {
+				for _, metric := range mf.GetMetric() {
+					for _, lp := range metric.GetLabel() {
+						if lp.GetName() == "result" && lp.GetValue() == "transport_fail" {
+							return metric.GetCounter().GetValue() >= 1
+						}
+					}
+				}
+			}
+		}
+		return false
+	}, time.Second, 5*time.Millisecond, "transport_fail not incremented")
+	p.Shutdown(context.Background())
 }
 
 // A custom job label overrides the default.

@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/auth"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/obs"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
@@ -36,6 +37,7 @@ type Deps struct {
 	Verifier *auth.Verifier
 	Log      *slog.Logger
 	Registry *prometheus.Registry
+	Metrics  *metrics.Metrics
 }
 
 type API struct {
@@ -44,13 +46,14 @@ type API struct {
 	v     *auth.Verifier
 	log   *slog.Logger
 	reg   *prometheus.Registry
+	m     *metrics.Metrics
 }
 
 func New(d Deps) *API {
 	if d.Log == nil {
 		d.Log = slog.Default()
 	}
-	return &API{ctl: d.Ctl, store: d.Store, v: d.Verifier, log: d.Log, reg: d.Registry}
+	return &API{ctl: d.Ctl, store: d.Store, v: d.Verifier, log: d.Log, reg: d.Registry, m: d.Metrics}
 }
 
 // requestLogger is a chi middleware that logs each request at INFO on completion

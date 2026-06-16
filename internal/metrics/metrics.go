@@ -14,9 +14,12 @@ type Metrics struct {
 	Interjections     prometheus.Counter
 
 	// Bootstrap metrics (rule 13: counters for everything that counts/can fail).
-	BootstrapCloneTotal *prometheus.CounterVec // label: result=ok|fail
-	BootstrapDuration   prometheus.Histogram   // full Render() wall-clock time
-	CommitPushTotal     *prometheus.CounterVec // label: result=ok|fail
+	BootstrapCloneTotal  *prometheus.CounterVec // label: result=ok|fail
+	BootstrapDuration    prometheus.Histogram   // full Render() wall-clock time
+	CommitPushTotal      *prometheus.CounterVec // label: result=ok|fail
+	BootstrapHookInstall *prometheus.CounterVec // labels: result=ok|fail, tool=mise|pre-commit
+	HookOutcome          *prometheus.CounterVec // labels: result=ok|bad_payload|rejected|store_error
+	MetricPushTotal      *prometheus.CounterVec // labels: result=ok|encode_fail|transport_fail|rejected
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -45,9 +48,16 @@ func New(reg prometheus.Registerer) *Metrics {
 			Buckets: prometheus.ExponentialBuckets(0.5, 2, 8)}),
 		CommitPushTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_commit_push_total", Help: "CommitAndPush calls by result."}, []string{"result"}),
+		BootstrapHookInstall: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_bootstrap_hook_install_total", Help: "Hook install attempts (mise/pre-commit) by result and tool."}, []string{"result", "tool"}),
+		HookOutcome: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_hook_outcome_total", Help: "Stop-hook callback outcomes at every decision point."}, []string{"result"}),
+		MetricPushTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_metric_push_total", Help: "Metric push attempts by result."}, []string{"result"}),
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
 		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal, m.Interjections,
-		m.BootstrapCloneTotal, m.BootstrapDuration, m.CommitPushTotal)
+		m.BootstrapCloneTotal, m.BootstrapDuration, m.CommitPushTotal,
+		m.BootstrapHookInstall, m.HookOutcome, m.MetricPushTotal)
 	return m
 }

@@ -2,6 +2,7 @@ package webhook_test
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -111,4 +112,42 @@ func TestDeliver_AfterShutdown_DoesNotPanic(t *testing.T) {
 	require.NotPanics(t, func() {
 		s.Deliver("http://127.0.0.1:0/no-such-server", &turn.Record{ID: "post-shutdown"})
 	})
+}
+
+// TestDeliver_MarshalFailureCountedAsDropped verifies that a marshal error in
+// Deliver increments ccw_webhook_delivery_total{result=dropped} (audit finding 6).
+// We trigger a marshal error by using a turn.Record with an un-marshalable field.
+// Since turn.Record is a plain struct that always marshals fine, we inject an
+// unmarshalable ResultJSON directly.
+func TestDeliver_MarshalFailureCountedAsDropped(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	s := webhook.New(webhook.Config{Retries: 0, Backoff: time.Millisecond}, m, discardLogger())
+
+	// json.RawMessage with invalid JSON causes json.Marshal(rec) to fail.
+	rec := &turn.Record{
+		ID:         "bad-marshal",
+		ResultJSON: json.RawMessage([]byte(`{invalid`)),
+	}
+	s.Deliver("http://127.0.0.1:0/irrelevant", rec)
+
+	// Give the goroutine a moment to run (Deliver is async for the marshal step).
+	// Actually the marshal happens before the goroutine is spawned, so it's synchronous.
+	// But we need the wg to be released; require.Eventually for robustness.
+	require.Eventually(t, func() bool {
+		mfs, _ := reg.Gather()
+		for _, mf := range mfs {
+			if mf.GetName() != "ccw_webhook_delivery_total" {
+				continue
+			}
+			for _, metric := range mf.GetMetric() {
+				for _, lp := range metric.GetLabel() {
+					if lp.GetName() == "result" && lp.GetValue() == "dropped" {
+						return metric.GetCounter().GetValue() >= 1
+					}
+				}
+			}
+		}
+		return false
+	}, time.Second, 5*time.Millisecond, "ccw_webhook_delivery_total{result=dropped} not incremented on marshal error")
 }
