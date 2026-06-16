@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -182,7 +183,7 @@ func (p *Pusher) endpoint() string {
 	}
 	q.Set("job", p.cfg.Job)
 	sep := "?"
-	if bytes.ContainsRune([]byte(p.cfg.URL), '?') {
+	if strings.ContainsRune(p.cfg.URL, '?') {
 		sep = "&"
 	}
 	return p.cfg.URL + sep + q.Encode()

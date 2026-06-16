@@ -254,6 +254,36 @@ func TestPushHonorsPerPushDeadline(t *testing.T) {
 	}
 }
 
+// TestEndpointAppendsAmpersandWhenURLContainsQuery verifies that endpoint()
+// uses '&' when the base URL already contains a query string (audit finding 1).
+func TestEndpointAppendsAmpersandWhenURLContainsQuery(t *testing.T) {
+	cap := &capture{}
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+
+	// Provide a base URL that already has a query parameter.
+	p := pushclient.New(pushclient.Config{
+		URL:      srv.URL + "/push?existing=1",
+		RunID:    "run-amp",
+		Interval: time.Hour,
+	}, testRegistry(t), discardLog())
+	p.Start()
+	require.Eventually(t, func() bool {
+		cap.mu.Lock()
+		defer cap.mu.Unlock()
+		return cap.hits >= 1
+	}, time.Second, 5*time.Millisecond)
+	p.Shutdown(context.Background())
+
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	// The full raw query should have existing=1 joined by & not ?
+	require.Contains(t, cap.query, "existing=1")
+	require.Contains(t, cap.query, "run_id=run-amp")
+	// Ensure the separator is & (i.e. existing param is not duplicated as ?...?...)
+	require.NotContains(t, cap.query, "?", "separator must be & not ?, got: "+cap.query)
+}
+
 // A custom job label overrides the default.
 func TestJobOverride(t *testing.T) {
 	cap := &capture{}
