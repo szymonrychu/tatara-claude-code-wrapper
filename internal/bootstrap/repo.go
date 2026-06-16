@@ -29,6 +29,18 @@ func configureGit(p Params, git GitRunner) error {
 	return nil
 }
 
+// RepoDir returns the on-disk directory a single-repo clone lives in:
+// workspace/<namespacePath(repoURL)>. It mirrors the single-repo clone target
+// in Render. Returns "" when the URL yields no valid namespace (the same
+// condition under which Render refuses to clone), so callers can skip safely.
+func RepoDir(workspace, repoURL string) string {
+	ns := namespacePath(repoURL)
+	if ns == "" || filepath.Clean(filepath.Join(workspace, ns)) == filepath.Clean(workspace) {
+		return ""
+	}
+	return filepath.Join(workspace, ns)
+}
+
 // CommitAndPush stages all changes, and when something is staged commits and
 // pushes the branch to origin. A clean tree is left untouched: nothing is
 // committed and nothing is pushed, so no empty remote branch is created.

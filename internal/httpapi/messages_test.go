@@ -124,6 +124,9 @@ func TestPostMessage_SSRFValidation(t *testing.T) {
 		{"private 172.16.x", "https://172.16.0.1/cb"},
 		{"private 192.168.x", "https://192.168.1.1/cb"},
 		{"loopback IPv6", "https://[::1]/cb"},
+		{"unique-local IPv6", "https://[fd00::1]/cb"},
+		{"unspecified IPv4", "https://0.0.0.0/cb"},
+		{"unspecified IPv6", "https://[::]/cb"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

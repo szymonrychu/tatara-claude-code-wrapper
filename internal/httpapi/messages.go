@@ -44,17 +44,19 @@ func validateCallbackURL(raw string) error {
 	if ip.IsLoopback() {
 		return fmt.Errorf("callbackUrl host %q is not allowed (loopback)", host)
 	}
-	// Reject link-local (169.254.x.x, fe80::/10).
+	// Reject unspecified (0.0.0.0, ::) which can route to localhost on some stacks.
+	if ip.IsUnspecified() {
+		return fmt.Errorf("callbackUrl host %q is not allowed (unspecified)", host)
+	}
+	// Reject link-local (169.254.x.x, fe80::/10) - covers the cloud metadata IP.
 	if ip.IsLinkLocalUnicast() {
 		return fmt.Errorf("callbackUrl host %q is not allowed (link-local)", host)
 	}
-	// Reject private RFC1918 ranges (10.x, 172.16-31.x, 192.168.x).
-	private := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
-	for _, cidr := range private {
-		_, block, _ := net.ParseCIDR(cidr)
-		if block.Contains(ip) {
-			return fmt.Errorf("callbackUrl host %q is not allowed (private range %s)", host, cidr)
-		}
+	// Reject private ranges. net.IP.IsPrivate covers BOTH RFC1918 IPv4
+	// (10/8, 172.16/12, 192.168/16) AND IPv6 unique-local fc00::/7, so an
+	// internal IPv6 ULA target (e.g. [fd00::1]) cannot be reached either.
+	if ip.IsPrivate() {
+		return fmt.Errorf("callbackUrl host %q is not allowed (private range)", host)
 	}
 	return nil
 }

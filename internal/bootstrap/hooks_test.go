@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -15,8 +16,10 @@ import (
 )
 
 // TestInstallHooks_SingleRepo asserts that InstallHooks calls mise install and
-// pre-commit install --hook-type pre-commit --hook-type pre-push in the
-// workspace dir when repos is empty and repoURL is set.
+// pre-commit install --hook-type pre-commit --hook-type pre-push in the repo's
+// namespace subdir (workspace/<owner>/<repo>) when repos is empty and repoURL is
+// set. Single-repo clones into a subdir (not the workspace root), so hooks must
+// install there.
 func TestInstallHooks_SingleRepo(t *testing.T) {
 	type call struct {
 		dir  string
@@ -35,13 +38,14 @@ func TestInstallHooks_SingleRepo(t *testing.T) {
 
 	require.Len(t, calls, 2, "expected 2 calls: mise install + pre-commit install")
 
+	repoDir := filepath.Join(workspace, "x", "y")
 	miseCall := calls[0]
-	require.Equal(t, workspace, miseCall.dir)
+	require.Equal(t, repoDir, miseCall.dir, "hooks must install in the repo namespace subdir, not the workspace root")
 	require.Equal(t, "mise", miseCall.name)
 	require.Equal(t, []string{"install"}, miseCall.args)
 
 	pcCall := calls[1]
-	require.Equal(t, workspace, pcCall.dir)
+	require.Equal(t, repoDir, pcCall.dir, "hooks must install in the repo namespace subdir, not the workspace root")
 	require.Equal(t, "pre-commit", pcCall.name)
 	require.Equal(t, []string{"install", "--hook-type", "pre-commit", "--hook-type", "pre-push"}, pcCall.args)
 }

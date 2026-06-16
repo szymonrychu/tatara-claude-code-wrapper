@@ -10,6 +10,43 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
 )
 
+// TestRepoDir_MatchesSingleRepoCloneDest is a regression guard for the audit
+// finding that single-repo clone moved into workspace/<owner>/<repo> but the
+// commit/push and hook-install consumers still targeted the workspace root.
+// RepoDir is the single source of truth for the single-repo dir and MUST equal
+// the directory Render clones into; an empty/invalid URL must return "".
+func TestRepoDir_MatchesSingleRepoCloneDest(t *testing.T) {
+	ws := t.TempDir()
+
+	// Capture the destination Render actually clones into for a single repo.
+	var cloneDest string
+	fakeGit := func(dir string, args ...string) error {
+		if len(args) > 0 && args[0] == "clone" {
+			cloneDest = args[len(args)-1]
+		}
+		return nil
+	}
+	p := bootstrap.Params{
+		HomeDir:    t.TempDir(),
+		Workspace:  ws,
+		BaseMCP:    []byte(`{"mcpServers":{}}`),
+		RepoURL:    "https://github.com/owner/myrepo.git",
+		RepoBranch: "main",
+	}
+	require.NoError(t, bootstrap.Render(p, fakeGit))
+
+	require.Equal(t, cloneDest, bootstrap.RepoDir(ws, p.RepoURL),
+		"RepoDir must equal the directory Render clones the single repo into")
+	require.Equal(t, filepath.Join(ws, "owner", "myrepo"), bootstrap.RepoDir(ws, p.RepoURL))
+
+	// Invalid/empty URLs must yield "" so callers skip rather than operate on
+	// the workspace root.
+	require.Equal(t, "", bootstrap.RepoDir(ws, ""))
+	require.Equal(t, "", bootstrap.RepoDir(ws, "https://github.com/"))
+	require.Equal(t, "", bootstrap.RepoDir(ws, "https://host/repo.git"),
+		"single-segment (no owner) must return empty")
+}
+
 // TestCommitAndPush_UsesNoVerify asserts that CommitAndPush passes --no-verify
 // to both git commit and git push (safety-net push must bypass hooks).
 func TestCommitAndPush_UsesNoVerify(t *testing.T) {

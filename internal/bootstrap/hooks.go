@@ -14,7 +14,8 @@ import (
 //
 // Directory resolution mirrors Render:
 //   - When repos is non-empty: workspace/<namespacePath(r.URL)> for each entry.
-//   - When repos is empty and repoURL is set: workspace itself.
+//   - When repos is empty and repoURL is set: workspace/<namespacePath(repoURL)>
+//     (single-repo also clones into a namespace subdir, not the workspace root).
 func InstallHooks(workspace string, repos []RepoSpec, repoURL string, cmd CmdRunnerDir, log *slog.Logger, m *metrics.Metrics) {
 	dirs := repoDirs(workspace, repos, repoURL)
 	for _, dir := range dirs {
@@ -57,7 +58,9 @@ func repoDirs(workspace string, repos []RepoSpec, repoURL string) []string {
 		return dirs
 	}
 	if repoURL != "" {
-		return []string{workspace}
+		if dir := RepoDir(workspace, repoURL); dir != "" {
+			return []string{dir}
+		}
 	}
 	return nil
 }

@@ -92,6 +92,11 @@ func (a *API) httpMetrics() func(http.Handler) http.Handler {
 			defer func() {
 				if rec := recover(); rec != nil {
 					a.m.HTTPPanicsTotal.Inc()
+					a.log.ErrorContext(r.Context(), "http handler panic recovered",
+						"action", "http_panic",
+						"request_id", middleware.GetReqID(r.Context()),
+						"route", r.URL.Path, "method", r.Method,
+						"panic", fmt.Sprintf("%v", rec))
 					http.Error(w, "internal server error", http.StatusInternalServerError)
 				}
 			}()

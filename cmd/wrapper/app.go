@@ -100,7 +100,14 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 				if len(cfg.Repos) > 0 {
 					err = bootstrap.CommitAndPushAll(cfg.Workspace, cfg.Repos, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
 				} else {
-					err = bootstrap.CommitAndPush(cfg.Workspace, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
+					// Single-repo clones into workspace/<owner>/<repo>, not the
+					// workspace root, so commit/push must target that subdir.
+					repoDir := bootstrap.RepoDir(cfg.Workspace, cfg.RepoURL)
+					if repoDir == "" {
+						err = fmt.Errorf("cannot derive repo dir from REPO_URL %q for commit/push", cfg.RepoURL)
+					} else {
+						err = bootstrap.CommitAndPush(repoDir, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
+					}
 				}
 				if err != nil {
 					m.CommitPushTotal.WithLabelValues("fail").Inc()
