@@ -1041,3 +1041,108 @@ func TestComplete_HookOutcomeCounters(t *testing.T) {
 	}
 	t.Fatal("ccw_hook_received_total not found")
 }
+
+// TestComplete_RejectsHookDuringDeadState verifies that a Stop hook arriving
+// while the session is Dead (mid-recovery) is rejected, not accepted as a real
+// completion (audit finding 1).
+func TestComplete_RejectsHookDuringDeadState(t *testing.T) {
+	store := turn.NewStore()
+	ids := make(chan string, 4)
+	ids <- "turn-1"
+	mgr := session.New(
+		session.Config{TurnTimeout: 10 * time.Second, SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return <-ids },
+	)
+	mgr.SetWriterForTest(&fakePTY{})
+
+	_, err := mgr.Submit("hi", "")
+	require.NoError(t, err)
+
+	// Directly flip to Dead while keeping current set: simulates the crash window
+	// before relaunch, where a late Stop hook from the dying process arrives.
+	mgr.SetDeadForTest()
+	require.Equal(t, session.Dead, mgr.Snapshot().State, "state must be Dead")
+
+	// A Stop hook arriving now (state=Dead, turn still set) must be rejected.
+	err = mgr.Complete(session.HookResult{FinalText: "stale output", StopReason: "end_turn"})
+	require.Error(t, err, "Complete must reject hook when session is Dead")
+	require.Contains(t, err.Error(), "recovery", "rejection message should mention recovery")
+
+	// The turn must not be marked Complete.
+	rec, ok := store.Get("turn-1")
+	require.True(t, ok)
+	require.NotEqual(t, turn.Complete, rec.State, "turn must not be Complete after hook rejected during Dead state")
+}
+
+// TestComplete_RejectsHookDuringBootingState verifies that a Stop hook arriving
+// while the session is Booting (mid-recovery) is also rejected (audit finding 1).
+func TestComplete_RejectsHookDuringBootingState(t *testing.T) {
+	store := turn.NewStore()
+	ids := make(chan string, 4)
+	ids <- "turn-1"
+
+	// We need a manager whose state is Booting with an in-flight turn.
+	// Create a custom manager that starts in Ready state, submit a turn, then
+	// directly set state to Booting to simulate mid-relaunch window.
+	mgr := session.New(
+		session.Config{TurnTimeout: 10 * time.Second, SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return <-ids },
+	)
+	mgr.SetWriterForTest(&fakePTY{})
+
+	_, err := mgr.Submit("hi", "")
+	require.NoError(t, err)
+
+	// Use SetBootingForTest to flip state to Booting while keeping mgr.current set.
+	mgr.SetBootingForTest()
+
+	err = mgr.Complete(session.HookResult{FinalText: "stale", StopReason: "end_turn"})
+	require.Error(t, err, "Complete must reject hook when session is Booting")
+	require.Contains(t, err.Error(), "recovery")
+}
+
+// TestSubmit_DoesNotHoldLockAcrossSleep verifies that Submit releases mgr.mu
+// before the SubmitDelay sleep so concurrent Snapshot/Complete/Alive are not
+// blocked for the full delay (audit finding 2).
+func TestSubmit_DoesNotHoldLockAcrossSleep(t *testing.T) {
+	store := turn.NewStore()
+	ids := make(chan string, 4)
+	ids <- "turn-1"
+	// Use a deliberately long SubmitDelay to make the race detectable.
+	mgr := session.New(
+		session.Config{TurnTimeout: 10 * time.Second, SubmitDelay: 300 * time.Millisecond, SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return <-ids },
+	)
+	mgr.SetWriterForTest(&fakePTY{})
+
+	snapshotDone := make(chan time.Duration, 1)
+	go func() {
+		// Give Submit a tiny head-start to enter the lock and trigger the paste write.
+		time.Sleep(20 * time.Millisecond)
+		start := time.Now()
+		_ = mgr.Snapshot()
+		snapshotDone <- time.Since(start)
+	}()
+
+	// Submit holds paste write + sleep + submit write; Snapshot should not block
+	// for the full 300ms if the lock is released before the sleep.
+	_, _ = mgr.Submit("hello", "")
+
+	select {
+	case d := <-snapshotDone:
+		// Snapshot should complete well under the SubmitDelay (allow 200ms margin).
+		require.Less(t, d, 250*time.Millisecond,
+			"Snapshot blocked for %v; Submit must release lock before SubmitDelay sleep", d)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Snapshot never returned; Submit is holding the lock across sleep")
+	}
+}

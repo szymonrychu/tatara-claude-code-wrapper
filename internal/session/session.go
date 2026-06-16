@@ -257,6 +257,24 @@ func (mgr *Manager) SetStoppingForTest() {
 	mgr.stopping = true
 }
 
+// SetBootingForTest transitions the session state to Booting while leaving the
+// in-flight turn id intact. Test-only: simulates the Dead->Booting window during
+// crash recovery so the Complete guard can be exercised in isolation.
+func (mgr *Manager) SetBootingForTest() {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	mgr.state = Booting
+}
+
+// SetDeadForTest transitions the session state to Dead while leaving the
+// in-flight turn id intact. Test-only: simulates the crash window before relaunch
+// so the Complete Dead-state guard can be exercised without a real watch goroutine.
+func (mgr *Manager) SetDeadForTest() {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	mgr.state = Dead
+}
+
 // Start spawns claude, reads its PTY into the ring buffer, navigates the boot
 // dialogs, and marks READY once the TUI settles.
 func (mgr *Manager) Start(ctx context.Context) error {
@@ -473,9 +491,11 @@ func (mgr *Manager) relaunch() error {
 		_ = old.Close()
 	}
 	// Clear the dead proc's output so bootWait navigates against only the new
-	// proc's dialogs. The old proc's Wait() has returned and its PTY master is
-	// closed, so its readPTY goroutine has stopped writing - this cannot race the
-	// new proc's first bytes (readPTY(proc) starts below).
+	// proc's dialogs. old.Close() above causes the old ptmx Read to error, but
+	// the old readPTY goroutine may still be inside ring.Write with a final buffer
+	// when reset() runs. ring.mu serialises the two so there is no data race, but
+	// a stale tail from the dead proc can land in the ring after the reset in a
+	// small window. bootWait's minBoot delay (4s) absorbs this in practice.
 	mgr.ring.reset()
 	mgr.wg.Add(2)
 	go mgr.readPTY(proc)
@@ -567,35 +587,54 @@ func (mgr *Manager) failTurn(id, reason string) {
 
 func (mgr *Manager) Submit(text, callbackURL string) (string, error) {
 	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
 	if mgr.state == Dead {
+		mgr.mu.Unlock()
 		return "", fmt.Errorf("session dead")
 	}
 	if mgr.state == Booting {
+		mgr.mu.Unlock()
 		return "", fmt.Errorf("session not ready")
 	}
 	if mgr.current != "" {
+		mgr.mu.Unlock()
 		return "", ErrBusy
 	}
 	id := mgr.newID()
 	now := mgr.now()
 	mgr.store.Create(id, text, callbackURL, now)
-	// Two writes: paste the text, pause, then submit. A single concatenated
-	// write does not submit reliably (spike). The pause is held under the lock
-	// (turns are sequential, so nothing else is writing).
+	// Reserve the turn slot immediately so a concurrent Submit sees ErrBusy even
+	// while we are sleeping between the paste and the submit keystroke.
+	mgr.current, mgr.currentStarted, mgr.currentTimeoutStarted, mgr.state = id, now, now, Busy
+	mgr.m.TurnInFlight.Set(1)
+	w := mgr.w
 	seq := mgr.cfg.SubmitSeq
-	if _, err := mgr.w.Write([]byte(seq.PasteStart + text + seq.PasteEnd)); err != nil {
+	mgr.mu.Unlock()
+
+	// Paste and submit happen outside the lock so that Snapshot/Alive/Complete
+	// are not blocked for the full SubmitDelay (mirrors the Interject fix,
+	// finding 2). Both writes are to the same logical PTY, ordered by the fact
+	// that only one goroutine (this one) drives the paste+submit sequence at a time
+	// (the turn slot above guarantees no concurrent Submit).
+	if _, err := w.Write([]byte(seq.PasteStart + text + seq.PasteEnd)); err != nil {
+		mgr.mu.Lock()
 		_ = mgr.store.Fail(id, fmt.Sprintf("write pty paste: %v", err), now)
+		mgr.clearCurrentLocked(Ready)
+		mgr.mu.Unlock()
 		return "", fmt.Errorf("write pty paste: %w", err)
 	}
 	time.Sleep(mgr.cfg.SubmitDelay)
-	if _, err := mgr.w.Write([]byte(seq.Submit)); err != nil {
+	if _, err := w.Write([]byte(seq.Submit)); err != nil {
+		mgr.mu.Lock()
 		_ = mgr.store.Fail(id, fmt.Sprintf("write pty submit: %v", err), now)
+		mgr.clearCurrentLocked(Ready)
+		mgr.mu.Unlock()
 		return "", fmt.Errorf("write pty submit: %w", err)
 	}
-	mgr.current, mgr.currentStarted, mgr.currentTimeoutStarted, mgr.state = id, now, now, Busy
-	mgr.m.TurnInFlight.Set(1)
+
+	// Install the timeout timer and log only after writes succeed.
+	mgr.mu.Lock()
 	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.failTimeout(id) })
+	mgr.mu.Unlock()
 	mgr.log.Info("turn submitted", "action", "turn_submit", "turn_id", id)
 	return id, nil
 }
@@ -652,6 +691,15 @@ func (mgr *Manager) Complete(r HookResult) error {
 		mgr.m.HookOutcome.WithLabelValues("no_turn").Inc()
 		mgr.mu.Unlock()
 		return fmt.Errorf("no in-flight turn")
+	}
+	// Reject hooks that arrive during crash recovery (Dead or Booting). The hook
+	// is from the dead process; the genuine post-resume completion only arrives
+	// after resumeTurn flips state back to Busy (finding 1).
+	if mgr.state == Dead || mgr.state == Booting {
+		mgr.m.HookOutcome.WithLabelValues("rejected").Inc()
+		mgr.mu.Unlock()
+		mgr.log.Warn("hook during recovery; rejecting", "turn_id", id, "state", mgr.state)
+		return fmt.Errorf("hook during recovery: session %s", mgr.state)
 	}
 	// Reject stale/duplicate hooks: if this is not the first hook for this turn
 	// and the session already has a recorded SessionID that differs, the hook

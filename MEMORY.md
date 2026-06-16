@@ -1,5 +1,7 @@
 # MEMORY.md - tatara-claude-code-wrapper
 
+- 2026-06-16 (audit-r2): resumeTurn sends a bare CR into the --continue session. Two unresolved hazards: (1) if claude already completed the turn before crashing, --continue restores the completed conversation and the bare CR submits an empty user turn, causing duplicate work; (2) if the paste landed but the submit keystroke was lost, no Stop hook fires for the original turn id and the turn sits Busy until TurnTimeout. These cannot be fixed without reading the last-message role from the restored transcript (tailer already parses it, but resumeTurn runs before any hook lands). Documented as a known limitation per hard rule 4; full fix requires transcript-aware resume (future work).
+
 - 2026-06-16 (audit-r2): `.claude.json` customApiKeyResponses.approved stores last 20 chars of the Anthropic API key (partial secret at rest, 0600 file). Real sk-ant-* keys are always >20 chars so the suffix is never the full key. Intentional per the claude onboarding recipe; hardening would require a different auth method.
 
 - 2026-06-16 (audit-r2): `.mcp.json` written 0644 (non-secret config). Overlay fragments must NOT embed secrets in their `env` map - use env passthrough (the pod's env provides secrets at runtime). Fragments with embedded credentials would be world-readable inside the pod. Single-tenant pod so impact is contained, but document as a usage constraint.
