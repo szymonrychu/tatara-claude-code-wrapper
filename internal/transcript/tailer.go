@@ -14,6 +14,12 @@ import (
 
 const pollInterval = 200 * time.Millisecond
 
+// maxPartialBytes caps the in-memory accumulator for partial (non-newline-
+// terminated) lines. Matches the 16 MiB scanner limit used by the stop-hook
+// reader in transcript.go. Exceeding this emits a raw event and resets
+// partial so a pathological write cannot grow memory unbounded.
+const maxPartialBytes = 16 * 1024 * 1024
+
 // StreamCounter is satisfied by *prometheus.CounterVec.
 type StreamCounter interface {
 	WithLabelValues(lvs ...string) prometheus.Counter
@@ -127,8 +133,12 @@ func (t *Tailer) Follow(ctx context.Context, path string) error {
 				partial = nil
 				t.processLine(full)
 			} else {
-				// Partial line at EOF - accumulate
+				// Partial line at EOF - accumulate up to cap
 				partial = append(partial, line...)
+				if len(partial) >= maxPartialBytes {
+					t.processLine(partial)
+					partial = nil
+				}
 			}
 		}
 

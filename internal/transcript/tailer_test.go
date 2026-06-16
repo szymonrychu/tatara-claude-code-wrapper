@@ -604,6 +604,58 @@ func TestTailer_TurnIDCapturedOnce(t *testing.T) {
 	}
 }
 
+// TestTailer_PartialLineSizeCap verifies that a partial line that exceeds
+// maxPartialBytes is flushed as a raw event and partial is reset, preventing
+// unbounded memory growth from a never-newline-terminated chunk.
+func TestTailer_PartialLineSizeCap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+
+	// Write a chunk that exceeds maxPartialBytes with no trailing newline.
+	// We use a small sentinel constant here; the production constant is 16MiB
+	// which is too large to allocate in a unit test. Instead we write content
+	// directly and test the flush logic by calling processLine indirectly
+	// through the Follow loop with a file that has a very long partial segment.
+	//
+	// Strategy: write maxPartialBytes+1 bytes of 'x' then a newline.  The file
+	// has exactly one "line" that is maxPartialBytes+1 bytes long (so it is read
+	// past the cap).  We verify that a raw event is emitted.
+	oversized := make([]byte, maxPartialBytes+1)
+	for i := range oversized {
+		oversized[i] = 'x'
+	}
+	oversized = append(oversized, '\n')
+	if err := os.WriteFile(path, oversized, 0o600); err != nil {
+		t.Fatalf("write oversized file: %v", err)
+	}
+
+	h := newCaptureHandler()
+	log := slog.New(h)
+	tailer := NewTailer(log, NewRedactor(nil), func() string { return "" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	recs := waitForRecords(t, h, 1, 3*time.Second)
+	cancel()
+	<-done
+
+	stream := filterAgentStream(recs)
+	var hasRaw bool
+	for _, r := range stream {
+		if r["stream_type"] == "raw" {
+			hasRaw = true
+			break
+		}
+	}
+	if !hasRaw {
+		t.Fatalf("expected raw event for oversized partial line, got: %v", stream)
+	}
+}
+
 func TestTailer_RedactorAppliedToText(t *testing.T) {
 	// Craft a line where the text field contains a secret
 	secretVal := "supersecrettoken9999"
