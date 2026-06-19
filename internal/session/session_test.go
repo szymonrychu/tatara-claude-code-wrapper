@@ -81,6 +81,39 @@ func TestSnapshot_EmptyRepoWhenUnconfigured(t *testing.T) {
 	require.Equal(t, "", m.Snapshot().Repo)
 }
 
+// TestSnapshot_ExposesLastActivityAt verifies the snapshot surfaces the in-flight
+// turn's last activity timestamp (zero when idle, advancing on activity).
+func TestSnapshot_ExposesLastActivityAt(t *testing.T) {
+	fp := &fakePTY{}
+	store := turn.NewStore()
+	ids := make(chan string, 2)
+	ids <- "turn-1"
+	var clkMu sync.Mutex
+	clock := time.Unix(100, 0)
+	now := func() time.Time {
+		clkMu.Lock()
+		defer clkMu.Unlock()
+		return clock
+	}
+	m := session.New(session.Config{TurnTimeout: 10 * time.Second, SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		now, func() string { return <-ids })
+	m.SetWriterForTest(fp)
+
+	require.True(t, m.Snapshot().LastActivityAt.IsZero(), "idle session has no activity timestamp")
+
+	_, err := m.Submit("hi", "")
+	require.NoError(t, err)
+	require.Equal(t, time.Unix(100, 0), m.Snapshot().LastActivityAt, "defaults to turn start")
+
+	clkMu.Lock()
+	clock = time.Unix(140, 0)
+	clkMu.Unlock()
+	m.FireActivityForTest("turn-1")
+	require.Equal(t, time.Unix(140, 0), m.Snapshot().LastActivityAt, "advances on activity")
+}
+
 func TestSubmit_WritesPasteAndSubmit_ThenBusy(t *testing.T) {
 	fp := &fakePTY{}
 	m, store := newMgr(t, fp)
@@ -183,6 +216,83 @@ func TestTurnTimeout_FailsAndFiresCallback(t *testing.T) {
 	}
 	rec, _ := store.Get("turn-1")
 	require.Equal(t, turn.Failed, rec.State)
+}
+
+// TestTurnTimeout_ResetsOnActivity verifies the per-turn deadline is an
+// inactivity timer: a turn that keeps producing transcript activity survives
+// well past the original wall-clock TurnTimeout, and only fails once activity
+// stops for a full TurnTimeout window. It also confirms activity advances
+// LastActivityAt on the turn record.
+func TestTurnTimeout_ResetsOnActivity(t *testing.T) {
+	fp := &fakePTY{}
+	store := turn.NewStore()
+	ids := make(chan string, 4)
+	ids <- "turn-1"
+	var clkMu sync.Mutex
+	clock := time.Unix(100, 0)
+	now := func() time.Time {
+		clkMu.Lock()
+		defer clkMu.Unlock()
+		return clock
+	}
+	m := session.New(session.Config{TurnTimeout: 100 * time.Millisecond, SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		now, func() string { return <-ids })
+	m.SetWriterForTest(fp)
+
+	done := make(chan *turn.Record, 1)
+	m.OnTurnDone = func(r *turn.Record) { done <- r }
+
+	_, err := m.Submit("hi", "https://cb/x")
+	require.NoError(t, err)
+
+	// Signal activity faster than TurnTimeout for longer than TurnTimeout total.
+	for i := 0; i < 6; i++ {
+		time.Sleep(40 * time.Millisecond)
+		clkMu.Lock()
+		clock = clock.Add(40 * time.Millisecond)
+		clkMu.Unlock()
+		m.FireActivityForTest("turn-1")
+	}
+
+	rec, _ := store.Get("turn-1")
+	require.Equal(t, turn.Running, rec.State, "an actively streaming turn must survive past TurnTimeout")
+	require.True(t, rec.LastActivityAt.After(time.Unix(100, 0)), "activity must advance LastActivityAt")
+
+	// Silence: the inactivity timer must now fire.
+	select {
+	case r := <-done:
+		require.Equal(t, turn.Failed, r.State)
+	case <-time.After(2 * time.Second):
+		t.Fatal("inactivity timeout did not fire after activity stopped")
+	}
+}
+
+// TestActivity_StaleTurnDoesNotResetTimer verifies that activity attributed to a
+// turn other than the in-flight one does not extend the live deadline.
+func TestActivity_StaleTurnDoesNotResetTimer(t *testing.T) {
+	fp := &fakePTY{}
+	m, _ := newMgr(t, fp) // TurnTimeout 50ms
+	done := make(chan *turn.Record, 1)
+	m.OnTurnDone = func(r *turn.Record) { done <- r }
+
+	_, err := m.Submit("hi", "https://cb/x")
+	require.NoError(t, err)
+
+	// Hammer activity for a stale turn id across a window longer than TurnTimeout.
+	// If stale activity (wrongly) reset the timer, the turn would stay Running.
+	for i := 0; i < 8; i++ {
+		m.FireActivityForTest("turn-999")
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	select {
+	case r := <-done:
+		require.Equal(t, turn.Failed, r.State)
+	default:
+		t.Fatal("stale-turn activity reset the live timer; in-flight turn did not time out")
+	}
 }
 
 func TestClaudeExit_FailsInFlightTurnAndFiresCallback(t *testing.T) {

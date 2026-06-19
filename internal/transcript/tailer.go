@@ -29,10 +29,11 @@ type StreamCounter interface {
 // It re-opens the file on inode change (claude restart) and never drops a
 // malformed line (emits a raw event instead).
 type Tailer struct {
-	log      *slog.Logger
-	redactor *Redactor
-	turnID   func() string
-	counter  StreamCounter
+	log        *slog.Logger
+	redactor   *Redactor
+	turnID     func() string
+	counter    StreamCounter
+	onActivity func(turnID string)
 }
 
 // NewTailer constructs a Tailer. turnID is called per event to get the current
@@ -47,9 +48,23 @@ func (t *Tailer) WithCounter(c StreamCounter) *Tailer {
 	return t
 }
 
+// WithActivity attaches a hook fired once per processed transcript line that
+// carries an in-flight turn id. It is the per-turn liveness heartbeat the
+// session uses to reset its inactivity deadline. Returns self for chaining.
+func (t *Tailer) WithActivity(fn func(turnID string)) *Tailer {
+	t.onActivity = fn
+	return t
+}
+
 func (t *Tailer) incCounter(streamType string) {
 	if t.counter != nil {
 		t.counter.WithLabelValues(streamType).Inc() //nolint:errcheck
+	}
+}
+
+func (t *Tailer) fireActivity(turnID string) {
+	if t.onActivity != nil && turnID != "" {
+		t.onActivity(turnID)
 	}
 }
 
@@ -224,6 +239,10 @@ func (t *Tailer) processLine(raw []byte) {
 	// Capture turnID once per line so all branches share the same value and
 	// the session mutex is taken at most once per poll cycle.
 	turnID := t.turnID()
+
+	// Any non-empty transcript line is agent progress: signal liveness for the
+	// in-flight turn so the session can treat its deadline as an inactivity timer.
+	t.fireActivity(turnID)
 
 	var entry transcriptEntry
 	if err := json.Unmarshal(raw, &entry); err != nil {

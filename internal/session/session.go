@@ -78,11 +78,12 @@ const (
 )
 
 type Snapshot struct {
-	State          State  `json:"state"`
-	TurnsCompleted int    `json:"turnsCompleted"` // successful turns only (excludes failed/timed-out)
-	TurnsFinished  int    `json:"turnsFinished"`  // all terminal turns (success + failed + timed-out)
-	Model          string `json:"model"`
-	Repo           string `json:"repo"`
+	State          State     `json:"state"`
+	TurnsCompleted int       `json:"turnsCompleted"` // successful turns only (excludes failed/timed-out)
+	TurnsFinished  int       `json:"turnsFinished"`  // all terminal turns (success + failed + timed-out)
+	Model          string    `json:"model"`
+	Repo           string    `json:"repo"`
+	LastActivityAt time.Time `json:"lastActivityAt"` // last agent_stream event of the in-flight turn; zero when idle
 }
 
 type Manager struct {
@@ -156,6 +157,7 @@ func (mgr *Manager) StartTailer(ctx context.Context) {
 	redactor := transcript.NewRedactor(secretsFromEnv())
 	tailer := transcript.NewTailer(mgr.log, redactor, mgr.currentTurnID)
 	tailer.WithCounter(mgr.m.StreamEventsTotal)
+	tailer.WithActivity(mgr.onTailerActivity)
 	tailerCtx, cancel := context.WithCancel(ctx) //nolint:gosec // cancel is stored in mgr.tailerCancel and invoked by Shutdown/path-change restart
 	mgr.mu.Lock()
 	mgr.tailer = tailer
@@ -169,6 +171,23 @@ func (mgr *Manager) currentTurnID() string {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	return mgr.current
+}
+
+// onTailerActivity is the transcript Tailer's per-turn liveness hook. For each
+// agent_stream event of the in-flight turn it advances LastActivityAt and resets
+// the turn deadline, turning the AfterFunc(TurnTimeout) into an inactivity timer:
+// a turn that keeps streaming runs as long as it makes progress, while a silent
+// (hung) turn still fails after TurnTimeout of no transcript output. Events for a
+// stale or already-cleared turn are ignored so a late event cannot extend or
+// resurrect a turn the timeout path has finished.
+func (mgr *Manager) onTailerActivity(turnID string) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	if turnID == "" || turnID != mgr.current || mgr.timer == nil {
+		return
+	}
+	mgr.store.Touch(turnID, mgr.now())
+	mgr.timer.Reset(mgr.cfg.TurnTimeout)
 }
 
 // logTranscriptEnabled returns true unless CCW_LOG_TRANSCRIPT is explicitly "false".
@@ -232,6 +251,13 @@ func (mgr *Manager) SimulateExitForTest(err error) {
 	if proc != nil {
 		_ = proc.Close()
 	}
+}
+
+// FireActivityForTest drives the transcript activity hook directly, simulating a
+// tailer-observed agent_stream event for turnID. Test-only: exercises the
+// inactivity-timer reset without standing up a real tailer goroutine.
+func (mgr *Manager) FireActivityForTest(turnID string) {
+	mgr.onTailerActivity(turnID)
 }
 
 // SetSpawnForTest replaces the spawn function used by Start/relaunch. Test-only.
@@ -1000,12 +1026,19 @@ func (mgr *Manager) fireDone(rec *turn.Record) {
 func (mgr *Manager) Snapshot() Snapshot {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
+	var lastActivity time.Time
+	if mgr.current != "" {
+		if rec, ok := mgr.store.Get(mgr.current); ok {
+			lastActivity = rec.LastActivityAt
+		}
+	}
 	return Snapshot{
 		State:          mgr.state,
 		TurnsCompleted: mgr.turnsSucceeded, // successful turns only (finding 11)
 		TurnsFinished:  mgr.turnsCompleted, // all terminal turns
 		Model:          mgr.cfg.Model,
 		Repo:           mgr.cfg.Repo,
+		LastActivityAt: lastActivity,
 	}
 }
 
