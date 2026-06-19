@@ -46,6 +46,10 @@ func mergeMCP(p Params) error {
 			}
 		}
 	}
+	if p.GrafanaMCPURL != "" {
+		entry, _ := json.Marshal(map[string]string{"type": "http", "url": p.GrafanaMCPURL})
+		merged.MCPServers["grafana"] = entry
+	}
 	out, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal mcp: %w", err)

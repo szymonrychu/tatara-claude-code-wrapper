@@ -40,6 +40,7 @@ type config struct {
 	ProjectClaudeMdPath string
 	MCPBasePath         string
 	MCPOverlayDir       string
+	GrafanaMCPURL       string
 	SkillsSrcDirs       string // colon-separated
 	AllowedToolsPath    string
 	Repos               []bootstrap.RepoSpec
@@ -92,6 +93,7 @@ func loadConfig(args []string) (config, error) {
 		ProjectClaudeMdPath: envOr("PROJECT_CLAUDE_MD_PATH", "/etc/wrapper/project-claude.md"),
 		MCPBasePath:         envOr("MCP_BASE_PATH", "/etc/wrapper/mcp-base.json"),
 		MCPOverlayDir:       envOr("MCP_OVERLAY_DIR", "/etc/wrapper/mcp.d"),
+		GrafanaMCPURL:       os.Getenv("TATARA_GRAFANA_MCP_URL"),
 		SkillsSrcDirs:       envOr("SKILLS_SRC_DIRS", "/templates/skills:/etc/wrapper/skills"),
 		AllowedToolsPath:    envOr("ALLOWED_TOOLS_PATH", "/etc/wrapper/allowed-tools.txt"),
 	}

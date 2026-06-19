@@ -199,6 +199,7 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		ProjectClaudeMd: readFileOrEmpty(cfg.ProjectClaudeMdPath),
 		BaseMCP:         readBytesOrDefault(cfg.MCPBasePath, []byte(`{"mcpServers":{}}`)),
 		MCPOverlayDir:   cfg.MCPOverlayDir,
+		GrafanaMCPURL:   cfg.GrafanaMCPURL,
 		SkillsSrc:       strings.Split(cfg.SkillsSrcDirs, ":"),
 		HookCommand:     cfg.HookPath,
 		AllowedTools:    readLines(cfg.AllowedToolsPath),

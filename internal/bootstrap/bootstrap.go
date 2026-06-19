@@ -22,6 +22,7 @@ type Params struct {
 	GlobalClaudeMd, ProjectClaudeMd string
 	BaseMCP                         []byte
 	MCPOverlayDir                   string
+	GrafanaMCPURL                   string
 	SkillsSrc                       []string
 	HookCommand                     string
 	AllowedTools                    []string
