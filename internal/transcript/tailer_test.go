@@ -604,6 +604,79 @@ func TestTailer_TurnIDCapturedOnce(t *testing.T) {
 	}
 }
 
+// TestTailer_FiresActivityPerLine verifies the OnActivity hook fires once per
+// processed line carrying an in-flight turn id (the liveness heartbeat), even
+// when a single line emits multiple content-block events.
+func TestTailer_FiresActivityPerLine(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	writeTranscriptLine(t, path, makeToolUseLine())    // tool_use + message_end = 2 events
+	writeTranscriptLine(t, path, makeToolResultLine()) // tool_result = 1 event
+
+	var mu sync.Mutex
+	var got []string
+	h := newCaptureHandler()
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "turn-1" })
+	tailer.WithActivity(func(id string) {
+		mu.Lock()
+		got = append(got, id)
+		mu.Unlock()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	waitForRecords(t, h, 3, 2*time.Second) // 2 lines -> 3 agent_stream events
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("OnActivity fired %d times, want 2 (once per line, not per content block): %v", len(got), got)
+	}
+	for _, id := range got {
+		if id != "turn-1" {
+			t.Errorf("OnActivity got turn id %q, want turn-1", id)
+		}
+	}
+}
+
+// TestTailer_NoActivityWhenNoInFlightTurn verifies the OnActivity hook is not
+// fired for lines processed while no turn is in flight (turnID == "").
+func TestTailer_NoActivityWhenNoInFlightTurn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	writeTranscriptLine(t, path, makeToolUseLine())
+
+	var mu sync.Mutex
+	var fired int
+	h := newCaptureHandler()
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "" })
+	tailer.WithActivity(func(string) {
+		mu.Lock()
+		fired++
+		mu.Unlock()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	waitForRecords(t, h, 2, 2*time.Second)
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	if fired != 0 {
+		t.Fatalf("OnActivity fired %d times with no in-flight turn, want 0", fired)
+	}
+}
+
 // TestTailer_PartialLineSizeCap verifies that a partial line that exceeds
 // maxPartialBytes is flushed as a raw event and partial is reset, preventing
 // unbounded memory growth from a never-newline-terminated chunk.

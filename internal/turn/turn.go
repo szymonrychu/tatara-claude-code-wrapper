@@ -16,23 +16,25 @@ const (
 
 // Record is one user turn and its eventual result.
 type Record struct {
-	ID          string          `json:"turnId"`
-	State       State           `json:"state"`
-	Text        string          `json:"-"`
-	CallbackURL string          `json:"-"`
-	FinalText   string          `json:"finalText,omitempty"`
-	ResultJSON  json.RawMessage `json:"resultJson,omitempty"`
-	Usage       json.RawMessage `json:"usage,omitempty"`
-	StopReason  string          `json:"stopReason,omitempty"`
-	Error       string          `json:"error,omitempty"`
-	StartedAt   time.Time       `json:"startedAt"`
-	CompletedAt *time.Time      `json:"completedAt,omitempty"`
+	ID             string          `json:"turnId"`
+	State          State           `json:"state"`
+	Text           string          `json:"-"`
+	CallbackURL    string          `json:"-"`
+	FinalText      string          `json:"finalText,omitempty"`
+	ResultJSON     json.RawMessage `json:"resultJson,omitempty"`
+	Usage          json.RawMessage `json:"usage,omitempty"`
+	StopReason     string          `json:"stopReason,omitempty"`
+	Error          string          `json:"error,omitempty"`
+	StartedAt      time.Time       `json:"startedAt"`
+	LastActivityAt time.Time       `json:"lastActivityAt"`
+	CompletedAt    *time.Time      `json:"completedAt,omitempty"`
 }
 
 // Summary is the compact form returned by List.
 type Summary struct {
-	ID          string     `json:"turnId"`
-	State       State      `json:"state"`
-	StartedAt   time.Time  `json:"startedAt"`
-	CompletedAt *time.Time `json:"completedAt,omitempty"`
+	ID             string     `json:"turnId"`
+	State          State      `json:"state"`
+	StartedAt      time.Time  `json:"startedAt"`
+	LastActivityAt time.Time  `json:"lastActivityAt"`
+	CompletedAt    *time.Time `json:"completedAt,omitempty"`
 }
