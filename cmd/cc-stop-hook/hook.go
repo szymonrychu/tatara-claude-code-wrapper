@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/transcript"
 )
 
 // hookPayload mirrors the real Stop-hook payload (Task-1 spike, v2.1.162).
@@ -28,14 +29,14 @@ func buildResult(payload []byte, resultJSONPath string) (session.HookResult, err
 	}
 	res := session.HookResult{SessionID: hp.SessionID, FinalText: hp.LastAssistantMessage, TranscriptPath: hp.TranscriptPath}
 	if hp.TranscriptPath != "" {
-		if text, usage, stop, err := lastAssistantText(hp.TranscriptPath); err == nil {
+		if text, usage, stop, err := transcript.LastAssistant(hp.TranscriptPath); err == nil {
 			res.Usage = usage
 			res.StopReason = stop
 			if res.FinalText == "" {
 				res.FinalText = text
 			}
 		}
-		if tokens, err := turnTokens(hp.TranscriptPath); err == nil {
+		if tokens, err := transcript.SumTurnTokens(hp.TranscriptPath); err == nil {
 			res.TurnTokens = tokens
 		}
 	}

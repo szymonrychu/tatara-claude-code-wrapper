@@ -1,4 +1,4 @@
-package main
+package transcript
 
 import (
 	"bufio"
@@ -6,9 +6,67 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-
-	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
 )
+
+// TurnTokens is the per-model token total for one turn, summed from the
+// persisted transcript. The stop hook computes it at completion; the crash
+// recovery path computes it when synthesizing a completion from the restored
+// transcript. Lives here (not in session) so transcript parsing stays free of
+// a session dependency; session.TurnTokens aliases this type.
+type TurnTokens struct {
+	Model         string `json:"model"`
+	Input         int64  `json:"input"`
+	Output        int64  `json:"output"`
+	CacheRead     int64  `json:"cacheRead"`
+	CacheCreation int64  `json:"cacheCreation"`
+}
+
+// roleLine is the content-agnostic view of a transcript line used by LastMessage.
+// The top-level "type" is the conversation role ("user"/"assistant") for message
+// lines; content is deliberately not decoded because genuine user prompts carry a
+// string content while assistant/tool lines carry an array, and we only need the
+// role and (for assistant lines) the stop_reason.
+type roleLine struct {
+	Type    string `json:"type"`
+	Message *struct {
+		StopReason string `json:"stop_reason"`
+	} `json:"message"`
+}
+
+// LastMessage returns the role and stop_reason of the last conversation message
+// in the JSONL transcript at path. Non-message lines (system, summary) are
+// skipped so the result reflects the last actual message. role is "" when the
+// transcript has no message lines. This is a one-shot synchronous read, distinct
+// from the streaming Tailer, used at crash-resume time before any hook lands.
+func LastMessage(path string) (role, stopReason string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", fmt.Errorf("open transcript: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1024*1024), maxPartialBytes)
+	for sc.Scan() {
+		var rl roleLine
+		if err := json.Unmarshal(sc.Bytes(), &rl); err != nil {
+			continue
+		}
+		if rl.Type != "user" && rl.Type != "assistant" {
+			continue
+		}
+		role = rl.Type
+		if rl.Message != nil {
+			stopReason = rl.Message.StopReason
+		} else {
+			stopReason = ""
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", "", fmt.Errorf("scan transcript: %w", err)
+	}
+	return role, stopReason, nil
+}
 
 type assistantLine struct {
 	Type    string `json:"type"`
@@ -22,9 +80,9 @@ type assistantLine struct {
 	} `json:"message"`
 }
 
-// lastAssistantText returns the concatenated text blocks of the final
-// assistant line in a JSONL transcript, plus its usage object and stop_reason.
-func lastAssistantText(path string) (string, json.RawMessage, string, error) {
+// LastAssistant returns the concatenated text blocks of the final assistant
+// line in a JSONL transcript, plus its usage object and stop_reason.
+func LastAssistant(path string) (string, json.RawMessage, string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", nil, "", fmt.Errorf("open transcript: %w", err)
@@ -35,7 +93,7 @@ func lastAssistantText(path string) (string, json.RawMessage, string, error) {
 	var lastUsage json.RawMessage
 	var lastStop string
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1024*1024), 16*1024*1024)
+	sc.Buffer(make([]byte, 1024*1024), maxPartialBytes)
 	for sc.Scan() {
 		line := sc.Bytes()
 		var al assistantLine
@@ -77,23 +135,23 @@ type turnLine struct {
 	} `json:"message"`
 }
 
-// turnTokens sums token usage across every assistant message of the LAST turn
+// SumTurnTokens sums token usage across every assistant message of the LAST turn
 // in the transcript, grouped by model. The transcript accumulates across all
 // turns of a session, so the accumulator resets at each typed user prompt;
 // only the final turn's assistant lines survive into the result. Returning the
 // summed view (not the single last-message usage) is what makes the token
 // metric correct for multi-step agentic turns.
-func turnTokens(path string) ([]session.TurnTokens, error) {
+func SumTurnTokens(path string) ([]TurnTokens, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open transcript: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
-	byModel := map[string]*session.TurnTokens{}
+	byModel := map[string]*TurnTokens{}
 	var order []string
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1024*1024), 16*1024*1024)
+	sc.Buffer(make([]byte, 1024*1024), maxPartialBytes)
 	for sc.Scan() {
 		var tl turnLine
 		if err := json.Unmarshal(sc.Bytes(), &tl); err != nil {
@@ -101,7 +159,7 @@ func turnTokens(path string) ([]session.TurnTokens, error) {
 		}
 		if tl.Type == "user" && isJSONString(tl.Message.Content) {
 			// New turn boundary: drop everything accumulated for prior turns.
-			byModel = map[string]*session.TurnTokens{}
+			byModel = map[string]*TurnTokens{}
 			order = order[:0]
 			continue
 		}
@@ -110,7 +168,7 @@ func turnTokens(path string) ([]session.TurnTokens, error) {
 		}
 		t := byModel[tl.Message.Model]
 		if t == nil {
-			t = &session.TurnTokens{Model: tl.Message.Model}
+			t = &TurnTokens{Model: tl.Message.Model}
 			byModel[tl.Message.Model] = t
 			order = append(order, tl.Message.Model)
 		}
@@ -122,7 +180,7 @@ func turnTokens(path string) ([]session.TurnTokens, error) {
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("scan transcript: %w", err)
 	}
-	out := make([]session.TurnTokens, 0, len(order))
+	out := make([]TurnTokens, 0, len(order))
 	for _, m := range order {
 		out = append(out, *byModel[m])
 	}

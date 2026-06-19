@@ -63,14 +63,10 @@ type HookResult struct {
 	TurnTokens []TurnTokens `json:"turnTokens,omitempty"`
 }
 
-// TurnTokens is the per-model token total for one turn.
-type TurnTokens struct {
-	Model         string `json:"model"`
-	Input         int64  `json:"input"`
-	Output        int64  `json:"output"`
-	CacheRead     int64  `json:"cacheRead"`
-	CacheCreation int64  `json:"cacheCreation"`
-}
+// TurnTokens is the per-model token total for one turn. Aliased to the
+// transcript package, which owns the JSONL parsing that produces it (both the
+// stop hook and the crash-recovery completion path build it from the transcript).
+type TurnTokens = transcript.TurnTokens
 
 type State string
 
@@ -255,6 +251,15 @@ func (mgr *Manager) InjectProcForTest(proc ClaudeProcess) {
 	mgr.wg.Add(2)
 	go mgr.readPTY(proc)
 	go mgr.watch(proc)
+}
+
+// SetTranscriptPathForTest sets the persisted transcript path the recovery path
+// reads at resume time. Test-only: in production this is set by a prior turn's
+// Stop hook (the session JSONL accumulates across turns).
+func (mgr *Manager) SetTranscriptPathForTest(path string) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	mgr.transcriptPath = path
 }
 
 // RingContainsForTest reports whether the ring buffer currently holds needle.
@@ -527,15 +532,26 @@ func (mgr *Manager) shouldResume() bool {
 	return mgr.current != "" || mgr.turnsCompleted > 0 || mgr.transcriptPath != ""
 }
 
-// resumeTurn nudges the restored --continue session to continue the in-flight
-// turn. It does NOT re-paste the original prompt: --continue already restored
-// the full conversation including the user prompt, so re-pasting would
-// double-submit and cause duplicate work (finding 1). Instead we send a plain
-// submit keystroke (an empty "continue" nudge) so claude picks up where it
-// left off. The same turn id is kept so the eventual Stop hook still correlates.
-// A fresh timer replaces the stale one that was stopped by watch() before
-// relaunch, giving the resumed turn a full uncontended TurnTimeout budget
-// (finding 2). No-op if the turn was resolved during relaunch.
+// resumeTurn restores the in-flight turn after a crash+relaunch. --continue has
+// already restored the full conversation to disk, so resumeTurn first reads the
+// last message of the restored transcript to decide what the crash interrupted:
+//
+//   - Turn still in flight (last message is the user prompt, a tool_result, or
+//     an assistant tool_use awaiting a tool) -> nudge: write a plain submit
+//     keystroke so claude picks up where it left off. The original prompt is NOT
+//     re-pasted (--continue already restored it; re-pasting would double-submit).
+//     A fresh timer replaces the stale one watch() stopped before relaunch, and
+//     the same turn id is kept so the eventual Stop hook still correlates.
+//   - Turn already finished before the crash (last message is a terminal
+//     assistant answer, Stop hook never landed) -> complete from transcript: do
+//     NOT submit. A bare submit here injects an empty user turn and triggers
+//     duplicate work (hazard 1); leaving the turn unresolved wedges it Busy until
+//     TurnTimeout (hazard 2). Instead synthesize the result from the restored
+//     transcript so the operator gets the real output and the turn resolves now.
+//
+// Any transcript read error or ambiguous shape falls through to the nudge so
+// resume is never worse than the pre-transcript behavior. No-op if the turn was
+// resolved during relaunch.
 func (mgr *Manager) resumeTurn(id string) {
 	mgr.mu.Lock()
 	if mgr.current != id || mgr.state != Ready {
@@ -553,12 +569,30 @@ func (mgr *Manager) resumeTurn(id string) {
 	w := mgr.w
 	seq := mgr.cfg.SubmitSeq
 	started := mgr.currentStarted
+	path := mgr.transcriptPath
 	mgr.mu.Unlock()
 
-	// Send only the submit keystroke - the prompt is already in the restored
-	// conversation via --continue (finding 1).
+	// Decide nudge vs complete-from-transcript by reading the restored transcript.
+	// tool_use is a mid-turn stop_reason (claude paused to run a tool), so it stays
+	// in-flight and falls through to the nudge; only a terminal assistant answer
+	// means the turn finished before the crash.
+	if path != "" {
+		role, stop, err := transcript.LastMessage(path)
+		if err == nil && role == "assistant" && stop != "" && stop != "tool_use" {
+			if finalText, usage, sr, rerr := transcript.LastAssistant(path); rerr == nil {
+				mgr.completeFromTranscript(id, started, path, finalText, usage, sr)
+				return
+			} else {
+				mgr.log.Warn("resume: turn looked complete but transcript read failed; nudging",
+					"action", "turn_resume", "turn_id", id, "err", rerr)
+			}
+		}
+	}
+
+	// In-flight turn: send only the submit keystroke - the prompt is already in the
+	// restored conversation via --continue (finding 1).
 	if _, err := w.Write([]byte(seq.Submit)); err != nil {
-		mgr.m.TurnResumes.WithLabelValues("write_fail").Inc()
+		mgr.m.TurnResumes.WithLabelValues("write_fail", "nudge").Inc()
 		mgr.failTurn(id, fmt.Sprintf("resume write submit: %v", err))
 		return
 	}
@@ -580,9 +614,62 @@ func (mgr *Manager) resumeTurn(id string) {
 	mgr.state = Busy
 	now := mgr.now()
 	mgr.mu.Unlock()
-	mgr.m.TurnResumes.WithLabelValues("ok").Inc()
+	mgr.m.TurnResumes.WithLabelValues("ok", "nudge").Inc()
 	mgr.log.Info("resumed in-flight turn after relaunch", "action", "turn_resume", "turn_id", id,
+		"resume_mode", "nudge", "duration_ms", now.Sub(started).Milliseconds())
+}
+
+// completeFromTranscript resolves an in-flight turn whose output claude finished
+// before the crash, using the restored transcript instead of a Stop hook (which
+// never landed). It mirrors Complete's finalize path - store.Complete, success
+// metrics, token metering, fireDone - so the operator gets the real result and
+// no empty nudge triggers duplicate work (hazard 1); clearing the turn also stops
+// it sitting Busy until TurnTimeout (hazard 2). finalText/usage/stopReason are the
+// already-read last-assistant fields; per-turn token totals are summed here.
+// No-op if the turn was resolved concurrently during relaunch.
+func (mgr *Manager) completeFromTranscript(id string, started time.Time, path, finalText string, usage json.RawMessage, stopReason string) {
+	var tokens []TurnTokens
+	if tt, err := transcript.SumTurnTokens(path); err == nil {
+		tokens = tt
+	} else {
+		mgr.log.Warn("resume: token sum failed; completing without token metrics",
+			"action", "turn_complete", "turn_id", id, "err", err)
+	}
+
+	mgr.mu.Lock()
+	if mgr.current != id {
+		mgr.mu.Unlock()
+		return
+	}
+	if mgr.timer != nil {
+		mgr.timer.Stop()
+	}
+	now := mgr.now()
+	if err := mgr.store.Complete(id, finalText, nil, usage, stopReason, now); err != nil {
+		// Record not found means a correlation bug; do not bump success metrics or
+		// fire a phantom completion (mirrors Complete, finding 6).
+		mgr.mu.Unlock()
+		mgr.log.Error("store.Complete returned error in completeFromTranscript; skipping metrics and callback",
+			"action", "turn_complete", "turn_id", id, "err", err)
+		return
+	}
+	mgr.clearCurrentLocked(Ready)
+	mgr.turnsSucceeded++
+	mgr.restarts = 0          // a completed turn proves the session healthy
+	mgr.currentSessionID = "" // clear for next turn
+	mgr.m.TurnsTotal.WithLabelValues("complete").Inc()
+	mgr.m.TurnDuration.Observe(now.Sub(started).Seconds())
+	rec, _ := mgr.store.Get(id)
+	mgr.mu.Unlock()
+
+	// Cost (result.json) is owned by the Stop hook and not read on this path; only
+	// token totals from the transcript are metered.
+	mgr.meterTokens(HookResult{Usage: usage, TurnTokens: tokens})
+	mgr.m.TurnResumes.WithLabelValues("ok", "complete_from_transcript").Inc()
+	mgr.log.Info("resumed turn completed from transcript", "action", "turn_complete", "turn_id", id,
+		"resume_mode", "complete_from_transcript", "stop_reason", stopReason,
 		"duration_ms", now.Sub(started).Milliseconds())
+	mgr.fireDone(rec)
 }
 
 // failTurn fails the in-flight turn immediately (used when claude died and the

@@ -3,6 +3,8 @@ package session_test
 import (
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +17,32 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
 )
+
+// resumeModeCount reads ccw_turn_resumes_total for a given (result, resume_mode).
+func resumeModeCount(t *testing.T, reg *prometheus.Registry, result, mode string) float64 {
+	t.Helper()
+	mfs, _ := reg.Gather()
+	for _, mf := range mfs {
+		if mf.GetName() != "ccw_turn_resumes_total" {
+			continue
+		}
+		for _, mm := range mf.GetMetric() {
+			var gotResult, gotMode string
+			for _, lp := range mm.GetLabel() {
+				switch lp.GetName() {
+				case "result":
+					gotResult = lp.GetValue()
+				case "resume_mode":
+					gotMode = lp.GetValue()
+				}
+			}
+			if gotResult == result && gotMode == mode {
+				return mm.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
 
 // fakeProc simulates a claude process for recovery tests.
 // Close deadCh to make Wait() return (simulating process death).
@@ -399,4 +427,118 @@ func TestWatch_ShutdownDeath_NoRelaunch(t *testing.T) {
 
 	snap := mgr.Snapshot()
 	require.Equal(t, session.Dead, snap.State)
+}
+
+// newResumeMgr builds a Manager with explicit registry/store wired so the test
+// can assert metrics and turn state after a crash+relaunch resume.
+func newResumeMgr(t *testing.T, reg *prometheus.Registry, st *spawnTracker) (*session.Manager, *turn.Store) {
+	t.Helper()
+	store := turn.NewStore()
+	m := session.New(
+		session.Config{
+			TurnTimeout: 10 * time.Second,
+			BootTimeout: 30 * time.Millisecond,
+			SubmitDelay: 0,
+			SubmitSeq:   session.DefaultSubmitSeq,
+			MaxRestarts: 3,
+		},
+		store,
+		metrics.New(reg),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return "turn-1" },
+	)
+	m.SetSpawnForTest(st.spawn)
+	return m, store
+}
+
+// TestResumeTurn_CompletesFromTranscript_NoNudge: claude finished the turn before
+// the crash (transcript ends with a terminal assistant answer). resumeTurn must
+// NOT send the bare-CR nudge (which would inject an empty user turn and trigger
+// duplicate work); instead it resolves the turn from the transcript.
+func TestResumeTurn_CompletesFromTranscript_NoNudge(t *testing.T) {
+	dir := t.TempDir()
+	tp := filepath.Join(dir, "session.jsonl")
+	lines := `{"type":"user","message":{"role":"user","content":"do the thing"}}
+{"type":"assistant","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"all done"}],"usage":{"input_tokens":10,"output_tokens":3},"stop_reason":"end_turn"}}
+`
+	require.NoError(t, os.WriteFile(tp, []byte(lines), 0o644))
+
+	reg := prometheus.NewRegistry()
+	first := newFakeProc()
+	second := newFakeProc()
+	third := newFakeProc()
+	st := newSpawnTracker(second, third)
+
+	mgr, store := newResumeMgr(t, reg, st)
+	done := make(chan *turn.Record, 1)
+	mgr.OnTurnDone = func(r *turn.Record) { done <- r }
+	mgr.InjectProcForTest(first)
+
+	_, err := mgr.Submit("do the thing", "")
+	require.NoError(t, err)
+	// A prior turn's hook would have set this in production; the session JSONL
+	// accumulates across turns and now contains this turn's completed answer.
+	mgr.SetTranscriptPathForTest(tp)
+
+	first.kill() // crash -> watch -> relaunch -> resumeTurn
+
+	select {
+	case r := <-done:
+		require.Equal(t, turn.Complete, r.State, "turn must be completed from transcript")
+		require.Equal(t, "all done", r.FinalText)
+		require.Equal(t, "end_turn", r.StopReason)
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnTurnDone not fired; turn never completed from transcript")
+	}
+
+	// The relaunched proc must NOT receive a submit keystroke: no empty nudge.
+	assert.Empty(t, second.bytes(), "completed-from-transcript resume must not nudge the relaunched proc")
+
+	rec, ok := store.Get("turn-1")
+	require.True(t, ok)
+	require.Equal(t, turn.Complete, rec.State)
+
+	require.Equal(t, float64(1), resumeModeCount(t, reg, "ok", "complete_from_transcript"),
+		"TurnResumes{ok,complete_from_transcript} must be 1")
+	require.Equal(t, float64(0), resumeModeCount(t, reg, "ok", "nudge"),
+		"no nudge resume should be recorded")
+}
+
+// TestResumeTurn_NudgesWhenTranscriptPending: the transcript ends with the
+// restored user prompt (turn genuinely in flight). resumeTurn must fall back to
+// today's behavior: send the bare-CR nudge and keep the turn running.
+func TestResumeTurn_NudgesWhenTranscriptPending(t *testing.T) {
+	dir := t.TempDir()
+	tp := filepath.Join(dir, "session.jsonl")
+	require.NoError(t, os.WriteFile(tp, []byte(
+		`{"type":"user","message":{"role":"user","content":"keep going"}}`+"\n"), 0o644))
+
+	reg := prometheus.NewRegistry()
+	first := newFakeProc()
+	second := newFakeProc()
+	third := newFakeProc()
+	st := newSpawnTracker(second, third)
+
+	mgr, store := newResumeMgr(t, reg, st)
+	mgr.InjectProcForTest(first)
+
+	_, err := mgr.Submit("keep going", "")
+	require.NoError(t, err)
+	mgr.SetTranscriptPathForTest(tp)
+
+	first.kill()
+
+	require.Eventually(t, func() bool { return len(second.bytes()) > 0 },
+		3*time.Second, 10*time.Millisecond, "pending-transcript resume must nudge the relaunched proc")
+	assert.Contains(t, string(second.bytes()), session.DefaultSubmitSeq.Submit)
+
+	rec, ok := store.Get("turn-1")
+	require.True(t, ok)
+	require.Equal(t, turn.Running, rec.State, "pending turn must stay running after nudge")
+
+	require.Equal(t, float64(1), resumeModeCount(t, reg, "ok", "nudge"),
+		"TurnResumes{ok,nudge} must be 1")
+	require.Equal(t, float64(0), resumeModeCount(t, reg, "ok", "complete_from_transcript"),
+		"no completion resume should be recorded")
 }
