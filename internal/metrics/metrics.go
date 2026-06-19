@@ -31,7 +31,7 @@ type Metrics struct {
 	AuthTotal *prometheus.CounterVec // label: result=ok|rejected
 
 	// Turn resume counter (rule 13: distinct fallible business action).
-	TurnResumes *prometheus.CounterVec // label: result=ok|write_fail
+	TurnResumes *prometheus.CounterVec // labels: result=ok|write_fail, resume_mode=nudge|complete_from_transcript
 
 	// Bootstrap render counter (rule 13: per-step observability).
 	BootstrapRenderTotal *prometheus.CounterVec // label: result=ok|fail
@@ -89,7 +89,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		AuthTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_auth_total", Help: "Auth outcomes by result (ok|rejected)."}, []string{"result"}),
 		TurnResumes: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ccw_turn_resumes_total", Help: "Turn resume attempts by result (ok|write_fail)."}, []string{"result"}),
+			Name: "ccw_turn_resumes_total", Help: "Turn resume attempts by result (ok|write_fail) and mode (nudge|complete_from_transcript)."}, []string{"result", "resume_mode"}),
 		BootstrapRenderTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_bootstrap_render_total", Help: "Bootstrap config-render steps by result (ok|fail)."}, []string{"result"}),
 		TurnTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
