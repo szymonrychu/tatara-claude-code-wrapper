@@ -32,6 +32,25 @@ decay in what already exists. Same discovery discipline, narrower lens.
   stable Go; JSON slog + INFO business logging + /metrics.
 - Communication only via `tatara` MCP tools.
 
+## Orchestration (run at maximum effort)
+
+This is a multi-repo health survey - run it at **maximum effort** and
+orchestrate, do not work single-threaded:
+
+- The pod's `EFFORT` is already set high; sustain deep multi-step reasoning and
+  reproduce failures before deciding. Spend the thinking budget on the survey.
+- **Decompose** the survey into one independent unit of work per repository in
+  the Project (the repos under `/workspace/*/` plus the cross-repo graph view).
+- **Dispatch one parallel subagent per repo** to probe that repo's five health
+  dimensions (CI failures via `mise run test`/`lint`, coverage gaps, code to
+  simplify, missing pipeline steps, other tech-debt) and its `code_*` graph
+  signal. Launch them in a single batch so they run concurrently.
+- Use a **Workflow** to fan the per-repo probes out and then **synthesize** their
+  findings: prefer a systemic health issue recurring across >=2 repos or a
+  platform-wide pipeline gap over a single-repo decay, then pick the ONE
+  highest-leverage, well-evidenced finding.
+- Only after synthesis do you compose the proposal below.
+
 The `tatara` tools auto-scope to your current task and project from the pod
 environment. Do NOT try to pass an environment variable as an argument
 (you cannot expand it) - omit the `task`/`project` args and the tool fills
