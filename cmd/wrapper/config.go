@@ -45,6 +45,15 @@ type config struct {
 	SkillsSrcDirs       string // colon-separated
 	AllowedToolsPath    string
 	Repos               []bootstrap.RepoSpec
+
+	// Lifecycle hook commands (set by the operator via HOOK_* env vars). Empty
+	// means the hook is disabled.
+	HookPreClone             string
+	HookPostClone            string
+	HookConversationStart    string
+	HookConversationRestart  string
+	HookAgentTurnFinished    string
+	HookConversationFinished string
 }
 
 func loadConfig(args []string) (config, error) {
@@ -98,6 +107,13 @@ func loadConfig(args []string) (config, error) {
 		GrafanaMCPURL:       os.Getenv("TATARA_GRAFANA_MCP_URL"),
 		SkillsSrcDirs:       envOr("SKILLS_SRC_DIRS", "/templates/skills:/etc/wrapper/skills"),
 		AllowedToolsPath:    envOr("ALLOWED_TOOLS_PATH", "/etc/wrapper/allowed-tools.txt"),
+
+		HookPreClone:             envOr("HOOK_PRE_CLONE", ""),
+		HookPostClone:            envOr("HOOK_POST_CLONE", ""),
+		HookConversationStart:    envOr("HOOK_CONVERSATION_START", ""),
+		HookConversationRestart:  envOr("HOOK_CONVERSATION_RESTART", ""),
+		HookAgentTurnFinished:    envOr("HOOK_AGENT_TURN_FINISHED", ""),
+		HookConversationFinished: envOr("HOOK_CONVERSATION_FINISHED", ""),
 	}
 	if raw := os.Getenv("TATARA_REPOS"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.Repos); err != nil {

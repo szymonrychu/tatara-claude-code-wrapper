@@ -215,8 +215,17 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		GitUserEmail:    cfg.GitUserEmail,
 		TaskBranch:      cfg.TaskBranch,
 		Repos:           cfg.Repos,
-		Log:             log,
-		M:               m,
+
+		HookPreClone:             cfg.HookPreClone,
+		HookPostClone:            cfg.HookPostClone,
+		HookConversationStart:    cfg.HookConversationStart,
+		HookConversationRestart:  cfg.HookConversationRestart,
+		HookAgentTurnFinished:    cfg.HookAgentTurnFinished,
+		HookConversationFinished: cfg.HookConversationFinished,
+		HookRun:                  bootstrap.DefaultHookRunner,
+
+		Log: log,
+		M:   m,
 	}
 }
 
