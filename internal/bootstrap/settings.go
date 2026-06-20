@@ -22,16 +22,20 @@ func writeSettings(p Params, claudeHome string) error {
 		},
 		"enableAllProjectMcpServers": p.EnableAllMCP,
 	}
-	if p.PermissionMode != "" || len(p.AllowedTools) > 0 {
-		perms := map[string]any{}
-		if p.PermissionMode != "" {
-			perms["defaultMode"] = p.PermissionMode
-		}
-		if len(p.AllowedTools) > 0 {
-			perms["allow"] = p.AllowedTools
-		}
-		settings["permissions"] = perms
+	// Always deny Claude's built-in interactive tools. Agent pods run headless
+	// with no human at the terminal, so a picker can only stall the turn; the
+	// issue thread is the real human channel. Deny wins even under
+	// bypassPermissions, so these can never fire.
+	perms := map[string]any{
+		"deny": []string{"AskUserQuestion", "ExitPlanMode", "EnterPlanMode"},
 	}
+	if p.PermissionMode != "" {
+		perms["defaultMode"] = p.PermissionMode
+	}
+	if len(p.AllowedTools) > 0 {
+		perms["allow"] = p.AllowedTools
+	}
+	settings["permissions"] = perms
 	out, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal settings: %w", err)

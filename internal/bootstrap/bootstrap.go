@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
@@ -214,11 +215,12 @@ func Render(p Params, git GitRunner) error {
 		}
 		return err
 	}
-	if err := writeIfSet(filepath.Join(claudeHome, "CLAUDE.md"), p.GlobalClaudeMd); err != nil {
+	globalClaudeMd := strings.TrimLeft(p.GlobalClaudeMd+headlessDirective, "\n")
+	if err := os.WriteFile(filepath.Join(claudeHome, "CLAUDE.md"), []byte(globalClaudeMd), 0o644); err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
 		}
-		return err
+		return fmt.Errorf("write global CLAUDE.md: %w", err)
 	}
 	if err := mergeMCP(p); err != nil {
 		if p.M != nil {
@@ -254,6 +256,28 @@ func Render(p Params, git GitRunner) error {
 	}
 	return nil
 }
+
+// headlessDirective is appended to the agent's global CLAUDE.md on every
+// bootstrap. The agent runs in a pod with no human at the terminal, so it must
+// never wait on an interactive prompt; decisions go to the issue thread instead.
+const headlessDirective = `
+
+---
+
+## Headless agent: no interactive prompts
+
+You run headless in a pod. There is no human at the terminal. Claude's built-in
+interactive tools AskUserQuestion, ExitPlanMode and EnterPlanMode are disabled
+(denied) and error if called. Do not call them. Do not enter plan mode; there is
+no one to approve a plan. Do not wait on a dialog or picker.
+
+When you need a decision, a choice between options, or any clarification,
+surface it as a comment on the issue with the comment_on_issue MCP tool: lay out
+the options and your recommendation there and continue with your best judgement.
+If a decision blocks you from making any progress at all, call
+decline_implementation with the reason. The issue thread is your only channel to
+a human.
+`
 
 func writeIfSet(path, content string) error {
 	if content == "" {
