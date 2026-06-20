@@ -17,6 +17,7 @@ type config struct {
 	OIDCAudience        string
 	LogLevel            string
 	Model               string
+	Effort              string
 	PermissionMode      string
 	RepoURL             string
 	RepoBranch          string
@@ -70,6 +71,7 @@ func loadConfig(args []string) (config, error) {
 		OIDCAudience:        envOr("OIDC_AUDIENCE", "tatara-claude-code-wrapper"),
 		LogLevel:            envOr("LOG_LEVEL", "info"),
 		Model:               envOr("MODEL", ""),
+		Effort:              envOr("EFFORT", ""),
 		PermissionMode:      envOr("PERMISSION_MODE", "bypassPermissions"),
 		RepoURL:             envOr("REPO_URL", ""),
 		RepoBranch:          envOr("REPO_BRANCH", ""),
