@@ -37,6 +37,21 @@ type Params struct {
 	TaskBranch                      string // work branch the operator opens the PR from; checked out after clone
 	Repos                           []RepoSpec
 
+	// Lifecycle hook commands (operator-supplied via the Project CRD, delivered
+	// as HOOK_* env vars). Empty means the hook is disabled. preClone/postClone
+	// are fired by Render around each clone; the conversation/turn hooks are
+	// fired by the session/app layer. All run via HookRun, best-effort (RunHook).
+	HookPreClone             string
+	HookPostClone            string
+	HookConversationStart    string
+	HookConversationRestart  string
+	HookAgentTurnFinished    string
+	HookConversationFinished string
+	// HookRun executes a hook command; production wires DefaultHookRunner. Nil
+	// disables hook execution (RunHook no-ops), so Params built without it (the
+	// existing bootstrap tests) keep working unchanged.
+	HookRun HookRunner
+
 	// Optional: provide structured logging and metrics (rules 12+13).
 	// When nil, Render/CommitAndPush run silently without emitting log lines or metrics.
 	Log *slog.Logger
@@ -115,6 +130,7 @@ func Render(p Params, git GitRunner) error {
 				}
 				continue // non-primary parent-dir failure: skip
 			}
+			RunHook("preClone", p.HookPreClone, p.Workspace, []string{r.URL}, []string{"TATARA_HOOK_REPO_URL=" + r.URL}, p.HookRun, p.Log, p.M)
 			cloneStart := time.Now()
 			// Skip clone when the repo is already present (pod restart with persistent workspace).
 			if _, statErr := os.Stat(filepath.Join(dest, ".git")); os.IsNotExist(statErr) {
@@ -157,6 +173,7 @@ func Render(p Params, git GitRunner) error {
 				p.Log.Info("repo cloned", "action", action, "repo", r.Name, "branch", r.Branch,
 					"task_branch", p.TaskBranch, "duration_ms", time.Since(cloneStart).Milliseconds())
 			}
+			RunHook("postClone", p.HookPostClone, p.Workspace, []string{dest}, []string{"TATARA_HOOK_CLONE_DEST=" + dest}, p.HookRun, p.Log, p.M)
 		}
 	} else if p.RepoURL != "" {
 		if err := configureGit(p, git); err != nil {
@@ -174,6 +191,7 @@ func Render(p Params, git GitRunner) error {
 		if err := os.MkdirAll(filepath.Dir(repoDest), 0o755); err != nil {
 			return fmt.Errorf("mkdir parent for repo %s: %w", p.RepoURL, err)
 		}
+		RunHook("preClone", p.HookPreClone, p.Workspace, []string{p.RepoURL}, []string{"TATARA_HOOK_REPO_URL=" + p.RepoURL}, p.HookRun, p.Log, p.M)
 		cloneStart := time.Now()
 		if _, statErr := os.Stat(filepath.Join(repoDest, ".git")); os.IsNotExist(statErr) {
 			args := []string{"clone", "--depth", "1"}
@@ -208,6 +226,7 @@ func Render(p Params, git GitRunner) error {
 			p.Log.Info("repo cloned", "action", action, "repo", p.RepoURL, "branch", p.RepoBranch,
 				"task_branch", p.TaskBranch, "duration_ms", time.Since(cloneStart).Milliseconds())
 		}
+		RunHook("postClone", p.HookPostClone, p.Workspace, []string{repoDest}, []string{"TATARA_HOOK_CLONE_DEST=" + repoDest}, p.HookRun, p.Log, p.M)
 	}
 	renderConfigStart := time.Now()
 	if err := writeIfSet(filepath.Join(p.Workspace, "CLAUDE.md"), p.ProjectClaudeMd); err != nil {

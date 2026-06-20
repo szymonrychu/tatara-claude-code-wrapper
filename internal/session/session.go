@@ -97,6 +97,13 @@ type Manager struct {
 
 	OnTurnDone func(*turn.Record)
 
+	// OnRestart, when set, is invoked once after a crash-relaunch that resumed an
+	// existing conversation (--continue). It is NOT called for a fresh first-boot
+	// relaunch (nothing to resume). Invoked synchronously from the watch
+	// goroutine, so the callback must not block (the app wiring fires it in a
+	// goroutine).
+	OnRestart func()
+
 	spawn func(cfg Config, resume bool) (claudeProcess, error)
 
 	mu               sync.Mutex
@@ -515,7 +522,8 @@ func (mgr *Manager) watch(proc claudeProcess) {
 // rewires the PTY, restarts the reader+watcher, and waits for boot. The new
 // watch goroutine handles the next death (restarts persists across relaunches).
 func (mgr *Manager) relaunch() error {
-	proc, err := mgr.spawn(mgr.cfg, mgr.shouldResume())
+	resume := mgr.shouldResume()
+	proc, err := mgr.spawn(mgr.cfg, resume)
 	if err != nil {
 		return err
 	}
@@ -547,6 +555,11 @@ func (mgr *Manager) relaunch() error {
 	go mgr.readPTY(proc)
 	go mgr.watch(proc)
 	mgr.bootWait(proc) // flips Booting -> Ready
+	// Fire the conversationRestart hook only when an existing conversation was
+	// resumed (--continue); a fresh first-boot relaunch has nothing to restart.
+	if resume && mgr.OnRestart != nil {
+		mgr.OnRestart()
+	}
 	return nil
 }
 

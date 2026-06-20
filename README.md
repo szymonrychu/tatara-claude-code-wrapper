@@ -74,6 +74,23 @@ At boot the wrapper renders `~/.claude/CLAUDE.md`, `/workspace/CLAUDE.md`,
 installs skills, optionally clones a repo, and seeds `~/.claude.json` so a
 fresh HOME boots with no interactive dialogs.
 
+### Lifecycle hooks
+
+Operator-supplied shell commands (set on `Project.spec.agent.hooks`, delivered
+as `HOOK_*` env vars) run at fixed points in the agent lifecycle. Each runs via
+`sh -c <command>` in `/workspace` and is best-effort: a non-zero exit is logged
+(WARN) and counted (`ccw_lifecycle_hook_total{result,hook}`) but never aborts
+the run. An unset/empty `HOOK_*` is skipped.
+
+| env var | fires | context passed |
+| --- | --- | --- |
+| `HOOK_PRE_CLONE` | before each repo clone | repo URL as `$1` + `TATARA_HOOK_REPO_URL` |
+| `HOOK_POST_CLONE` | after each clone+checkout | clone dir as `$1` + `TATARA_HOOK_CLONE_DEST` |
+| `HOOK_CONVERSATION_START` | once after the session boots | `TATARA_TASK`, `TATARA_PROJECT` |
+| `HOOK_CONVERSATION_RESTART` | after a crash-relaunch that resumed (`--continue`) | `TATARA_TASK`, `TATARA_PROJECT` |
+| `HOOK_AGENT_TURN_FINISHED` | after a turn is committed, pushed, and the callback delivered | `TATARA_TURN_ID` (+ task/project) |
+| `HOOK_CONVERSATION_FINISHED` | once during shutdown (bounded to 5s) | `TATARA_TASK`, `TATARA_PROJECT` |
+
 ## Unattended boot
 
 A fresh HOME would otherwise hit several interactive dialogs. The wrapper

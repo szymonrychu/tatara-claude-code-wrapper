@@ -34,6 +34,9 @@ type app struct {
 	// callback) spawned by OnTurnDone so shutdown can drain them and never lose
 	// the agent's commits to a pod teardown mid-push.
 	turnWG sync.WaitGroup
+	// finishHook runs the conversationFinished lifecycle hook during shutdown,
+	// bounded so a slow hook cannot stall teardown. Nil is a safe no-op.
+	finishHook func(context.Context)
 }
 
 func newApp(ctx context.Context, cfg config) (*app, error) {
@@ -79,6 +82,10 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		sender:   sender,
 		pub:      &http.Server{Addr: cfg.HTTPAddr, ReadHeaderTimeout: 10 * time.Second},
 		internal: &http.Server{Addr: cfg.InternalAddr, ReadHeaderTimeout: 10 * time.Second},
+		finishHook: func(shutdownCtx context.Context) {
+			fireLifecycleHookBounded(shutdownCtx, cfg, m, log, "conversationFinished",
+				cfg.HookConversationFinished, 5*time.Second)
+		},
 	}
 
 	sess.OnTurnDone = func(rec *turn.Record) {
@@ -124,7 +131,19 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 				url = defaultCB
 			}
 			sender.Deliver(url, rec)
+
+			// agentTurnFinished runs last, after the turn's work is committed,
+			// pushed, and the operator callback delivered. Best-effort.
+			fireLifecycleHook(cfg, m, log, "agentTurnFinished", cfg.HookAgentTurnFinished,
+				[]string{"TATARA_TURN_ID=" + rec.ID})
 		}()
+	}
+
+	// conversationRestart fires after each crash-relaunch that resumed the
+	// conversation. Run in a goroutine so a slow hook cannot block the session's
+	// watch/relaunch path. Set before Start so a relaunch during boot is covered.
+	sess.OnRestart = func() {
+		go fireLifecycleHook(cfg, m, log, "conversationRestart", cfg.HookConversationRestart, nil)
 	}
 
 	sess.StartTailer(ctx)
@@ -132,6 +151,10 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	if err := sess.Start(ctx); err != nil {
 		return nil, err
 	}
+	// conversationStart fires once after the session boots successfully. Run
+	// synchronously here (before serving traffic), matching the best-effort
+	// boot-time semantics of InstallHooks.
+	fireLifecycleHook(cfg, m, log, "conversationStart", cfg.HookConversationStart, nil)
 
 	var verifier *auth.Verifier
 	if cfg.OIDCIssuer != "" {
@@ -183,6 +206,11 @@ func (a *app) shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		a.log.Warn("shutdown: turn finalisation goroutines did not drain in time", "err", ctx.Err())
 	}
+	// conversationFinished runs once the session is down and the turns have
+	// drained, bounded so a slow hook cannot stall teardown.
+	if a.finishHook != nil {
+		a.finishHook(ctx)
+	}
 	// Drain in-flight webhook deliveries within a bounded window so retries
 	// either complete or log a clean abort instead of being orphaned at exit.
 	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -190,6 +218,33 @@ func (a *app) shutdown(ctx context.Context) error {
 	cancel()
 	_ = a.internal.Shutdown(ctx)
 	return a.pub.Shutdown(ctx)
+}
+
+// fireLifecycleHook runs a conversation/turn lifecycle hook best-effort in the
+// workspace via the production hook runner. A no-op when command is empty.
+func fireLifecycleHook(cfg config, m *metrics.Metrics, log *slog.Logger, name, command string, extraEnv []string) {
+	bootstrap.RunHook(name, command, cfg.Workspace, nil, extraEnv, bootstrap.DefaultHookRunner, log, m)
+}
+
+// fireLifecycleHookBounded runs a lifecycle hook best-effort but never lets it
+// block teardown beyond timeout (or past ctx cancellation). A no-op when the
+// command is empty.
+func fireLifecycleHookBounded(ctx context.Context, cfg config, m *metrics.Metrics, log *slog.Logger, name, command string, timeout time.Duration) {
+	if command == "" {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		fireLifecycleHook(cfg, m, log, name, command, nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Warn("lifecycle hook did not finish before teardown deadline", "hook", name, "timeout", timeout)
+	case <-ctx.Done():
+		log.Warn("lifecycle hook aborted by shutdown context", "hook", name)
+	}
 }
 
 func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) bootstrap.Params {
@@ -215,8 +270,17 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		GitUserEmail:    cfg.GitUserEmail,
 		TaskBranch:      cfg.TaskBranch,
 		Repos:           cfg.Repos,
-		Log:             log,
-		M:               m,
+
+		HookPreClone:             cfg.HookPreClone,
+		HookPostClone:            cfg.HookPostClone,
+		HookConversationStart:    cfg.HookConversationStart,
+		HookConversationRestart:  cfg.HookConversationRestart,
+		HookAgentTurnFinished:    cfg.HookAgentTurnFinished,
+		HookConversationFinished: cfg.HookConversationFinished,
+		HookRun:                  bootstrap.DefaultHookRunner,
+
+		Log: log,
+		M:   m,
 	}
 }
 
