@@ -16,12 +16,24 @@ func writeSettings(p Params, claudeHome string) error {
 		Matcher string    `json:"matcher"`
 		Hooks   []hookCmd `json:"hooks"`
 	}
-	settings := map[string]any{
-		"hooks": map[string]any{
-			"Stop": []hookMatcher{{Matcher: "", Hooks: []hookCmd{{Type: "command", Command: p.HookCommand}}}},
-		},
-		"enableAllProjectMcpServers": p.EnableAllMCP,
+	settings := map[string]any{}
+	// Operator-provided extra settings go in FIRST (lowest priority): they fill
+	// in any claude-code knob the operator does not manage itself (e.g.
+	// maxParallelism), but must never clobber the hooks/effort/permissions the
+	// operator owns, so every operator-managed key below overwrites them.
+	if len(p.ExtraSettings) > 0 {
+		var extra map[string]any
+		if err := json.Unmarshal(p.ExtraSettings, &extra); err != nil {
+			return fmt.Errorf("parse extra settings: %w", err)
+		}
+		for k, v := range extra {
+			settings[k] = v
+		}
 	}
+	settings["hooks"] = map[string]any{
+		"Stop": []hookMatcher{{Matcher: "", Hooks: []hookCmd{{Type: "command", Command: p.HookCommand}}}},
+	}
+	settings["enableAllProjectMcpServers"] = p.EnableAllMCP
 	if p.Effort != "" {
 		settings["effortLevel"] = p.Effort
 	}
@@ -39,6 +51,16 @@ func writeSettings(p Params, claudeHome string) error {
 		perms["allow"] = p.AllowedTools
 	}
 	settings["permissions"] = perms
+	// Declarative plugin install (operator-managed): the interactive /plugin
+	// commands have no non-interactive flag, so plugins are enabled via
+	// settings.json instead. Operator-managed, so these win over any same-named
+	// keys an operator put in ExtraSettings.
+	if markets, enabled := pluginConfig(p.Plugins); len(enabled) > 0 {
+		if len(markets) > 0 {
+			settings["extraKnownMarketplaces"] = markets
+		}
+		settings["enabledPlugins"] = enabled
+	}
 	out, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal settings: %w", err)

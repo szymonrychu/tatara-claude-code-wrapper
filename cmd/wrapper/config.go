@@ -44,6 +44,8 @@ type config struct {
 	GrafanaMCPURL       string
 	SkillsSrcDirs       string // colon-separated
 	AllowedToolsPath    string
+	ExtraSettingsPath   string
+	PluginsPath         string
 	Repos               []bootstrap.RepoSpec
 }
 
@@ -98,6 +100,8 @@ func loadConfig(args []string) (config, error) {
 		GrafanaMCPURL:       os.Getenv("TATARA_GRAFANA_MCP_URL"),
 		SkillsSrcDirs:       envOr("SKILLS_SRC_DIRS", "/templates/skills:/etc/wrapper/skills"),
 		AllowedToolsPath:    envOr("ALLOWED_TOOLS_PATH", "/etc/wrapper/allowed-tools.txt"),
+		ExtraSettingsPath:   envOr("EXTRA_SETTINGS_PATH", "/etc/wrapper/settings-extra.json"),
+		PluginsPath:         envOr("PLUGINS_PATH", "/etc/wrapper/plugins.json"),
 	}
 	if raw := os.Getenv("TATARA_REPOS"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.Repos); err != nil {

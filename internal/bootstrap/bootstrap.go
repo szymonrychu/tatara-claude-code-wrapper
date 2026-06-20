@@ -37,6 +37,14 @@ type Params struct {
 	TaskBranch                      string // work branch the operator opens the PR from; checked out after clone
 	Repos                           []RepoSpec
 
+	// ExtraSettings is a raw JSON object the operator mounts (Project AgentSpec
+	// settings passthrough); merged into settings.json under the operator-managed
+	// keys. Empty when no extra settings are configured.
+	ExtraSettings []byte
+	// Plugins are claude-code plugins the operator mounts (plugins.json); rendered
+	// into settings.json enabledPlugins + extraKnownMarketplaces at bootstrap.
+	Plugins []PluginSpec
+
 	// Optional: provide structured logging and metrics (rules 12+13).
 	// When nil, Render/CommitAndPush run silently without emitting log lines or metrics.
 	Log *slog.Logger

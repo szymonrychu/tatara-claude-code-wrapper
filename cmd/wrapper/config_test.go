@@ -17,6 +17,22 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	require.Equal(t, 3, cfg.WebhookRetries)
 }
 
+func TestLoadConfig_CustomizationPathDefaults(t *testing.T) {
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, "/etc/wrapper/settings-extra.json", cfg.ExtraSettingsPath)
+	require.Equal(t, "/etc/wrapper/plugins.json", cfg.PluginsPath)
+}
+
+func TestLoadConfig_CustomizationPathOverride(t *testing.T) {
+	t.Setenv("EXTRA_SETTINGS_PATH", "/tmp/s.json")
+	t.Setenv("PLUGINS_PATH", "/tmp/p.json")
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, "/tmp/s.json", cfg.ExtraSettingsPath)
+	require.Equal(t, "/tmp/p.json", cfg.PluginsPath)
+}
+
 func TestLoadConfig_EnvOverride(t *testing.T) {
 	t.Setenv("HTTP_ADDR", ":9000")
 	t.Setenv("TURN_TIMEOUT_SECONDS", "42")

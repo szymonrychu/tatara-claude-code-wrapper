@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -204,6 +205,8 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		SkillsSrc:       strings.Split(cfg.SkillsSrcDirs, ":"),
 		HookCommand:     cfg.HookPath,
 		AllowedTools:    readLines(cfg.AllowedToolsPath),
+		ExtraSettings:   readBytesOrDefault(cfg.ExtraSettingsPath, nil),
+		Plugins:         readPlugins(cfg.PluginsPath, log),
 		EnableAllMCP:    true,
 		PermissionMode:  cfg.PermissionMode,
 		Effort:          cfg.Effort,
@@ -321,6 +324,24 @@ func readLines(p string) []string {
 		}
 	}
 	return out
+}
+
+// readPlugins parses the operator-mounted plugins.json (a JSON array of
+// {name, source}). Best-effort: a missing file yields no plugins, and a
+// malformed file is logged and ignored rather than aborting bootstrap.
+func readPlugins(p string, log *slog.Logger) []bootstrap.PluginSpec {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var ps []bootstrap.PluginSpec
+	if err := json.Unmarshal(b, &ps); err != nil {
+		if log != nil {
+			log.Warn("parse plugins file failed; ignoring", "path", p, "error", err)
+		}
+		return nil
+	}
+	return ps
 }
 
 func newTurnID() string { return "turn-" + strconv.FormatInt(time.Now().UnixNano(), 36) }

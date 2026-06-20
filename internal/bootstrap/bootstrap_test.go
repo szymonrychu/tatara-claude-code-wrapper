@@ -75,6 +75,54 @@ func TestRender_WritesClaudeMdSettingsSkillsAndMergesMCP(t *testing.T) {
 	require.Empty(t, gitCalls)
 }
 
+// TestRender_ConsumesOperatorMountedCustomization proves the full subtask-2 ->
+// subtask-3 path: the operator mounts project-claude.md, an mcp.d overlay
+// fragment, a skill dir, plus the new settings-extra.json and plugins.json, and
+// Render consumes ALL of them into the agent's workspace/home in one pass.
+func TestRender_ConsumesOperatorMountedCustomization(t *testing.T) {
+	home := t.TempDir()
+	ws := t.TempDir()
+	overlay := t.TempDir()   // operator mount: /etc/wrapper/mcp.d
+	skillsSrc := t.TempDir() // operator mount: /etc/wrapper/skills
+
+	require.NoError(t, os.MkdirAll(filepath.Join(skillsSrc, "deploy"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(skillsSrc, "deploy", "SKILL.md"), []byte("# /deploy"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(overlay, "0-github.json"),
+		[]byte(`{"mcpServers":{"github":{"type":"stdio","command":"/bin/gh"}}}`), 0o644))
+
+	p := bootstrap.Params{
+		HomeDir: home, Workspace: ws,
+		ProjectClaudeMd: "PROJECT PROMPT",
+		BaseMCP:         []byte(`{"mcpServers":{}}`),
+		MCPOverlayDir:   overlay,
+		SkillsSrc:       []string{skillsSrc},
+		HookCommand:     "/usr/local/bin/cc-stop-hook",
+		PermissionMode:  "bypassPermissions",
+		Effort:          "xhigh",
+		ExtraSettings:   []byte(`{"maxParallelism":3}`),
+		Plugins:         []bootstrap.PluginSpec{{Name: "fmt@acme", Source: "acme/plugins"}},
+	}
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { return nil }))
+
+	// systemPrompt -> workspace CLAUDE.md
+	b, _ := os.ReadFile(filepath.Join(ws, "CLAUDE.md"))
+	require.Equal(t, "PROJECT PROMPT", string(b))
+	// mcp overlay fragment merged
+	b, _ = os.ReadFile(filepath.Join(ws, ".mcp.json"))
+	require.Contains(t, string(b), "github")
+	// skill copied
+	b, _ = os.ReadFile(filepath.Join(ws, ".claude", "skills", "deploy", "SKILL.md"))
+	require.Equal(t, "# /deploy", string(b))
+	// settings carry extra passthrough, effort, and declarative plugins
+	b, _ = os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
+	var s map[string]any
+	require.NoError(t, json.Unmarshal(b, &s))
+	require.EqualValues(t, 3, s["maxParallelism"])
+	require.Equal(t, "xhigh", s["effortLevel"])
+	require.Contains(t, s["enabledPlugins"].(map[string]any), "fmt@acme")
+	require.Contains(t, s["extraKnownMarketplaces"].(map[string]any), "acme")
+}
+
 func TestRender_ClonesRepoWhenURLSet(t *testing.T) {
 	var gitCalls [][]string
 	p := bootstrap.Params{
