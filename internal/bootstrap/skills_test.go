@@ -114,6 +114,27 @@ func TestInstallSkills_LogsShadowedSkill(t *testing.T) {
 	}
 }
 
+func TestDiscoverySkillsCarryOrchestrationGuidance(t *testing.T) {
+	root := "../../templates/skills"
+	for _, name := range []string{"tatara-deep-research", "tatara-health-check"} {
+		b, err := os.ReadFile(filepath.Join(root, name, "SKILL.md"))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		s := string(b)
+		for _, want := range []string{
+			"## Orchestration",
+			"maximum effort",
+			"one parallel subagent per repo",
+			"Workflow",
+		} {
+			if !strings.Contains(s, want) {
+				t.Fatalf("%s: orchestration guidance missing %q", name, want)
+			}
+		}
+	}
+}
+
 func TestInstallSkills_CopiesDiscoverySkills(t *testing.T) {
 	for _, name := range []string{"tatara-deep-research", "tatara-research-followup"} {
 		name := name

@@ -22,6 +22,9 @@ func writeSettings(p Params, claudeHome string) error {
 		},
 		"enableAllProjectMcpServers": p.EnableAllMCP,
 	}
+	if p.Effort != "" {
+		settings["effortLevel"] = p.Effort
+	}
 	// Always deny Claude's built-in interactive tools. Agent pods run headless
 	// with no human at the terminal, so a picker can only stall the turn; the
 	// issue thread is the real human channel. Deny wins even under

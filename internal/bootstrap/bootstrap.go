@@ -29,6 +29,7 @@ type Params struct {
 	AllowedTools                    []string
 	EnableAllMCP                    bool
 	PermissionMode                  string
+	Effort                          string // claude reasoning-effort level for the agent session
 	AnthropicAPIKey                 string // used to seed customApiKeyResponses (last 20 chars)
 	RepoURL, RepoBranch             string
 	GitToken                        string // private-repo auth for clone + the agent's push (read from $GIT_TOKEN at runtime, never written to disk)

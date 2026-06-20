@@ -200,6 +200,28 @@ func TestClaudeArgs_ContinueOnResume(t *testing.T) {
 	}
 }
 
+func TestClaudeArgs_EffortFlag(t *testing.T) {
+	args := session.ConfigClaudeArgs(session.Config{Effort: "xhigh"}, false)
+	// --effort and its value must be adjacent, in that order.
+	idx := -1
+	for i, a := range args {
+		if a == "--effort" {
+			idx = i
+			break
+		}
+	}
+	require.GreaterOrEqual(t, idx, 0, "expected --effort in args")
+	require.Less(t, idx+1, len(args), "--effort missing its value")
+	require.Equal(t, "xhigh", args[idx+1], "--effort value must be the level")
+}
+
+func TestClaudeArgs_NoEffortWhenEmpty(t *testing.T) {
+	args := session.ConfigClaudeArgs(session.Config{}, false)
+	for _, a := range args {
+		require.NotEqual(t, "--effort", a, "empty Effort must NOT emit --effort")
+	}
+}
+
 // TestWatch_MidTurnDeath_RelaunchesAndResumes: kill claude mid-turn; expect
 // relaunch with resume=true and the turn re-submitted to the new proc.
 func TestWatch_MidTurnDeath_RelaunchesAndResumes(t *testing.T) {

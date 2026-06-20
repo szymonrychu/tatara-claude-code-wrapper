@@ -30,6 +30,29 @@ the bot identity.
   newest stable Go; JSON slog + INFO business logging + /metrics.
 - Communication only via `tatara` MCP tools.
 
+## Orchestration (run at maximum effort)
+
+This is a deep, cross-repo research turn - run it at **maximum effort** and
+orchestrate, do not work single-threaded:
+
+- The pod's `EFFORT` is already set high; sustain deep multi-step reasoning and
+  read widely before deciding. Spend the thinking budget on the survey.
+- **Decompose** the cross-repo survey into one independent unit of work per
+  repository in the Project (the repos under `/workspace/*/` plus the cross-repo
+  graph view).
+- **Dispatch one parallel subagent per repo** to gather that repo's state
+  (roadmap themes, fragile/load-bearing code via the `code_*` graph tools, open
+  issues/MRs, recurring debt). Launch them in a single batch so they run
+  concurrently; do not serialize what can fan out.
+- Use a **Workflow** to fan the per-repo investigations out and then **synthesize**
+  their findings into the single highest-leverage SYSTEMIC opportunity - a
+  pattern spanning >=2 repos, a platform-wide gap, or recurring debt - in
+  preference to a one-repo tweak.
+- Only after synthesis do you choose the propose-vs-comment action below. For a
+  genuinely systemic improvement you MAY open one `propose_issue` per affected
+  repo sharing a single `systemicId` you generate (bounded, <=6); the operator
+  correlates them and counts the group as one against the proposal cap.
+
 The `tatara` tools auto-scope to your current task and project from the pod
 environment. Do NOT try to pass an environment variable as an argument
 (you cannot expand it) - omit the `task`/`project` args and the tool fills

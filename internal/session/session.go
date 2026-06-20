@@ -39,6 +39,7 @@ type Config struct {
 	Workspace   string
 	Env         []string
 	Model       string
+	Effort      string
 	Repo        string // primary repository URL the pod is bound to ("" if none)
 	TurnTimeout time.Duration
 	BootTimeout time.Duration

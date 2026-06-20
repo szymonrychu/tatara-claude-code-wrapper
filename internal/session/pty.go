@@ -53,6 +53,9 @@ func (c Config) claudeArgs(resume bool) []string {
 	if c.Model != "" {
 		args = append(args, "--model", c.Model)
 	}
+	if c.Effort != "" {
+		args = append(args, "--effort", c.Effort)
+	}
 	if resume {
 		// Resume the most recent conversation in the workspace so a relaunched
 		// session keeps its context after a crash.

@@ -35,3 +35,16 @@ func TestLoadConfig_ParsesTataraRepos(t *testing.T) {
 	require.Equal(t, "https://h/b", cfg.Repos[1].URL)
 	require.Equal(t, "dev", cfg.Repos[1].Branch)
 }
+
+func TestLoadConfig_EffortDefaultsEmpty(t *testing.T) {
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, "", cfg.Effort, "EFFORT unset must yield empty (no --effort)")
+}
+
+func TestLoadConfig_EffortFromEnv(t *testing.T) {
+	t.Setenv("EFFORT", "xhigh")
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, "xhigh", cfg.Effort)
+}
