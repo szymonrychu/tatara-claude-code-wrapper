@@ -206,6 +206,7 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		AllowedTools:    readLines(cfg.AllowedToolsPath),
 		EnableAllMCP:    true,
 		PermissionMode:  cfg.PermissionMode,
+		Effort:          cfg.Effort,
 		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
 		RepoURL:         cfg.RepoURL,
 		RepoBranch:      cfg.RepoBranch,
