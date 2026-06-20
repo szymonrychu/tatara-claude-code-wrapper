@@ -108,17 +108,23 @@ func timeZero() time.Time { return time.Unix(0, 0) }
 var _ = errors.New // keep errors import if unused after edits
 
 // TestPostMessage_SSRFValidation verifies that postMessage rejects callbackUrl
-// values that would enable SSRF (finding 2): non-https schemes, loopback, and
-// link-local/metadata addresses must all return 400.
+// values that would enable SSRF (finding 2): non-http(s) schemes, loopback, and
+// link-local/metadata addresses must all return 400. http and https are both
+// allowed schemes (in-cluster callbacks are plaintext), so the IP-range guards
+// must fire regardless of scheme.
 func TestPostMessage_SSRFValidation(t *testing.T) {
 	cases := []struct {
 		name string
 		url  string
 	}{
-		{"http scheme", "http://operator.example.com/cb"},
+		{"file scheme", "file:///etc/passwd"},
+		{"gopher scheme", "gopher://operator.example.com/cb"},
 		{"loopback IPv4", "https://127.0.0.1/cb"},
 		{"loopback localhost", "https://localhost/cb"},
-		{"link-local metadata", "https://169.254.169.254/latest/meta-data/"},
+		{"link-local metadata https", "https://169.254.169.254/latest/meta-data/"},
+		{"link-local metadata http", "http://169.254.169.254/latest/meta-data/"},
+		{"loopback IPv4 http", "http://127.0.0.1/cb"},
+		{"private 10.x http", "http://10.0.0.1/cb"},
 		{"link-local other", "https://169.254.1.1/cb"},
 		{"private 10.x", "https://10.0.0.1/cb"},
 		{"private 172.16.x", "https://172.16.0.1/cb"},
@@ -155,6 +161,19 @@ func TestPostMessage_EmptyCallbackAllowed(t *testing.T) {
 func TestPostMessage_HTTPSCallbackAccepted(t *testing.T) {
 	api := newAPI(&fakeCtl{submitID: "t"}, turn.NewStore())
 	body, _ := json.Marshal(map[string]string{"text": "hi", "callbackUrl": "https://operator.example.com/cb"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+}
+
+// TestPostMessage_HTTPClusterCallbackAccepted verifies the in-cluster plaintext
+// callback the operator actually sends (a ClusterIP svc DNS name, no TLS) passes.
+// The https-only rule rejected this and stalled every turn submit.
+func TestPostMessage_HTTPClusterCallbackAccepted(t *testing.T) {
+	api := newAPI(&fakeCtl{submitID: "t"}, turn.NewStore())
+	body, _ := json.Marshal(map[string]string{"text": "hi",
+		"callbackUrl": "http://tatara-operator-internal.tatara.svc:8082/internal/turn-complete"})
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 	api.TestRouter().ServeHTTP(rec, req)

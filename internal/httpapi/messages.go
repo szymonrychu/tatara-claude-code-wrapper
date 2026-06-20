@@ -15,7 +15,9 @@ import (
 
 // validateCallbackURL rejects callbackUrl values that would enable SSRF.
 // Empty string is allowed (caller uses server default). Non-empty values must:
-//   - use the https scheme
+//   - use the http or https scheme (in-cluster callbacks are plaintext http to
+//     a ClusterIP svc with no TLS; the IP-range guards below, not the scheme,
+//     are what provide the SSRF protection and fire for either scheme)
 //   - not resolve to loopback, link-local, or private (RFC1918) addresses
 func validateCallbackURL(raw string) error {
 	if raw == "" {
@@ -25,8 +27,8 @@ func validateCallbackURL(raw string) error {
 	if err != nil {
 		return fmt.Errorf("invalid callbackUrl: %w", err)
 	}
-	if u.Scheme != "https" {
-		return fmt.Errorf("callbackUrl must use https scheme, got %q", u.Scheme)
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return fmt.Errorf("callbackUrl must use http or https scheme, got %q", u.Scheme)
 	}
 	host := u.Hostname()
 	// Reject literal "localhost" before IP parsing.
