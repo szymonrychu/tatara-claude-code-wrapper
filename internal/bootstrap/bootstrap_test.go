@@ -48,7 +48,8 @@ func TestRender_WritesClaudeMdSettingsSkillsAndMergesMCP(t *testing.T) {
 
 	// global + project CLAUDE.md
 	b, _ := os.ReadFile(filepath.Join(home, ".claude", "CLAUDE.md"))
-	require.Equal(t, "GLOBAL RULES", string(b))
+	require.Contains(t, string(b), "GLOBAL RULES")
+	require.Contains(t, string(b), "comment_on_issue") // headless directive appended
 	b, _ = os.ReadFile(filepath.Join(ws, "CLAUDE.md"))
 	require.Equal(t, "PROJECT RULES", string(b))
 
