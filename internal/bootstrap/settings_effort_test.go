@@ -41,3 +41,54 @@ func TestWriteSettings_NoEffortLevelWhenEmpty(t *testing.T) {
 		t.Fatalf("effortLevel must be absent when Effort empty, got %v", m["effortLevel"])
 	}
 }
+
+func TestWriteSettings_BypassDefaultMode_AutoApprovesDispatch(t *testing.T) {
+	home := t.TempDir()
+	// Mirrors the live boot: bypassPermissions, empty allow-list.
+	if err := writeSettings(Params{HookCommand: "/x", PermissionMode: "bypassPermissions"}, home); err != nil {
+		t.Fatalf("writeSettings: %v", err)
+	}
+	m := readSettings(t, home)
+	perms, ok := m["permissions"].(map[string]any)
+	if !ok {
+		t.Fatalf("permissions block missing: %v", m["permissions"])
+	}
+	if perms["defaultMode"] != "bypassPermissions" {
+		t.Fatalf("defaultMode = %v, want bypassPermissions (auto-approves Agent/Workflow headless)", perms["defaultMode"])
+	}
+	// With an empty allow-list, NO allow key is emitted, so nothing can exclude
+	// Agent/Workflow. (A present-but-partial allow list under bypass is still
+	// fully permissive, but we assert absence to catch an accidental restriction.)
+	if _, present := perms["allow"]; present {
+		t.Fatalf("allow key must be absent under empty allow-list, got %v", perms["allow"])
+	}
+}
+
+func TestWriteSettings_AllowListNeverDropsDispatchTools(t *testing.T) {
+	// If a non-empty allow-list is ever supplied, it must include the dispatch
+	// tools (Agent, Workflow) so a future switch away from bypassPermissions
+	// would not hang a headless turn on subagent/workflow approval.
+	home := t.TempDir()
+	allow := []string{"Bash", "Edit", "Agent", "Workflow"}
+	if err := writeSettings(Params{HookCommand: "/x", PermissionMode: "bypassPermissions", AllowedTools: allow}, home); err != nil {
+		t.Fatalf("writeSettings: %v", err)
+	}
+	m := readSettings(t, home)
+	perms := m["permissions"].(map[string]any)
+	got, _ := perms["allow"].([]any)
+	var asStr []string
+	for _, v := range got {
+		asStr = append(asStr, v.(string))
+	}
+	for _, want := range []string{"Agent", "Workflow"} {
+		found := false
+		for _, a := range asStr {
+			if a == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("dispatch tool %q missing from allow-list %v", want, asStr)
+		}
+	}
+}
