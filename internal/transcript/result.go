@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // TurnTokens is the per-model token total for one turn, summed from the
@@ -191,4 +192,119 @@ func SumTurnTokens(path string) ([]TurnTokens, error) {
 func isJSONString(raw json.RawMessage) bool {
 	b := bytes.TrimSpace(raw)
 	return len(b) > 0 && b[0] == '"'
+}
+
+// criticalOutcomeTools is the set of MCP outcome tools whose rejection by the
+// operator must be propagated back to the agent (a silently dropped decline is
+// what produced the false "refused-no-explanation" park). Matched on the bare
+// tool name after stripping any MCP namespace prefix (mcp__<server>__<name>).
+var criticalOutcomeTools = map[string]bool{
+	"decline_implementation": true,
+	"already_done":           true,
+}
+
+// bareToolName strips an MCP namespace prefix ("mcp__tatara__decline_implementation"
+// -> "decline_implementation"). A non-prefixed name is returned unchanged.
+func bareToolName(name string) string {
+	if i := strings.LastIndex(name, "__"); i >= 0 {
+		return name[i+2:]
+	}
+	return name
+}
+
+// outcomeLine is the minimal view of a transcript line carrying tool_use and
+// tool_result blocks, used by FailedCriticalOutcome. content is decoded as an
+// array of blocks; genuine string-content user prompts simply fail to unmarshal
+// into the array and are skipped.
+type outcomeLine struct {
+	Type    string `json:"type"`
+	Message *struct {
+		Content []struct {
+			Type      string          `json:"type"`
+			ID        string          `json:"id"`
+			Name      string          `json:"name"`
+			ToolUseID string          `json:"tool_use_id"`
+			IsError   bool            `json:"is_error"`
+			Content   json.RawMessage `json:"content"`
+		} `json:"content"`
+	} `json:"message"`
+}
+
+// FailedCriticalOutcome scans the JSONL transcript at path for a critical-outcome
+// MCP tool call (decline_implementation / already_done, under any MCP namespace
+// prefix) whose tool_result came back is_error:true. It returns the bare tool
+// name, the operator's error text, and found=true on a hit. found=false (nil
+// error) is the common no-failure case. A later non-error result for the same
+// tool_use_id supersedes an earlier failure (the agent already corrected).
+func FailedCriticalOutcome(path string) (tool, errText string, found bool, err error) {
+	f, oerr := os.Open(path)
+	if oerr != nil {
+		return "", "", false, fmt.Errorf("open transcript: %w", oerr)
+	}
+	defer func() { _ = f.Close() }()
+
+	// toolUseByID maps tool_use_id -> bare critical tool name for in-flight calls.
+	toolUseByID := map[string]string{}
+	// lastResult tracks the most recent outcome (errText or "") per bare tool
+	// name. An empty string means the last result was a success; non-empty means
+	// the last result was a failure with that error text. A later successful retry
+	// (different tool_use_id, same bare name) clears the failure.
+	lastResult := map[string]string{}
+	lastFailed := map[string]bool{}
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1024*1024), maxPartialBytes)
+	for sc.Scan() {
+		var ol outcomeLine
+		if jerr := json.Unmarshal(sc.Bytes(), &ol); jerr != nil || ol.Message == nil {
+			continue
+		}
+		for _, b := range ol.Message.Content {
+			switch b.Type {
+			case "tool_use":
+				if name := bareToolName(b.Name); criticalOutcomeTools[name] && b.ID != "" {
+					toolUseByID[b.ID] = name
+				}
+			case "tool_result":
+				if b.ToolUseID == "" {
+					continue
+				}
+				name, ok := toolUseByID[b.ToolUseID]
+				if !ok {
+					continue // not a critical outcome tool call
+				}
+				if b.IsError {
+					lastResult[name] = jsonContentString(b.Content)
+					lastFailed[name] = true
+				} else {
+					// A later success for the same tool name clears any earlier failure.
+					lastResult[name] = ""
+					lastFailed[name] = false
+				}
+			}
+		}
+	}
+	if serr := sc.Err(); serr != nil {
+		return "", "", false, fmt.Errorf("scan transcript: %w", serr)
+	}
+
+	for name, isF := range lastFailed {
+		if isF {
+			return name, lastResult[name], true, nil
+		}
+	}
+	return "", "", false, nil
+}
+
+// jsonContentString renders a tool_result content field as a human-readable
+// string. The field is either a JSON string ("400: ...") or an array of blocks;
+// in the array case the raw JSON is returned so the message is never empty.
+func jsonContentString(raw json.RawMessage) string {
+	if isJSONString(raw) {
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			return s
+		}
+	}
+	return string(raw)
 }

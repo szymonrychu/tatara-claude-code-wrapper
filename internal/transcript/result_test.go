@@ -3,6 +3,7 @@ package transcript
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -164,4 +165,83 @@ func TestLastAssistant_FromRealTranscript(t *testing.T) {
 	require.NotEmpty(t, text)
 	require.Equal(t, "end_turn", stop)
 	_ = usage
+}
+
+// TestFailedCriticalOutcome covers the rejected-decline detection that the
+// wrapper uses to re-prompt the agent instead of finishing a turn silently.
+func TestFailedCriticalOutcome(t *testing.T) {
+	tests := []struct {
+		name       string
+		lines      []string
+		wantTool   string
+		wantErrSub string
+		wantFound  bool
+	}{
+		{
+			name: "rejected decline_implementation",
+			lines: []string{
+				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__tatara__decline_implementation","input":{"reason":"   "}}]}}`,
+				`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"400: reason must not be blank"}]}}`,
+			},
+			wantTool:   "decline_implementation",
+			wantErrSub: "reason must not be blank",
+			wantFound:  true,
+		},
+		{
+			name: "rejected already_done",
+			lines: []string{
+				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a9","name":"mcp__tatara__already_done","input":{}}]}}`,
+				`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"a9","is_error":true,"content":"400: reason required"}]}}`,
+			},
+			wantTool:   "already_done",
+			wantErrSub: "reason required",
+			wantFound:  true,
+		},
+		{
+			name: "successful decline is not a hit",
+			lines: []string{
+				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__tatara__decline_implementation","input":{"reason":"blocked on creds"}}]}}`,
+				`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"ok"}]}}`,
+			},
+			wantFound: false,
+		},
+		{
+			name: "unrelated failing tool is not a hit",
+			lines: []string{
+				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"false"}}]}}`,
+				`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b1","is_error":true,"content":"exit 1"}]}}`,
+			},
+			wantFound: false,
+		},
+		{
+			name: "later successful retry supersedes earlier failure",
+			lines: []string{
+				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__tatara__decline_implementation","input":{"reason":""}}]}}`,
+				`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"400"}]}}`,
+				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"mcp__tatara__decline_implementation","input":{"reason":"real"}}]}}`,
+				`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","is_error":false,"content":"ok"}]}}`,
+			},
+			wantFound: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "t.jsonl")
+			require.NoError(t, os.WriteFile(path, []byte(strings.Join(tt.lines, "\n")+"\n"), 0o644))
+
+			tool, errText, found, err := FailedCriticalOutcome(path)
+			require.NoError(t, err)
+			require.Equal(t, tt.wantFound, found)
+			if tt.wantFound {
+				require.Equal(t, tt.wantTool, tool)
+				require.Contains(t, errText, tt.wantErrSub)
+			}
+		})
+	}
+}
+
+func TestFailedCriticalOutcome_MissingFileErrors(t *testing.T) {
+	_, _, _, err := FailedCriticalOutcome(filepath.Join(t.TempDir(), "nope.jsonl"))
+	require.Error(t, err)
 }
