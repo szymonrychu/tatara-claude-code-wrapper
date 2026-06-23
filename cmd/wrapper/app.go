@@ -171,6 +171,11 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 			// and bounded so a hung S3 call cannot wedge the turn finaliser.
 			if convStore != nil && cfg.ConversationObjectKey != "" {
 				if path := sess.TranscriptPath(); path != "" {
+					// Report the conversation pointer to the operator on this turn's
+					// callback so it records SessionID/ConversationObjectKey on the Task
+					// and replays them on the next-phase pod (issue #114, subtask 6).
+					rec.SessionID = convstore.SessionIDFromPath(path)
+					rec.ConversationObjectKey = cfg.ConversationObjectKey
 					upStart := time.Now()
 					upCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 					err := convstore.Upload(upCtx, convStore, cfg.ConversationObjectKey, path)

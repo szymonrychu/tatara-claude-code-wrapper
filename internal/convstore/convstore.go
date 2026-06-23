@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/storage"
 )
@@ -41,6 +42,13 @@ func ProjectDirName(cwd string) string {
 // reads/writes session transcripts in for the given working directory.
 func TranscriptDir(homeDir, cwd string) string {
 	return filepath.Join(homeDir, ".claude", "projects", ProjectDirName(cwd))
+}
+
+// SessionIDFromPath extracts the Claude session id from a transcript path:
+// ~/.claude/projects/<dir>/<sessionId>.jsonl -> <sessionId>. claude names the
+// transcript file after the session id, so the basename is authoritative.
+func SessionIDFromPath(transcriptPath string) string {
+	return strings.TrimSuffix(filepath.Base(transcriptPath), ".jsonl")
 }
 
 // Upload stores the transcript file at transcriptPath under key. The caller logs

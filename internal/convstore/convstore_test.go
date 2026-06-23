@@ -33,6 +33,14 @@ func TestTranscriptDir(t *testing.T) {
 	}
 }
 
+func TestSessionIDFromPath(t *testing.T) {
+	const sid = "11111111-2222-3333-4444-555555555555"
+	got := SessionIDFromPath("/home/agent/.claude/projects/-workspace/" + sid + ".jsonl")
+	if got != sid {
+		t.Errorf("SessionIDFromPath = %q, want %q", got, sid)
+	}
+}
+
 func TestUpload_ReadsFileAndPuts(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
