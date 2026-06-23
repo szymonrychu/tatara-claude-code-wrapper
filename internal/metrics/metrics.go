@@ -42,6 +42,10 @@ type Metrics struct {
 	// property the operator can later budget on.
 	TurnTokensTotal *prometheus.CounterVec // labels: type=input|output|cache_read|cache_creation, model
 	TurnCostUSD     prometheus.Counter     // emitted only when result.json carries total_cost_usd
+
+	// Conversation persistence (issue #114): upload-on-turn-finish and
+	// restore-on-boot of the S3 transcript blob.
+	ConversationOpsTotal *prometheus.CounterVec // labels: op=upload|restore, result=ok|fail|skip
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -99,6 +103,8 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_turn_tokens_total", Help: "Claude tokens consumed per turn, summed across the turn, by token type and model."}, []string{"type", "model"}),
 		TurnCostUSD: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "ccw_turn_cost_usd_total", Help: "Cumulative Claude turn cost in USD (from result.json total_cost_usd when present)."}),
+		ConversationOpsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_conversation_ops_total", Help: "Conversation transcript persistence operations by op and result."}, []string{"op", "result"}),
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
 		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal, m.Interjections,
@@ -106,6 +112,6 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.BootstrapHookInstall, m.LifecycleHookTotal, m.HookOutcome, m.MetricPushTotal,
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.HTTPInFlight, m.HTTPPanicsTotal,
 		m.AuthTotal, m.TurnResumes, m.BootstrapRenderTotal,
-		m.TurnTokensTotal, m.TurnCostUSD)
+		m.TurnTokensTotal, m.TurnCostUSD, m.ConversationOpsTotal)
 	return m
 }

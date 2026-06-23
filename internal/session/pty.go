@@ -56,10 +56,15 @@ func (c Config) claudeArgs(resume bool) []string {
 	if c.Effort != "" {
 		args = append(args, "--effort", c.Effort)
 	}
-	if resume {
-		// Resume the most recent conversation in the workspace so a relaunched
-		// session keeps its context after a crash.
+	switch {
+	case resume:
+		// Crash relaunch: resume the most recent conversation in the workspace so
+		// the session keeps its context after a crash.
 		args = append(args, "--continue")
+	case c.ResumeSessionID != "":
+		// Cross-pod resume (issue #114): a prior conversation transcript was
+		// restored to disk on boot; resume it explicitly by session id.
+		args = append(args, "--resume", c.ResumeSessionID)
 	}
 	return args
 }

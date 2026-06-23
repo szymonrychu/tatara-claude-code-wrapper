@@ -66,6 +66,12 @@ type config struct {
 	S3ForcePathStyle bool
 	S3AccessKeyID    string
 	S3SecretKey      string
+
+	// Conversation resume (issue #114). The operator sets the S3 object key for
+	// this issue's conversation (stable per issue); the sessionId is set only
+	// when a prior conversation exists, triggering restore + `claude --resume`.
+	ConversationObjectKey string
+	ConversationSessionID string
 }
 
 func loadConfig(args []string) (config, error) {
@@ -138,6 +144,9 @@ func loadConfig(args []string) (config, error) {
 		S3ForcePathStyle: fps,
 		S3AccessKeyID:    envOr("AWS_ACCESS_KEY_ID", ""),
 		S3SecretKey:      envOr("AWS_SECRET_ACCESS_KEY", ""),
+
+		ConversationObjectKey: envOr("CONVERSATION_OBJECT_KEY", ""),
+		ConversationSessionID: envOr("CONVERSATION_SESSION_ID", ""),
 	}
 	if raw := os.Getenv("TATARA_REPOS"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.Repos); err != nil {

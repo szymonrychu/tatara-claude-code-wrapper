@@ -46,6 +46,13 @@ type Config struct {
 	SubmitDelay time.Duration // pause between the paste and the submit keystroke
 	SubmitSeq   SubmitSequence
 	MaxRestarts int // crash-relaunch budget per session; default 3
+
+	// ResumeSessionID, when set, makes the INITIAL boot resume a specific prior
+	// conversation by id (claude --resume <id>) rather than starting fresh. Set
+	// by the app after a cross-pod transcript restore (issue #114). Crash
+	// relaunches still use --continue (most recent), which is this same
+	// conversation once resumed.
+	ResumeSessionID string
 }
 
 // HookResult is the payload cc-stop-hook POSTs to the internal endpoint.

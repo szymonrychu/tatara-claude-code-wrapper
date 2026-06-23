@@ -14,11 +14,13 @@ import (
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/auth"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/convstore"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/httpapi"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/obs"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/pushclient"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/storage"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/webhook"
 )
@@ -60,17 +62,54 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		repo = cfg.Repos[0].URL
 	}
 
+	// Conversation persistence (issue #114): build the S3 store if configured,
+	// restore a prior transcript so this pod resumes via `claude --resume`, and
+	// (below, in OnTurnDone) upload the live transcript after each turn. The whole
+	// feature is off and the wrapper behaves exactly as before unless an S3 bucket
+	// is configured. All of it is best-effort: an init/restore failure logs and
+	// falls back to a fresh session (plus the operator's text handover).
+	var convStore storage.Store
+	resumeSID := ""
+	if sc := cfg.S3Config(); sc.Enabled() {
+		cl, err := storage.New(ctx, sc)
+		if err != nil {
+			log.Error("conversation persistence: S3 client init failed; continuing without it", "error", err)
+		} else {
+			convStore = cl
+		}
+	}
+	if convStore != nil && cfg.ConversationObjectKey != "" && cfg.ConversationSessionID != "" {
+		dir := convstore.TranscriptDir(cfg.HomeDir, cfg.Workspace)
+		restored, rerr := convstore.Restore(ctx, convStore, cfg.ConversationObjectKey, cfg.ConversationSessionID, dir)
+		switch {
+		case rerr != nil:
+			m.ConversationOpsTotal.WithLabelValues("restore", "fail").Inc()
+			log.Error("conversation restore failed; starting fresh", "action", "conversation_restore",
+				"key", cfg.ConversationObjectKey, "session_id", cfg.ConversationSessionID, "error", rerr)
+		case restored:
+			m.ConversationOpsTotal.WithLabelValues("restore", "ok").Inc()
+			resumeSID = cfg.ConversationSessionID
+			log.Info("conversation restored; resuming", "action", "conversation_restore",
+				"key", cfg.ConversationObjectKey, "session_id", resumeSID)
+		default:
+			m.ConversationOpsTotal.WithLabelValues("restore", "skip").Inc()
+			log.Info("no prior conversation object; starting fresh", "action", "conversation_restore",
+				"key", cfg.ConversationObjectKey)
+		}
+	}
+
 	store := turn.NewStore()
 	sess := session.New(session.Config{
-		ClaudePath:  cfg.ClaudePath,
-		Workspace:   cfg.Workspace,
-		Env:         claudeEnv(cfg),
-		Model:       cfg.Model,
-		Effort:      cfg.Effort,
-		Repo:        repo,
-		TurnTimeout: time.Duration(cfg.TurnTimeoutSeconds) * time.Second,
-		BootTimeout: time.Duration(cfg.BootTimeoutSeconds) * time.Second,
-		SubmitSeq:   session.DefaultSubmitSeq,
+		ClaudePath:      cfg.ClaudePath,
+		Workspace:       cfg.Workspace,
+		Env:             claudeEnv(cfg),
+		Model:           cfg.Model,
+		Effort:          cfg.Effort,
+		Repo:            repo,
+		TurnTimeout:     time.Duration(cfg.TurnTimeoutSeconds) * time.Second,
+		BootTimeout:     time.Duration(cfg.BootTimeoutSeconds) * time.Second,
+		SubmitSeq:       session.DefaultSubmitSeq,
+		ResumeSessionID: resumeSID,
 	}, store, m, log, time.Now, newTurnID)
 
 	sender := webhook.New(webhook.Config{Retries: cfg.WebhookRetries}, m, log)
@@ -123,6 +162,28 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 				} else {
 					m.CommitPushTotal.WithLabelValues("ok").Inc()
 					log.Info("commit/push succeeded", "action", "commit_push", "branch", cfg.TaskBranch, "duration_ms", time.Since(pushStart).Milliseconds())
+				}
+			}
+
+			// Persist the conversation transcript to S3 BEFORE the callback: the
+			// operator may transition phase and spawn a new pod on receipt, and that
+			// pod must restore the latest transcript, not a stale one. Best-effort
+			// and bounded so a hung S3 call cannot wedge the turn finaliser.
+			if convStore != nil && cfg.ConversationObjectKey != "" {
+				if path := sess.TranscriptPath(); path != "" {
+					upStart := time.Now()
+					upCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					err := convstore.Upload(upCtx, convStore, cfg.ConversationObjectKey, path)
+					cancel()
+					if err != nil {
+						m.ConversationOpsTotal.WithLabelValues("upload", "fail").Inc()
+						log.Error("conversation upload failed", "action", "conversation_upload",
+							"key", cfg.ConversationObjectKey, "error", err, "duration_ms", time.Since(upStart).Milliseconds())
+					} else {
+						m.ConversationOpsTotal.WithLabelValues("upload", "ok").Inc()
+						log.Info("conversation uploaded", "action", "conversation_upload",
+							"key", cfg.ConversationObjectKey, "duration_ms", time.Since(upStart).Milliseconds())
+					}
 				}
 			}
 
