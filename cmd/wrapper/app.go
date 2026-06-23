@@ -358,6 +358,7 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		GitUserName:     cfg.GitUserName,
 		GitUserEmail:    cfg.GitUserEmail,
 		TaskBranch:      cfg.TaskBranch,
+		CheckoutBranch:  cfg.CheckoutBranch,
 		Repos:           cfg.Repos,
 
 		HookPreClone:             cfg.HookPreClone,

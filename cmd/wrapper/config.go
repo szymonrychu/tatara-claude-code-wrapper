@@ -12,20 +12,24 @@ import (
 )
 
 type config struct {
-	HTTPAddr            string
-	InternalAddr        string
-	OIDCIssuer          string
-	OIDCAudience        string
-	LogLevel            string
-	Model               string
-	Effort              string
-	PermissionMode      string
-	RepoURL             string
-	RepoBranch          string
-	GitToken            string
-	GitUserName         string
-	GitUserEmail        string
-	TaskBranch          string
+	HTTPAddr       string
+	InternalAddr   string
+	OIDCIssuer     string
+	OIDCAudience   string
+	LogLevel       string
+	Model          string
+	Effort         string
+	PermissionMode string
+	RepoURL        string
+	RepoBranch     string
+	GitToken       string
+	GitUserName    string
+	GitUserEmail   string
+	TaskBranch     string
+	// CheckoutBranch is a branch to check out read-only after clone when no
+	// TaskBranch is set (issue #114 decision 4: an MR review agent works on the
+	// PR head but never pushes). TaskBranch takes precedence when both are set.
+	CheckoutBranch      string
 	DefaultCallbackURL  string
 	OperatorPushURL     string
 	RunID               string
@@ -115,6 +119,7 @@ func loadConfig(args []string) (config, error) {
 		GitUserName:         envOr("GIT_USER_NAME", "tatara-agent"),
 		GitUserEmail:        envOr("GIT_USER_EMAIL", "tatara-agent@szymonrichert.pl"),
 		TaskBranch:          envOr("TASK_BRANCH", ""),
+		CheckoutBranch:      envOr("CHECKOUT_BRANCH", ""),
 		DefaultCallbackURL:  envOr("DEFAULT_CALLBACK_URL", ""),
 		OperatorPushURL:     envOr("OPERATOR_PUSH_URL", ""),
 		RunID:               envOr("RUN_ID", ""),
