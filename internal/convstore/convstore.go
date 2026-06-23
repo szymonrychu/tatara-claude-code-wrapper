@@ -11,7 +11,10 @@
 package convstore
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -63,6 +66,63 @@ func Upload(ctx context.Context, store storage.Store, key, transcriptPath string
 		return fmt.Errorf("upload conversation %s: %w", key, err)
 	}
 	return nil
+}
+
+// ParseSessionID reads the Claude session id from transcript JSONL content. Each
+// line carries a "sessionId" field; the first non-empty one wins. Returns "" if
+// none is found.
+func ParseSessionID(r io.Reader) string {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for sc.Scan() {
+		var line struct {
+			SessionID string `json:"sessionId"`
+		}
+		if err := json.Unmarshal(sc.Bytes(), &line); err == nil && line.SessionID != "" {
+			return line.SessionID
+		}
+	}
+	return ""
+}
+
+// Fork copies the parent conversation at parentKey to ownKey (so each issue gets
+// its own diverging copy, issue #114 decision 3), writes it to disk under its
+// session id, and returns that session id so the caller can launch
+// `claude --resume <sid>`. The copy keys the conversation by issue while leaving
+// the parent untouched. Returns ("", nil) when parentKey is absent (nothing to
+// fork).
+func Fork(ctx context.Context, store storage.Store, parentKey, ownKey, transcriptDir string) (string, error) {
+	exists, err := store.Exists(ctx, parentKey)
+	if err != nil {
+		return "", fmt.Errorf("check fork parent %s: %w", parentKey, err)
+	}
+	if !exists {
+		return "", nil
+	}
+	if err := store.Copy(ctx, parentKey, ownKey); err != nil {
+		return "", fmt.Errorf("fork copy %s -> %s: %w", parentKey, ownKey, err)
+	}
+	rc, err := store.Get(ctx, ownKey)
+	if err != nil {
+		return "", fmt.Errorf("read forked conversation %s: %w", ownKey, err)
+	}
+	body, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		return "", fmt.Errorf("read forked conversation %s: %w", ownKey, err)
+	}
+	sid := ParseSessionID(bytes.NewReader(body))
+	if sid == "" {
+		return "", fmt.Errorf("forked conversation %s has no sessionId", ownKey)
+	}
+	if err := os.MkdirAll(transcriptDir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir transcript dir %s: %w", transcriptDir, err)
+	}
+	dest := filepath.Join(transcriptDir, sid+".jsonl")
+	if err := os.WriteFile(dest, body, 0o600); err != nil { //nolint:gosec // dest derived from parsed sessionId + home, not user input
+		return "", fmt.Errorf("write forked transcript %s: %w", dest, err)
+	}
+	return sid, nil
 }
 
 // Restore downloads the conversation blob at key into

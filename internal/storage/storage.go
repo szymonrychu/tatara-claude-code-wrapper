@@ -28,6 +28,9 @@ type Store interface {
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
 	Delete(ctx context.Context, key string) error
 	Exists(ctx context.Context, key string) (bool, error)
+	// Copy duplicates the object at srcKey to dstKey (server-side for S3). Used to
+	// fork a parent conversation onto a per-issue key (issue #114 decision 3).
+	Copy(ctx context.Context, srcKey, dstKey string) error
 }
 
 // Config is the S3 connection config, sourced from the wrapper env (which the
@@ -132,6 +135,21 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 		Key:    aws.String(c.fullKey(key)),
 	}); err != nil {
 		return fmt.Errorf("storage delete %s: %w", key, err)
+	}
+	return nil
+}
+
+// Copy server-side copies srcKey to dstKey within the bucket. Both are logical
+// keys; the configured prefix is applied to each. CopySource is the
+// bucket-qualified source path; tatara conversation keys contain only
+// [A-Za-z0-9/_.-], none of which require URL-escaping.
+func (c *Client) Copy(ctx context.Context, srcKey, dstKey string) error {
+	if _, err := c.s3.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(c.bucket),
+		Key:        aws.String(c.fullKey(dstKey)),
+		CopySource: aws.String(c.bucket + "/" + c.fullKey(srcKey)),
+	}); err != nil {
+		return fmt.Errorf("storage copy %s -> %s: %w", srcKey, dstKey, err)
 	}
 	return nil
 }

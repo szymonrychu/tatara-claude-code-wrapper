@@ -41,6 +41,56 @@ func TestSessionIDFromPath(t *testing.T) {
 	}
 }
 
+func TestParseSessionID(t *testing.T) {
+	jsonl := `{"type":"mode","sessionId":"sid-parent","mode":"x"}` + "\n" +
+		`{"type":"user","sessionId":"sid-parent","message":{}}` + "\n"
+	if got := ParseSessionID(strings.NewReader(jsonl)); got != "sid-parent" {
+		t.Errorf("ParseSessionID = %q, want sid-parent", got)
+	}
+	if got := ParseSessionID(strings.NewReader("not json\n")); got != "" {
+		t.Errorf("ParseSessionID of junk = %q, want empty", got)
+	}
+}
+
+func TestFork_CopiesParentAndWritesSessionFile(t *testing.T) {
+	ctx := context.Background()
+	st := storage.NewMemStore()
+	const parentSID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	parentContent := `{"type":"mode","sessionId":"` + parentSID + `"}` + "\n" +
+		`{"type":"user","sessionId":"` + parentSID + `","message":{}}` + "\n"
+	if err := st.Put(ctx, "tatara/task-brainstorm.jsonl", strings.NewReader(parentContent)); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "projects", "-workspace")
+	ownKey := "tatara/repo/issue-7.jsonl"
+
+	sid, err := Fork(ctx, st, "tatara/task-brainstorm.jsonl", ownKey, dir)
+	if err != nil {
+		t.Fatalf("Fork: %v", err)
+	}
+	if sid != parentSID {
+		t.Errorf("Fork sid = %q, want %q", sid, parentSID)
+	}
+	// The parent was copied onto the issue's own key (diverging copy).
+	if ok, _ := st.Exists(ctx, ownKey); !ok {
+		t.Error("Fork must copy the parent onto the own key")
+	}
+	// The transcript is on disk under the session id for --resume.
+	if _, err := os.Stat(filepath.Join(dir, parentSID+".jsonl")); err != nil {
+		t.Errorf("forked transcript not written for resume: %v", err)
+	}
+}
+
+func TestFork_NoParentIsNoop(t *testing.T) {
+	sid, err := Fork(context.Background(), storage.NewMemStore(), "absent", "own", t.TempDir())
+	if err != nil {
+		t.Fatalf("Fork with absent parent: %v", err)
+	}
+	if sid != "" {
+		t.Errorf("Fork with absent parent sid = %q, want empty", sid)
+	}
+}
+
 func TestUpload_ReadsFileAndPuts(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

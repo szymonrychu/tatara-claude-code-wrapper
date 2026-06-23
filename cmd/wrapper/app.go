@@ -78,23 +78,46 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 			convStore = cl
 		}
 	}
-	if convStore != nil && cfg.ConversationObjectKey != "" && cfg.ConversationSessionID != "" {
+	if convStore != nil && cfg.ConversationObjectKey != "" {
 		dir := convstore.TranscriptDir(cfg.HomeDir, cfg.Workspace)
-		restored, rerr := convstore.Restore(ctx, convStore, cfg.ConversationObjectKey, cfg.ConversationSessionID, dir)
 		switch {
-		case rerr != nil:
-			m.ConversationOpsTotal.WithLabelValues("restore", "fail").Inc()
-			log.Error("conversation restore failed; starting fresh", "action", "conversation_restore",
-				"key", cfg.ConversationObjectKey, "session_id", cfg.ConversationSessionID, "error", rerr)
-		case restored:
-			m.ConversationOpsTotal.WithLabelValues("restore", "ok").Inc()
-			resumeSID = cfg.ConversationSessionID
-			log.Info("conversation restored; resuming", "action", "conversation_restore",
-				"key", cfg.ConversationObjectKey, "session_id", resumeSID)
-		default:
-			m.ConversationOpsTotal.WithLabelValues("restore", "skip").Inc()
-			log.Info("no prior conversation object; starting fresh", "action", "conversation_restore",
-				"key", cfg.ConversationObjectKey)
+		case cfg.ConversationSessionID != "":
+			// Normal cross-pod resume of this issue's own conversation.
+			restored, rerr := convstore.Restore(ctx, convStore, cfg.ConversationObjectKey, cfg.ConversationSessionID, dir)
+			switch {
+			case rerr != nil:
+				m.ConversationOpsTotal.WithLabelValues("restore", "fail").Inc()
+				log.Error("conversation restore failed; starting fresh", "action", "conversation_restore",
+					"key", cfg.ConversationObjectKey, "session_id", cfg.ConversationSessionID, "error", rerr)
+			case restored:
+				m.ConversationOpsTotal.WithLabelValues("restore", "ok").Inc()
+				resumeSID = cfg.ConversationSessionID
+				log.Info("conversation restored; resuming", "action", "conversation_restore",
+					"key", cfg.ConversationObjectKey, "session_id", resumeSID)
+			default:
+				m.ConversationOpsTotal.WithLabelValues("restore", "skip").Inc()
+				log.Info("no prior conversation object; starting fresh", "action", "conversation_restore",
+					"key", cfg.ConversationObjectKey)
+			}
+		case cfg.ConversationForkFromKey != "":
+			// First run of a brainstorm-derived issue: fork the parent conversation
+			// onto this issue's own key and resume it (issue #114 decision 3).
+			sid, ferr := convstore.Fork(ctx, convStore, cfg.ConversationForkFromKey, cfg.ConversationObjectKey, dir)
+			switch {
+			case ferr != nil:
+				m.ConversationOpsTotal.WithLabelValues("fork", "fail").Inc()
+				log.Error("conversation fork failed; starting fresh", "action", "conversation_fork",
+					"parent_key", cfg.ConversationForkFromKey, "key", cfg.ConversationObjectKey, "error", ferr)
+			case sid != "":
+				m.ConversationOpsTotal.WithLabelValues("fork", "ok").Inc()
+				resumeSID = sid
+				log.Info("conversation forked; resuming", "action", "conversation_fork",
+					"parent_key", cfg.ConversationForkFromKey, "key", cfg.ConversationObjectKey, "session_id", resumeSID)
+			default:
+				m.ConversationOpsTotal.WithLabelValues("fork", "skip").Inc()
+				log.Info("no parent conversation to fork; starting fresh", "action", "conversation_fork",
+					"parent_key", cfg.ConversationForkFromKey)
+			}
 		}
 	}
 

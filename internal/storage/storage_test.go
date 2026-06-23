@@ -104,3 +104,31 @@ func TestStore_RoundTrip(t *testing.T) {
 		t.Errorf("Delete of missing key must be a no-op, got %v", err)
 	}
 }
+
+func TestMemStore_Copy(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemStore()
+	if err := s.Put(ctx, "parent.jsonl", strings.NewReader("parent-content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Copy(ctx, "parent.jsonl", "child.jsonl"); err != nil {
+		t.Fatalf("Copy: %v", err)
+	}
+	rc, err := s.Get(ctx, "child.jsonl")
+	if err != nil {
+		t.Fatalf("Get child: %v", err)
+	}
+	got, _ := io.ReadAll(rc)
+	_ = rc.Close()
+	if string(got) != "parent-content" {
+		t.Errorf("copied content = %q, want parent-content", got)
+	}
+	// Source untouched.
+	if ok, _ := s.Exists(ctx, "parent.jsonl"); !ok {
+		t.Error("Copy must not remove the source")
+	}
+	// Copying a missing source errors.
+	if err := s.Copy(ctx, "absent", "x"); err == nil {
+		t.Error("Copy of a missing source must error")
+	}
+}

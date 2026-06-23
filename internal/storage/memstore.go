@@ -55,3 +55,16 @@ func (m *MemStore) Exists(_ context.Context, key string) (bool, error) {
 	_, ok := m.data[key]
 	return ok, nil
 }
+
+func (m *MemStore) Copy(_ context.Context, srcKey, dstKey string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.data[srcKey]
+	if !ok {
+		return fmt.Errorf("storage: copy source key %q not found", srcKey)
+	}
+	cp := make([]byte, len(b))
+	copy(cp, b)
+	m.data[dstKey] = cp
+	return nil
+}

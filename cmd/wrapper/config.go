@@ -72,6 +72,11 @@ type config struct {
 	// when a prior conversation exists, triggering restore + `claude --resume`.
 	ConversationObjectKey string
 	ConversationSessionID string
+	// ConversationForkFromKey, when set on a first run with no own conversation
+	// yet, makes the wrapper copy that parent conversation onto this issue's own
+	// key and resume it (issue #114 decision 3: brainstorm conversation forked
+	// per issue).
+	ConversationForkFromKey string
 }
 
 func loadConfig(args []string) (config, error) {
@@ -145,8 +150,9 @@ func loadConfig(args []string) (config, error) {
 		S3AccessKeyID:    envOr("AWS_ACCESS_KEY_ID", ""),
 		S3SecretKey:      envOr("AWS_SECRET_ACCESS_KEY", ""),
 
-		ConversationObjectKey: envOr("CONVERSATION_OBJECT_KEY", ""),
-		ConversationSessionID: envOr("CONVERSATION_SESSION_ID", ""),
+		ConversationObjectKey:   envOr("CONVERSATION_OBJECT_KEY", ""),
+		ConversationSessionID:   envOr("CONVERSATION_SESSION_ID", ""),
+		ConversationForkFromKey: envOr("CONVERSATION_FORK_FROM_KEY", ""),
 	}
 	if raw := os.Getenv("TATARA_REPOS"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.Repos); err != nil {
