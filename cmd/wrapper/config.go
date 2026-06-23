@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/storage"
 )
 
 type config struct {
@@ -54,6 +55,17 @@ type config struct {
 	HookConversationRestart  string
 	HookAgentTurnFinished    string
 	HookConversationFinished string
+
+	// S3 conversation persistence (issue #114). Off unless S3Bucket is set.
+	// The operator injects these from a ConfigMap (endpoint/bucket/region/
+	// prefix/path-style) plus a k8s secret (the AWS_* creds).
+	S3Endpoint       string
+	S3Bucket         string
+	S3Region         string
+	S3KeyPrefix      string
+	S3ForcePathStyle bool
+	S3AccessKeyID    string
+	S3SecretKey      string
 }
 
 func loadConfig(args []string) (config, error) {
@@ -70,6 +82,10 @@ func loadConfig(args []string) (config, error) {
 		return config{}, err
 	}
 	pi, err := envIntOr("PUSH_INTERVAL_SECONDS", 15)
+	if err != nil {
+		return config{}, err
+	}
+	fps, err := envBoolOr("S3_FORCE_PATH_STYLE", false)
 	if err != nil {
 		return config{}, err
 	}
@@ -114,6 +130,14 @@ func loadConfig(args []string) (config, error) {
 		HookConversationRestart:  envOr("HOOK_CONVERSATION_RESTART", ""),
 		HookAgentTurnFinished:    envOr("HOOK_AGENT_TURN_FINISHED", ""),
 		HookConversationFinished: envOr("HOOK_CONVERSATION_FINISHED", ""),
+
+		S3Endpoint:       envOr("S3_ENDPOINT", ""),
+		S3Bucket:         envOr("S3_BUCKET", ""),
+		S3Region:         envOr("S3_REGION", ""),
+		S3KeyPrefix:      envOr("S3_KEY_PREFIX", ""),
+		S3ForcePathStyle: fps,
+		S3AccessKeyID:    envOr("AWS_ACCESS_KEY_ID", ""),
+		S3SecretKey:      envOr("AWS_SECRET_ACCESS_KEY", ""),
 	}
 	if raw := os.Getenv("TATARA_REPOS"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.Repos); err != nil {
@@ -146,4 +170,31 @@ func envIntOr(k string, def int) (int, error) {
 		return 0, fmt.Errorf("env %s: %w", k, err)
 	}
 	return n, nil
+}
+
+func envBoolOr(k string, def bool) (bool, error) {
+	v, ok := os.LookupEnv(k)
+	if !ok {
+		return def, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("env %s: %w", k, err)
+	}
+	return b, nil
+}
+
+// S3Config maps the wrapper config to the storage client config. The
+// upload/restore wiring (subtask 4) constructs the client from this when
+// storage.Config.Enabled() (i.e. a bucket is set).
+func (c config) S3Config() storage.Config {
+	return storage.Config{
+		Endpoint:       c.S3Endpoint,
+		Bucket:         c.S3Bucket,
+		Region:         c.S3Region,
+		KeyPrefix:      c.S3KeyPrefix,
+		ForcePathStyle: c.S3ForcePathStyle,
+		AccessKeyID:    c.S3AccessKeyID,
+		SecretKey:      c.S3SecretKey,
+	}
 }
