@@ -28,6 +28,12 @@ type Record struct {
 	StartedAt      time.Time       `json:"startedAt"`
 	LastActivityAt time.Time       `json:"lastActivityAt"`
 	CompletedAt    *time.Time      `json:"completedAt,omitempty"`
+	// SessionID and ConversationObjectKey report the persisted conversation
+	// pointer back to the operator (issue #114) so it records them on the Task
+	// Status and replays them (CONVERSATION_SESSION_ID) on the next-phase pod.
+	// Set by the app's turn finaliser only when conversation persistence is on.
+	SessionID             string `json:"sessionId,omitempty"`
+	ConversationObjectKey string `json:"conversationObjectKey,omitempty"`
 }
 
 // Summary is the compact form returned by List.

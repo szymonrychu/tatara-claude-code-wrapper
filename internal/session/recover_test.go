@@ -200,6 +200,35 @@ func TestClaudeArgs_ContinueOnResume(t *testing.T) {
 	}
 }
 
+func TestClaudeArgs_ResumeSessionIDOnInitialBoot(t *testing.T) {
+	// Initial boot (resume=false) with a ResumeSessionID: cross-pod resume by id.
+	args := session.ConfigClaudeArgs(session.Config{ResumeSessionID: "sid-123"}, false)
+	idx := -1
+	for i, a := range args {
+		if a == "--resume" {
+			idx = i
+			break
+		}
+	}
+	require.GreaterOrEqual(t, idx, 0, "expected --resume on initial boot with ResumeSessionID")
+	require.Less(t, idx+1, len(args), "--resume missing its value")
+	require.Equal(t, "sid-123", args[idx+1])
+	require.NotContains(t, args, "--continue", "initial cross-pod resume uses --resume, not --continue")
+}
+
+func TestClaudeArgs_CrashRelaunchPrefersContinueOverResumeID(t *testing.T) {
+	// A crash relaunch (resume=true) continues the most recent conversation even
+	// when a ResumeSessionID is set (post-resume, that IS the most recent).
+	args := session.ConfigClaudeArgs(session.Config{ResumeSessionID: "sid-123"}, true)
+	require.Contains(t, args, "--continue")
+	require.NotContains(t, args, "--resume", "crash relaunch must not also pass --resume")
+}
+
+func TestClaudeArgs_NoResumeWhenSessionIDEmpty(t *testing.T) {
+	args := session.ConfigClaudeArgs(session.Config{}, false)
+	require.NotContains(t, args, "--resume", "no ResumeSessionID must NOT emit --resume")
+}
+
 func TestClaudeArgs_EffortFlag(t *testing.T) {
 	args := session.ConfigClaudeArgs(session.Config{Effort: "xhigh"}, false)
 	// --effort and its value must be adjacent, in that order.

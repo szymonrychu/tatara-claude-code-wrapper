@@ -8,23 +8,28 @@ import (
 	"strconv"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/storage"
 )
 
 type config struct {
-	HTTPAddr            string
-	InternalAddr        string
-	OIDCIssuer          string
-	OIDCAudience        string
-	LogLevel            string
-	Model               string
-	Effort              string
-	PermissionMode      string
-	RepoURL             string
-	RepoBranch          string
-	GitToken            string
-	GitUserName         string
-	GitUserEmail        string
-	TaskBranch          string
+	HTTPAddr       string
+	InternalAddr   string
+	OIDCIssuer     string
+	OIDCAudience   string
+	LogLevel       string
+	Model          string
+	Effort         string
+	PermissionMode string
+	RepoURL        string
+	RepoBranch     string
+	GitToken       string
+	GitUserName    string
+	GitUserEmail   string
+	TaskBranch     string
+	// CheckoutBranch is a branch to check out read-only after clone when no
+	// TaskBranch is set (issue #114 decision 4: an MR review agent works on the
+	// PR head but never pushes). TaskBranch takes precedence when both are set.
+	CheckoutBranch      string
 	DefaultCallbackURL  string
 	OperatorPushURL     string
 	RunID               string
@@ -54,6 +59,28 @@ type config struct {
 	HookConversationRestart  string
 	HookAgentTurnFinished    string
 	HookConversationFinished string
+
+	// S3 conversation persistence (issue #114). Off unless S3Bucket is set.
+	// The operator injects these from a ConfigMap (endpoint/bucket/region/
+	// prefix/path-style) plus a k8s secret (the AWS_* creds).
+	S3Endpoint       string
+	S3Bucket         string
+	S3Region         string
+	S3KeyPrefix      string
+	S3ForcePathStyle bool
+	S3AccessKeyID    string
+	S3SecretKey      string
+
+	// Conversation resume (issue #114). The operator sets the S3 object key for
+	// this issue's conversation (stable per issue); the sessionId is set only
+	// when a prior conversation exists, triggering restore + `claude --resume`.
+	ConversationObjectKey string
+	ConversationSessionID string
+	// ConversationForkFromKey, when set on a first run with no own conversation
+	// yet, makes the wrapper copy that parent conversation onto this issue's own
+	// key and resume it (issue #114 decision 3: brainstorm conversation forked
+	// per issue).
+	ConversationForkFromKey string
 }
 
 func loadConfig(args []string) (config, error) {
@@ -73,6 +100,10 @@ func loadConfig(args []string) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	fps, err := envBoolOr("S3_FORCE_PATH_STYLE", false)
+	if err != nil {
+		return config{}, err
+	}
 	cfg := config{
 		HTTPAddr:            envOr("HTTP_ADDR", ":8080"),
 		InternalAddr:        envOr("INTERNAL_ADDR", "127.0.0.1:8090"),
@@ -88,6 +119,7 @@ func loadConfig(args []string) (config, error) {
 		GitUserName:         envOr("GIT_USER_NAME", "tatara-agent"),
 		GitUserEmail:        envOr("GIT_USER_EMAIL", "tatara-agent@szymonrichert.pl"),
 		TaskBranch:          envOr("TASK_BRANCH", ""),
+		CheckoutBranch:      envOr("CHECKOUT_BRANCH", ""),
 		DefaultCallbackURL:  envOr("DEFAULT_CALLBACK_URL", ""),
 		OperatorPushURL:     envOr("OPERATOR_PUSH_URL", ""),
 		RunID:               envOr("RUN_ID", ""),
@@ -114,6 +146,18 @@ func loadConfig(args []string) (config, error) {
 		HookConversationRestart:  envOr("HOOK_CONVERSATION_RESTART", ""),
 		HookAgentTurnFinished:    envOr("HOOK_AGENT_TURN_FINISHED", ""),
 		HookConversationFinished: envOr("HOOK_CONVERSATION_FINISHED", ""),
+
+		S3Endpoint:       envOr("S3_ENDPOINT", ""),
+		S3Bucket:         envOr("S3_BUCKET", ""),
+		S3Region:         envOr("S3_REGION", ""),
+		S3KeyPrefix:      envOr("S3_KEY_PREFIX", ""),
+		S3ForcePathStyle: fps,
+		S3AccessKeyID:    envOr("AWS_ACCESS_KEY_ID", ""),
+		S3SecretKey:      envOr("AWS_SECRET_ACCESS_KEY", ""),
+
+		ConversationObjectKey:   envOr("CONVERSATION_OBJECT_KEY", ""),
+		ConversationSessionID:   envOr("CONVERSATION_SESSION_ID", ""),
+		ConversationForkFromKey: envOr("CONVERSATION_FORK_FROM_KEY", ""),
 	}
 	if raw := os.Getenv("TATARA_REPOS"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.Repos); err != nil {
@@ -146,4 +190,31 @@ func envIntOr(k string, def int) (int, error) {
 		return 0, fmt.Errorf("env %s: %w", k, err)
 	}
 	return n, nil
+}
+
+func envBoolOr(k string, def bool) (bool, error) {
+	v, ok := os.LookupEnv(k)
+	if !ok {
+		return def, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("env %s: %w", k, err)
+	}
+	return b, nil
+}
+
+// S3Config maps the wrapper config to the storage client config. The
+// upload/restore wiring (subtask 4) constructs the client from this when
+// storage.Config.Enabled() (i.e. a bucket is set).
+func (c config) S3Config() storage.Config {
+	return storage.Config{
+		Endpoint:       c.S3Endpoint,
+		Bucket:         c.S3Bucket,
+		Region:         c.S3Region,
+		KeyPrefix:      c.S3KeyPrefix,
+		ForcePathStyle: c.S3ForcePathStyle,
+		AccessKeyID:    c.S3AccessKeyID,
+		SecretKey:      c.S3SecretKey,
+	}
 }

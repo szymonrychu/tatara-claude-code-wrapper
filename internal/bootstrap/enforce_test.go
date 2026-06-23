@@ -84,6 +84,30 @@ func TestRender_ChecksOutTaskBranchAfterClone(t *testing.T) {
 	require.Less(t, cloneIdx, coIdx, "checkout must run after clone")
 }
 
+func TestRender_ChecksOutCheckoutBranchWhenNoTaskBranch(t *testing.T) {
+	// MR review (issue #114 decision 4): no TaskBranch (so the turn finaliser
+	// never pushes), but CheckoutBranch is the PR head and must be checked out.
+	var calls [][]string
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		RepoURL:        "https://github.com/x/y",
+		RepoBranch:     "main",
+		CheckoutBranch: "feature/user-pr",
+		HookCommand:    "/usr/local/bin/cc-stop-hook", PermissionMode: "bypassPermissions",
+	}
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { calls = append(calls, a); return nil }))
+
+	var checkedOut bool
+	for _, c := range calls {
+		j := strings.Join(c, " ")
+		if strings.Contains(j, "checkout") && strings.Contains(j, "feature/user-pr") {
+			checkedOut = true
+		}
+	}
+	require.True(t, checkedOut, "CheckoutBranch (PR head) must be checked out when TaskBranch is empty")
+}
+
 func TestCommitAndPushAll_PushesEachRepoOnItsNamespaceDir(t *testing.T) {
 	var calls [][]string
 	git := func(dir string, a ...string) error {

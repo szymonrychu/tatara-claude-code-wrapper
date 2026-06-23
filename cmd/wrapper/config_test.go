@@ -48,3 +48,38 @@ func TestLoadConfig_EffortFromEnv(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "xhigh", cfg.Effort)
 }
+
+func TestLoadConfig_S3DefaultsOff(t *testing.T) {
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, "", cfg.S3Bucket)
+	require.False(t, cfg.S3ForcePathStyle)
+	require.False(t, cfg.S3Config().Enabled(), "no bucket => persistence off")
+}
+
+func TestLoadConfig_S3FromEnv(t *testing.T) {
+	t.Setenv("S3_ENDPOINT", "http://rook-ceph-rgw.tatara.svc")
+	t.Setenv("S3_BUCKET", "tatara-conversations")
+	t.Setenv("S3_REGION", "us-east-1")
+	t.Setenv("S3_KEY_PREFIX", "conv")
+	t.Setenv("S3_FORCE_PATH_STYLE", "true")
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIA_TEST")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	sc := cfg.S3Config()
+	require.True(t, sc.Enabled())
+	require.Equal(t, "http://rook-ceph-rgw.tatara.svc", sc.Endpoint)
+	require.Equal(t, "tatara-conversations", sc.Bucket)
+	require.Equal(t, "us-east-1", sc.Region)
+	require.Equal(t, "conv", sc.KeyPrefix)
+	require.True(t, sc.ForcePathStyle)
+	require.Equal(t, "AKIA_TEST", sc.AccessKeyID)
+	require.Equal(t, "secret", sc.SecretKey)
+}
+
+func TestLoadConfig_S3ForcePathStyleInvalid(t *testing.T) {
+	t.Setenv("S3_FORCE_PATH_STYLE", "notabool")
+	_, err := loadConfig(nil)
+	require.Error(t, err)
+}

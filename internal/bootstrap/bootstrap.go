@@ -35,7 +35,11 @@ type Params struct {
 	GitToken                        string // private-repo auth for clone + the agent's push (read from $GIT_TOKEN at runtime, never written to disk)
 	GitUserName, GitUserEmail       string // commit identity for the agent
 	TaskBranch                      string // work branch the operator opens the PR from; checked out after clone
-	Repos                           []RepoSpec
+	// CheckoutBranch is checked out (read-only, never pushed) after clone when
+	// TaskBranch is empty: an MR review agent works on the PR head but the turn
+	// finaliser only pushes when TaskBranch is set (issue #114 decision 4).
+	CheckoutBranch string
+	Repos          []RepoSpec
 
 	// Lifecycle hook commands (operator-supplied via the Project CRD, delivered
 	// as HOOK_* env vars). Empty means the hook is disabled. preClone/postClone
@@ -97,6 +101,13 @@ func Render(p Params, git GitRunner) error {
 	if err := os.MkdirAll(p.Workspace, 0o755); err != nil {
 		return fmt.Errorf("mkdir workspace: %w", err)
 	}
+	// Branch to check out after clone: the push branch (TaskBranch) when set, else
+	// a read-only CheckoutBranch (MR review on the PR head; never pushed because
+	// the turn finaliser only pushes when TaskBranch is set).
+	checkoutBranch := p.TaskBranch
+	if checkoutBranch == "" {
+		checkoutBranch = p.CheckoutBranch
+	}
 	if len(p.Repos) > 0 {
 		if err := configureGit(p, git); err != nil {
 			return err
@@ -150,12 +161,12 @@ func Render(p Params, git GitRunner) error {
 				}
 			}
 			action := "clone"
-			if p.TaskBranch != "" {
+			if checkoutBranch != "" {
 				// Surface checkout/resume failures for ALL repos (not just the
 				// primary): a secondary repo silently left on the wrong branch
 				// would make the agent commit the wrong state. Fail loud so the
 				// operator retries the run.
-				resumed, err := checkoutTaskBranch(dest, p.TaskBranch, git)
+				resumed, err := checkoutTaskBranch(dest, checkoutBranch, git)
 				if err != nil {
 					if p.M != nil {
 						p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
@@ -207,8 +218,8 @@ func Render(p Params, git GitRunner) error {
 			}
 		}
 		action := "clone"
-		if p.TaskBranch != "" {
-			resumed, err := checkoutTaskBranch(repoDest, p.TaskBranch, git)
+		if checkoutBranch != "" {
+			resumed, err := checkoutTaskBranch(repoDest, checkoutBranch, git)
 			if err != nil {
 				if p.M != nil {
 					p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
