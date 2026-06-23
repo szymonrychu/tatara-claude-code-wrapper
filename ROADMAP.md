@@ -9,6 +9,7 @@ HTTP API, webhook-or-poll turn delivery, bootstrap seeding (CLAUDE.md global+
 project, merged MCP, skills, `~/.claude.json` no-dialog seed, settings), boot
 dialog navigation, Stop-hook result capture, helm chart, modular Dockerfile.
 
+- SHIPPED (branch tatara/fix-114-...) - S3 conversation persistence (issue #114): internal/storage (AWS SDK v2 S3 client, AWS + Ceph RGW) + internal/convstore (cwd-dir derivation, upload-on-turn-finish, restore-on-boot via --resume, fork via copy-object), CHECKOUT_BRANCH read-only checkout for MR review, conversation pointer reported on the turn.Record callback. Gated on S3_BUCKET; awaiting deploy.
 - SHIPPED 2026-06-09 - SCM-projects MCP tools (propose_issue/review_verdict/pr_outcome) reach agents via the re-pinned baked tatara-cli 0.5.0; flow-through asserted by mcp_flowthrough_test.go.
 - SHIPPED 2026-06-11 - autonomous-cron: issue_outcome MCP tool flows through after cli bump 0.5.0 -> 0.6.0; guard extended; chart 0.1.9/appVersion 0.1.8.
 - SHIPPED 2026-06-11 - transcript streaming: Tailer+Redactor in internal/transcript; one agent_stream slog event per content block; ccw_stream_events_total counter; CCW_LOG_TRANSCRIPT=false disables; chart 0.1.13.
