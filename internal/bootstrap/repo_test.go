@@ -62,8 +62,9 @@ func TestCommitAndPush_UsesNoVerify(t *testing.T) {
 		return nil
 	}
 
-	err := bootstrap.CommitAndPush("/tmp/dir", "feat/x", "tatara agent: feat/x", fakeGit)
+	pushed, err := bootstrap.CommitAndPush("/tmp/dir", "feat/x", "tatara agent: feat/x", fakeGit)
 	require.NoError(t, err)
+	require.True(t, pushed, "dirty tree must report pushed=true")
 
 	commitCalls := callsContainingAll(calls, "commit")
 	require.NotEmpty(t, commitCalls, "git commit must be called")
@@ -94,8 +95,9 @@ func TestCommitAndPushAll_SkipsEmptyNamespace(t *testing.T) {
 		{Name: "bad-empty", URL: ""},                   // namespacePath returns ""
 		{Name: "bad-host", URL: "https://github.com/"}, // single-segment -> ""
 	}
-	err := bootstrap.CommitAndPushAll("/tmp/ws", repos, "feat/x", "msg", fakeGit)
+	pushedRepos, err := bootstrap.CommitAndPushAll("/tmp/ws", repos, "feat/x", "msg", fakeGit)
 	require.NoError(t, err)
+	require.Equal(t, []string{"good"}, pushedRepos, "only the valid-namespace repo must be reported pushed")
 
 	// Only the good repo should have had git add/commit/push
 	addCalls := callsContainingAll(calls, "add")
@@ -148,12 +150,39 @@ func TestCommitAndPush_CleanTree_NoPush(t *testing.T) {
 		return nil // all succeed, including diff -> clean
 	}
 
-	err := bootstrap.CommitAndPush("/tmp/dir", "feat/x", "msg", fakeGit)
+	pushed, err := bootstrap.CommitAndPush("/tmp/dir", "feat/x", "msg", fakeGit)
 	require.NoError(t, err)
+	require.False(t, pushed, "clean tree must report pushed=false")
 
 	commitCalls := callsContainingAll(calls, "commit")
 	require.Empty(t, commitCalls, "commit must be skipped on clean tree")
 
 	pushCalls := callsContainingAll(calls, "push")
 	require.Empty(t, pushCalls, "push must be skipped on clean tree")
+}
+
+// TestCommitAndPushAll_ReturnsOnlyDirtyRepos asserts the returned list contains
+// exactly the repos that had a diff and pushed; a clean repo is omitted.
+func TestCommitAndPushAll_ReturnsOnlyDirtyRepos(t *testing.T) {
+	// dirtyByDir[dir]=true makes "diff --cached --quiet" report dirty for that dir.
+	dirtyByDir := map[string]bool{
+		filepath.Join("/tmp/ws", "owner", "dirtyrepo"): true,
+	}
+	fakeGit := func(dir string, args ...string) error {
+		if len(args) >= 2 && args[0] == "diff" && args[1] == "--cached" {
+			if dirtyByDir[dir] {
+				return errFake("dirty")
+			}
+			return nil // clean
+		}
+		return nil
+	}
+
+	repos := []bootstrap.RepoSpec{
+		{Name: "dirty", URL: "https://github.com/owner/dirtyrepo"},
+		{Name: "clean", URL: "https://github.com/owner/cleanrepo"},
+	}
+	pushed, err := bootstrap.CommitAndPushAll("/tmp/ws", repos, "feat/x", "msg", fakeGit)
+	require.NoError(t, err)
+	require.Equal(t, []string{"dirty"}, pushed)
 }

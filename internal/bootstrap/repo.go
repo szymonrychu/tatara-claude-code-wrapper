@@ -43,32 +43,42 @@ func RepoDir(workspace, repoURL string) string {
 
 // CommitAndPush stages all changes, and when something is staged commits and
 // pushes the branch to origin. A clean tree is left untouched: nothing is
-// committed and nothing is pushed, so no empty remote branch is created.
-func CommitAndPush(dir, branch, message string, git GitRunner) error {
+// committed or pushed, so no empty remote branch is created. Returns pushed=true
+// only when a commit was made and the push succeeded.
+func CommitAndPush(dir, branch, message string, git GitRunner) (pushed bool, err error) {
 	if err := git(dir, "add", "-A"); err != nil {
-		return err
+		return false, err
 	}
 	// `diff --cached --quiet` exits zero (nil) when the tree is clean.
 	if git(dir, "diff", "--cached", "--quiet") == nil {
-		return nil
+		return false, nil
 	}
 	if err := git(dir, "commit", "--no-verify", "-m", message); err != nil {
-		return err
+		return false, err
 	}
-	return git(dir, "push", "--no-verify", "-u", "origin", branch)
+	if err := git(dir, "push", "--no-verify", "-u", "origin", branch); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-// CommitAndPushAll runs CommitAndPush in each repo dir under workspace.
-func CommitAndPushAll(workspace string, repos []RepoSpec, branch, message string, git GitRunner) error {
+// CommitAndPushAll runs CommitAndPush in each repo dir under workspace and
+// returns the Name of every repo that had a diff and pushed, so the caller can
+// report the exact touched-repo set to the operator.
+func CommitAndPushAll(workspace string, repos []RepoSpec, branch, message string, git GitRunner) (pushed []string, err error) {
 	for _, r := range repos {
 		ns := namespacePath(r.URL)
 		if ns == "" || filepath.Clean(filepath.Join(workspace, ns)) == filepath.Clean(workspace) {
 			continue // no valid namespace: skip to avoid operating on the workspace root
 		}
 		dir := filepath.Join(workspace, ns)
-		if err := CommitAndPush(dir, branch, message, git); err != nil {
-			return fmt.Errorf("commit/push %s: %w", r.Name, err)
+		ok, perr := CommitAndPush(dir, branch, message, git)
+		if perr != nil {
+			return pushed, fmt.Errorf("commit/push %s: %w", r.Name, perr)
+		}
+		if ok {
+			pushed = append(pushed, r.Name)
 		}
 	}
-	return nil
+	return pushed, nil
 }
