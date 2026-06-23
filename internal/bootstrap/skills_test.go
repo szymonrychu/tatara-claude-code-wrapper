@@ -10,7 +10,7 @@ import (
 
 func TestDiscoverySkillsPresentAndValid(t *testing.T) {
 	root := "../../templates/skills"
-	for _, name := range []string{"tatara-deep-research", "tatara-research-followup", "tatara-health-check"} {
+	for _, name := range []string{"tatara-deep-research", "tatara-research-followup", "tatara-health-check", "tatara-deep-architectural-research"} {
 		path := filepath.Join(root, name, "SKILL.md")
 		b, err := os.ReadFile(path)
 		if err != nil {
@@ -116,7 +116,7 @@ func TestInstallSkills_LogsShadowedSkill(t *testing.T) {
 
 func TestDiscoverySkillsCarryOrchestrationGuidance(t *testing.T) {
 	root := "../../templates/skills"
-	for _, name := range []string{"tatara-deep-research", "tatara-health-check"} {
+	for _, name := range []string{"tatara-deep-research", "tatara-health-check", "tatara-deep-architectural-research"} {
 		b, err := os.ReadFile(filepath.Join(root, name, "SKILL.md"))
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
@@ -161,5 +161,56 @@ func TestInstallSkills_CopiesDiscoverySkills(t *testing.T) {
 				t.Fatalf("%s: installed SKILL.md does not contain expected name", name)
 			}
 		})
+	}
+}
+
+func TestArchitecturalResearchSkillStructure(t *testing.T) {
+	b, err := os.ReadFile("../../templates/skills/tatara-deep-architectural-research/SKILL.md")
+	if err != nil {
+		t.Fatalf("read SKILL.md: %v", err)
+	}
+	s := string(b)
+
+	// Decision-tree step headers from design doc section 4(a).
+	for _, header := range []string{
+		"SCOPE",
+		"MAP INWARD",
+		"SURVEY",
+		"ASSESS FIT",
+		"NOVELTY",
+		"SYNTHESIZE",
+		"PROPOSE",
+	} {
+		if !strings.Contains(s, header) {
+			t.Fatalf("missing decision-tree step header %q", header)
+		}
+	}
+
+	// Cross-repo contract tool names.
+	for _, marker := range []string{
+		"skip_research",
+		"propose_issue",
+		"systemicId",
+	} {
+		if !strings.Contains(s, marker) {
+			t.Fatalf("missing cross-repo contract marker %q", marker)
+		}
+	}
+
+	// Phase-1 stub: SURVEY step is explicitly marked as deferred.
+	for _, stubMarker := range []string{
+		"field survey",
+		"not yet wired",
+	} {
+		if strings.Contains(s, stubMarker) {
+			goto stubOK
+		}
+	}
+	t.Fatalf("SURVEY step must carry a Phase-1 stub marker (field survey / not yet wired / external sources not yet available)")
+stubOK:
+
+	// ADR reference doc must be linked.
+	if !strings.Contains(s, "adr-template.md") {
+		t.Fatalf("SKILL.md must link to adr-template.md")
 	}
 }

@@ -345,6 +345,7 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		BaseMCP:         readBytesOrDefault(cfg.MCPBasePath, []byte(`{"mcpServers":{}}`)),
 		MCPOverlayDir:   cfg.MCPOverlayDir,
 		GrafanaMCPURL:   cfg.GrafanaMCPURL,
+		SerenaMCPURL:    cfg.SerenaMCPURL,
 		SkillsSrc:       strings.Split(cfg.SkillsSrcDirs, ":"),
 		HookCommand:     cfg.HookPath,
 		AllowedTools:    readLines(cfg.AllowedToolsPath),

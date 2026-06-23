@@ -24,6 +24,7 @@ type Params struct {
 	BaseMCP                         []byte
 	MCPOverlayDir                   string
 	GrafanaMCPURL                   string
+	SerenaMCPURL                    string
 	SkillsSrc                       []string
 	HookCommand                     string
 	AllowedTools                    []string
