@@ -34,6 +34,11 @@ type Record struct {
 	// Set by the app's turn finaliser only when conversation persistence is on.
 	SessionID             string `json:"sessionId,omitempty"`
 	ConversationObjectKey string `json:"conversationObjectKey,omitempty"`
+	// PushedRepos is the set of project repos this turn actually committed and
+	// pushed (had a diff). Reported to the operator on the callback so it knows
+	// which repos were touched in a multi-repo task (Defect A). Empty/absent for
+	// a turn that pushed nothing or a single-repo task with no diff.
+	PushedRepos []string `json:"pushedRepos,omitempty"`
 }
 
 // Summary is the compact form returned by List.

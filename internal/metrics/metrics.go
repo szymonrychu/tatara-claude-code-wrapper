@@ -34,6 +34,11 @@ type Metrics struct {
 	// Turn resume counter (rule 13: distinct fallible business action).
 	TurnResumes *prometheus.CounterVec // labels: result=ok|write_fail, resume_mode=nudge|complete_from_transcript
 
+	// Outcome-rejection re-prompt counter (rule 13): a critical outcome tool
+	// (decline_implementation/already_done) the operator rejected, surfaced back
+	// to the agent for correction instead of finishing the turn silently.
+	OutcomeRepromptTotal *prometheus.CounterVec // labels: tool, result=reprompted|budget_exhausted
+
 	// Bootstrap render counter (rule 13: per-step observability).
 	BootstrapRenderTotal *prometheus.CounterVec // label: result=ok|fail
 
@@ -97,6 +102,8 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_auth_total", Help: "Auth outcomes by result (ok|rejected)."}, []string{"result"}),
 		TurnResumes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_turn_resumes_total", Help: "Turn resume attempts by result (ok|write_fail) and mode (nudge|complete_from_transcript)."}, []string{"result", "resume_mode"}),
+		OutcomeRepromptTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_outcome_reprompt_total", Help: "Critical-outcome MCP tool rejections re-prompted to the agent, by tool and result."}, []string{"tool", "result"}),
 		BootstrapRenderTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_bootstrap_render_total", Help: "Bootstrap config-render steps by result (ok|fail)."}, []string{"result"}),
 		TurnTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -111,7 +118,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.BootstrapCloneTotal, m.BootstrapDuration, m.CommitPushTotal,
 		m.BootstrapHookInstall, m.LifecycleHookTotal, m.HookOutcome, m.MetricPushTotal,
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.HTTPInFlight, m.HTTPPanicsTotal,
-		m.AuthTotal, m.TurnResumes, m.BootstrapRenderTotal,
+		m.AuthTotal, m.TurnResumes, m.OutcomeRepromptTotal, m.BootstrapRenderTotal,
 		m.TurnTokensTotal, m.TurnCostUSD, m.ConversationOpsTotal)
 	return m
 }
