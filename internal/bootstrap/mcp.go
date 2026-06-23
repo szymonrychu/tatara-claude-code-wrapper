@@ -50,6 +50,10 @@ func mergeMCP(p Params) error {
 		entry, _ := json.Marshal(map[string]string{"type": "http", "url": p.GrafanaMCPURL})
 		merged.MCPServers["grafana"] = entry
 	}
+	if p.SerenaMCPURL != "" {
+		entry, _ := json.Marshal(map[string]string{"type": "http", "url": p.SerenaMCPURL})
+		merged.MCPServers["serena"] = entry
+	}
 	out, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal mcp: %w", err)
