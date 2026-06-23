@@ -16,7 +16,7 @@ BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # TATARA_CLI_VERSION pins the cli SHA baked into the image; keep in sync with
 # Dockerfile ARG default and Makefile default.  Use the short SHA published by
 # tatara-cli CI (both SHORT_SHA and VERSION tags are pushed on every main merge).
-TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-00e15f0}"
+TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-6f657d2}"
 DEST="harbor.szymonrichert.pl/containers/${REPO}"
 
 : "${GITHUB_TOKEN:?GITHUB_TOKEN required}"
