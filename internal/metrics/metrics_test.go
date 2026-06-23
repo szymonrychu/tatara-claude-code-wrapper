@@ -35,6 +35,32 @@ func TestNew_RegistersAllCollectors(t *testing.T) {
 	}
 }
 
+// TestMetrics_InternalIssueTotal_Registered asserts the new wrapper metric is
+// registered and carries the expected {category,severity} label pair.
+func TestMetrics_InternalIssueTotal_Registered(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	require.NotNil(t, m.InternalIssueTotal)
+	m.InternalIssueTotal.WithLabelValues("tool_error", "error").Inc()
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() == "tatara_wrapper_internal_issue_total" {
+			require.Len(t, mf.GetMetric(), 1)
+			lbls := map[string]string{}
+			for _, lp := range mf.GetMetric()[0].GetLabel() {
+				lbls[lp.GetName()] = lp.GetValue()
+			}
+			require.Equal(t, "tool_error", lbls["category"])
+			require.Equal(t, "error", lbls["severity"])
+			require.Equal(t, float64(1), mf.GetMetric()[0].GetCounter().GetValue())
+			return
+		}
+	}
+	t.Fatal("tatara_wrapper_internal_issue_total not found")
+}
+
 func TestMetrics_StreamEventsTotal(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := metrics.New(reg)
