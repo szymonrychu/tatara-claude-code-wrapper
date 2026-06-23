@@ -105,7 +105,8 @@ type internalIssueInput struct {
 
 // emitInternalIssue is called after the generic tool_use INFO log to emit the
 // additional ERROR/WARN log and increment the internal-issue counter. rawInput is
-// already redactor-scrubbed by the caller. Never panics.
+// the raw JSON from the transcript; free-text fields are scrubbed here before
+// logging. Never panics.
 func (t *Tailer) emitInternalIssue(turnID string, rawInput json.RawMessage) {
 	var in internalIssueInput
 	if err := json.Unmarshal(rawInput, &in); err != nil {
@@ -122,6 +123,12 @@ func (t *Tailer) emitInternalIssue(turnID string, rawInput json.RawMessage) {
 		}
 		return
 	}
+
+	// Scrub free-text fields before logging; Category/Severity are clamped to
+	// known enums and need no scrub.
+	in.Description = t.redactor.Scrub(in.Description)
+	in.OffendingTool = t.redactor.Scrub(in.OffendingTool)
+	in.ResourceID = t.redactor.Scrub(in.ResourceID)
 
 	// Clamp severity for the metric label; default to "error" on missing/unknown.
 	metricSeverity := in.Severity

@@ -1192,6 +1192,87 @@ func TestTailer_InternalIssue_AllCategories(t *testing.T) {
 	}
 }
 
+// TestTailer_InternalIssue_SecretFieldsRedacted verifies that secret values in
+// the description, offending_tool, and resource_id fields of an
+// internal_issue_report are scrubbed before logging. The generic agent_stream
+// INFO record still emits (tool_use), the distinct internal_issue_report record
+// must NOT contain the raw secret, and the counter must still be incremented.
+func TestTailer_InternalIssue_SecretFieldsRedacted(t *testing.T) {
+	fixtureVal := "ZZZ-FIXTURE-VALUE-0001"
+	input := `{"category":"tool_error","severity":"error","description":"value is ZZZ-FIXTURE-VALUE-0001 leaked","offending_tool":"ZZZ-FIXTURE-VALUE-0001","resource_id":"res/ZZZ-FIXTURE-VALUE-0001"}`
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	writeTranscriptLine(t, path, makeInternalIssueLine(input))
+
+	h := newCaptureHandler()
+	fc := &fakeInternalIssueCounter{}
+	tailer := NewTailer(slog.New(h), NewRedactor(map[string]string{"MY_KEY": fixtureVal}), func() string { return "turn-redact" }).
+		WithInternalIssueCounter(fc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	// agent_stream(tool_use) + internal_issue_report(ERROR) + message_end = 3 records
+	recs := waitForRecords(t, h, 3, 2*time.Second)
+	cancel()
+	<-done
+
+	// (a) generic agent_stream tool_use INFO still emits
+	agentStream := filterAgentStream(recs)
+	var hasToolUse bool
+	for _, r := range agentStream {
+		if r["stream_type"] == "tool_use" {
+			hasToolUse = true
+		}
+	}
+	if !hasToolUse {
+		t.Fatalf("no tool_use agent_stream record emitted, got: %v", agentStream)
+	}
+
+	// (b) internal_issue_report record must not contain raw secret
+	issueRecs := filterByAction(recs, "internal_issue_report")
+	if len(issueRecs) == 0 {
+		t.Fatalf("no internal_issue_report record emitted, got: %v", recs)
+	}
+	ir := issueRecs[0]
+
+	desc, _ := ir["description"].(string)
+	if strings.Contains(desc, fixtureVal) {
+		t.Errorf("secret leaked in description: %q", desc)
+	}
+	if !strings.Contains(desc, "[REDACTED:MY_KEY]") {
+		t.Errorf("description not redacted, got: %q", desc)
+	}
+
+	offTool, _ := ir["offending_tool"].(string)
+	if strings.Contains(offTool, fixtureVal) {
+		t.Errorf("secret leaked in offending_tool: %q", offTool)
+	}
+	if !strings.Contains(offTool, "[REDACTED:MY_KEY]") {
+		t.Errorf("offending_tool not redacted, got: %q", offTool)
+	}
+
+	resID, _ := ir["resource_id"].(string)
+	if strings.Contains(resID, fixtureVal) {
+		t.Errorf("secret leaked in resource_id: %q", resID)
+	}
+	if !strings.Contains(resID, "[REDACTED:MY_KEY]") {
+		t.Errorf("resource_id not redacted, got: %q", resID)
+	}
+
+	// (c) counter still incremented with correct labels
+	calls := fc.Calls()
+	if len(calls) == 0 {
+		t.Fatal("InternalIssueCounter not incremented")
+	}
+	if calls[0].category != "tool_error" || calls[0].severity != "error" {
+		t.Errorf("counter labels = (%q, %q), want (tool_error, error)", calls[0].category, calls[0].severity)
+	}
+}
+
 func TestTailer_RedactorAppliedToText(t *testing.T) {
 	// Craft a line where the text field contains a secret
 	secretVal := "supersecrettoken9999"
