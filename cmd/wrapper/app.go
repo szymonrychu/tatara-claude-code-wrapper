@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,9 +22,15 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/pushclient"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/storage"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/transcript"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/webhook"
 )
+
+// maxOutcomeReprompts bounds how many times this pod re-prompts the agent after
+// the operator rejects a critical-outcome tool call. Beyond this the finaliser
+// delivers the callback normally and the operator's empty-retry cap takes over.
+const maxOutcomeReprompts = 2
 
 type app struct {
 	log      *slog.Logger
@@ -39,6 +46,17 @@ type app struct {
 	// finishHook runs the conversationFinished lifecycle hook during shutdown,
 	// bounded so a slow hook cannot stall teardown. Nil is a safe no-op.
 	finishHook func(context.Context)
+	// repromptMu guards outcomeReprompts, the per-pod count of times a rejected
+	// critical-outcome MCP tool call (decline_implementation/already_done) was
+	// surfaced back to the agent via a re-prompt instead of finishing the turn
+	// silently (Defect C). Capped at maxOutcomeReprompts so a perpetually-failing
+	// agent still reaches the operator's empty-retry cap rather than looping here.
+	repromptMu       sync.Mutex
+	outcomeReprompts int
+	// submitFn is the turn-submit primitive reprompt() uses; production wires it
+	// to a.sess.Submit. Injectable so the re-prompt budget logic is unit-testable
+	// without a live PTY session.
+	submitFn func(text, callbackURL string) (string, error)
 }
 
 func newApp(ctx context.Context, cfg config) (*app, error) {
@@ -149,6 +167,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 				cfg.HookConversationFinished, 5*time.Second)
 		},
 	}
+	a.submitFn = a.sess.Submit
 
 	sess.OnTurnDone = func(rec *turn.Record) {
 		// Run the whole finalisation off the cc-stop-hook HTTP request goroutine:
@@ -168,7 +187,9 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 				pushStart := time.Now()
 				var err error
 				if len(cfg.Repos) > 0 {
-					_, err = bootstrap.CommitAndPushAll(cfg.Workspace, cfg.Repos, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
+					var pushedRepos []string
+					pushedRepos, err = bootstrap.CommitAndPushAll(cfg.Workspace, cfg.Repos, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
+					rec.PushedRepos = pushedRepos
 				} else {
 					// Single-repo clones into workspace/<owner>/<repo>, not the
 					// workspace root, so commit/push must target that subdir.
@@ -176,7 +197,11 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 					if repoDir == "" {
 						err = fmt.Errorf("cannot derive repo dir from REPO_URL %q for commit/push", cfg.RepoURL)
 					} else {
-						_, err = bootstrap.CommitAndPush(repoDir, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
+						var pushed bool
+						pushed, err = bootstrap.CommitAndPush(repoDir, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
+						if pushed {
+							rec.PushedRepos = []string{primaryRepoName(cfg)}
+						}
 					}
 				}
 				if err != nil {
@@ -184,7 +209,8 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 					log.Error("commit/push failed", "action", "commit_push", "branch", cfg.TaskBranch, "error", err, "duration_ms", time.Since(pushStart).Milliseconds())
 				} else {
 					m.CommitPushTotal.WithLabelValues("ok").Inc()
-					log.Info("commit/push succeeded", "action", "commit_push", "branch", cfg.TaskBranch, "duration_ms", time.Since(pushStart).Milliseconds())
+					log.Info("commit/push succeeded", "action", "commit_push", "branch", cfg.TaskBranch,
+						"pushed_repos", rec.PushedRepos, "duration_ms", time.Since(pushStart).Milliseconds())
 				}
 			}
 
@@ -212,6 +238,31 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 						log.Info("conversation uploaded", "action", "conversation_upload",
 							"key", cfg.ConversationObjectKey, "duration_ms", time.Since(upStart).Milliseconds())
 					}
+				}
+			}
+
+			// Defect C: a critical outcome tool (decline_implementation/already_done)
+			// the operator rejected (e.g. blank reason -> 400) shows up in the turn
+			// transcript as an is_error tool_result. Rather than let the turn finish
+			// silently (which the operator misreads as "refused-no-explanation"),
+			// re-prompt the agent to retry with a non-blank reason, and skip THIS
+			// turn's callback - the re-prompted turn delivers its own. Bounded by
+			// maxOutcomeReprompts so a stuck agent still reaches the operator's cap.
+			if path := a.sess.TranscriptPath(); path != "" {
+				toolName, errText, found, ferr := transcript.FailedCriticalOutcome(path)
+				if ferr != nil {
+					log.Warn("outcome-reprompt scan failed; delivering callback as-is",
+						"action", "outcome_reprompt", "turn_id", rec.ID, "error", ferr)
+				} else if found {
+					if a.reprompt(toolName, errText, rec.CallbackURL) {
+						m.OutcomeRepromptTotal.WithLabelValues(toolName, "reprompted").Inc()
+						log.Info("re-prompted agent after rejected outcome tool; suppressing this turn's callback",
+							"action", "outcome_reprompt", "turn_id", rec.ID, "tool", toolName, "error", errText)
+						return
+					}
+					m.OutcomeRepromptTotal.WithLabelValues(toolName, "budget_exhausted").Inc()
+					log.Warn("outcome re-prompt budget exhausted; delivering callback so the operator cap applies",
+						"action", "outcome_reprompt", "turn_id", rec.ID, "tool", toolName)
 				}
 			}
 
@@ -479,3 +530,43 @@ func readLines(p string) []string {
 }
 
 func newTurnID() string { return "turn-" + strconv.FormatInt(time.Now().UnixNano(), 36) }
+
+// reprompt submits a corrective turn telling the agent its critical outcome
+// tool call was rejected and must be retried with a non-blank reason. It returns
+// true when a re-prompt was issued, false when the budget is exhausted or the
+// session would not accept a new turn (in which case the caller delivers the
+// callback so the operator's empty-retry cap applies). The corrective text reuses
+// the same callback URL so the eventual completion still reaches the operator.
+func (a *app) reprompt(tool, errText, callbackURL string) bool {
+	a.repromptMu.Lock()
+	if a.outcomeReprompts >= maxOutcomeReprompts {
+		a.repromptMu.Unlock()
+		return false
+	}
+	a.outcomeReprompts++
+	a.repromptMu.Unlock()
+
+	msg := fmt.Sprintf("Your %s call was rejected by the operator: %s. "+
+		"This is mandatory: call %s again with a clear, non-blank `reason` explaining the decision. "+
+		"Do not finish the turn until the call succeeds.", tool, strings.TrimSpace(errText), tool)
+	if _, err := a.submitFn(msg, callbackURL); err != nil {
+		// Roll back the budget consumption: no turn was actually submitted.
+		a.repromptMu.Lock()
+		a.outcomeReprompts--
+		a.repromptMu.Unlock()
+		a.log.Warn("outcome re-prompt submit failed; delivering callback instead",
+			"action", "outcome_reprompt", "tool", tool, "error", err)
+		return false
+	}
+	return true
+}
+
+// primaryRepoName is the human-facing name of the single repo a non-cross-repo
+// pod is bound to, derived from the namespace path of REPO_URL ("owner/repo").
+// Used to populate PushedRepos in single-repo mode where there is no RepoSpec.
+func primaryRepoName(cfg config) string {
+	if dir := bootstrap.RepoDir(cfg.Workspace, cfg.RepoURL); dir != "" {
+		return filepath.Base(dir)
+	}
+	return cfg.RepoURL
+}
