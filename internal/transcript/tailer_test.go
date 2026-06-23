@@ -11,6 +11,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // captureHandler is a slog.Handler that records all log entries.
@@ -849,6 +852,424 @@ func TestTailer_ReadErrorDoesNotKillTailer(t *testing.T) {
 	}
 	if !hasToolUse {
 		t.Fatalf("tailer did not recover after read error; tool_use event missing, got: %v", stream)
+	}
+}
+
+// fakeInternalIssueCounter is a test double for InternalIssueCounter.
+type fakeInternalIssueCounter struct {
+	mu   sync.Mutex
+	hits []struct{ category, severity string }
+}
+
+func (f *fakeInternalIssueCounter) WithLabelValues(lvs ...string) prometheus.Counter {
+	f.mu.Lock()
+	cat, sev := "", ""
+	if len(lvs) > 0 {
+		cat = lvs[0]
+	}
+	if len(lvs) > 1 {
+		sev = lvs[1]
+	}
+	f.hits = append(f.hits, struct{ category, severity string }{cat, sev})
+	f.mu.Unlock()
+	return &noopCounter{}
+}
+
+func (f *fakeInternalIssueCounter) Calls() []struct{ category, severity string } {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]struct{ category, severity string }, len(f.hits))
+	copy(out, f.hits)
+	return out
+}
+
+// noopCounter implements prometheus.Counter with no-ops.
+type noopCounter struct{}
+
+func (n *noopCounter) Desc() *prometheus.Desc              { return nil }
+func (n *noopCounter) Write(*dto.Metric) error             { return nil }
+func (n *noopCounter) Describe(ch chan<- *prometheus.Desc) {}
+func (n *noopCounter) Collect(ch chan<- prometheus.Metric) {}
+func (n *noopCounter) Inc()                                {}
+func (n *noopCounter) Add(float64)                         {}
+
+// makeInternalIssueLine returns a transcript line for tool_use of
+// report_internal_issue with the given JSON input string.
+func makeInternalIssueLine(inputJSON string) string {
+	return `{"type":"assistant","uuid":"uuid-ii-1","sessionId":"sess-ii","timestamp":"2026-06-23T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_ii","name":"mcp__tatara__report_internal_issue","input":` + inputJSON + `}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":2}}}`
+}
+
+// filterByAction returns records matching the given action field.
+func filterByAction(recs []map[string]any, action string) []map[string]any {
+	var out []map[string]any
+	for _, r := range recs {
+		if r["action"] == action {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestInternalIssueToolNameConst asserts the match string is the exact namespaced
+// tool name. If the cli server name or tool name changes, the wrapper silently
+// stops emitting; this test catches the drift.
+func TestInternalIssueToolNameConst(t *testing.T) {
+	const want = "mcp__tatara__report_internal_issue"
+	if internalIssueToolName != want {
+		t.Errorf("internalIssueToolName = %q, want %q", internalIssueToolName, want)
+	}
+}
+
+// TestTailer_InternalIssue_ValidInput verifies that a tool_use block named
+// mcp__tatara__report_internal_issue causes:
+// (a) the generic agent_stream INFO line still emits (stream_type=tool_use),
+// (b) a distinct ERROR record with action=internal_issue_report + correct fields,
+// (c) InternalIssueCounter incremented with clamped labels.
+func TestTailer_InternalIssue_ValidInput(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	input := `{"category":"tool_error","severity":"error","description":"the tool blew up","offending_tool":"Bash","resource_id":"res-1"}`
+	writeTranscriptLine(t, path, makeInternalIssueLine(input))
+
+	h := newCaptureHandler()
+	fc := &fakeInternalIssueCounter{}
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "turn-ii" }).
+		WithInternalIssueCounter(fc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	// agent_stream(tool_use) + internal_issue_report(ERROR) + message_end = 3 records
+	recs := waitForRecords(t, h, 3, 2*time.Second)
+	cancel()
+	<-done
+
+	// (a) generic agent_stream tool_use INFO still emits
+	agentStream := filterAgentStream(recs)
+	var hasToolUse bool
+	for _, r := range agentStream {
+		if r["stream_type"] == "tool_use" {
+			hasToolUse = true
+			if r["tool"] != "mcp__tatara__report_internal_issue" {
+				t.Errorf("tool=%v, want mcp__tatara__report_internal_issue", r["tool"])
+			}
+		}
+	}
+	if !hasToolUse {
+		t.Fatalf("no tool_use agent_stream record emitted, got: %v", agentStream)
+	}
+
+	// (b) distinct internal_issue_report ERROR record
+	issueRecs := filterByAction(recs, "internal_issue_report")
+	if len(issueRecs) == 0 {
+		t.Fatalf("no internal_issue_report record emitted, got: %v", recs)
+	}
+	ir := issueRecs[0]
+	if ir["level"] != "ERROR" {
+		t.Errorf("level=%v, want ERROR", ir["level"])
+	}
+	if ir["category"] != "tool_error" {
+		t.Errorf("category=%v, want tool_error", ir["category"])
+	}
+	if ir["severity"] != "error" {
+		t.Errorf("severity=%v, want error", ir["severity"])
+	}
+	if ir["description"] != "the tool blew up" {
+		t.Errorf("description=%v, want 'the tool blew up'", ir["description"])
+	}
+	if ir["offending_tool"] != "Bash" {
+		t.Errorf("offending_tool=%v, want Bash", ir["offending_tool"])
+	}
+	if ir["resource_id"] != "res-1" {
+		t.Errorf("resource_id=%v, want res-1", ir["resource_id"])
+	}
+
+	// (c) counter incremented with correct labels
+	calls := fc.Calls()
+	if len(calls) == 0 {
+		t.Fatal("InternalIssueCounter not incremented")
+	}
+	if calls[0].category != "tool_error" || calls[0].severity != "error" {
+		t.Errorf("counter labels = (%q, %q), want (tool_error, error)", calls[0].category, calls[0].severity)
+	}
+}
+
+// TestTailer_InternalIssue_WarnSeverity verifies warn severity maps to Warn log level.
+func TestTailer_InternalIssue_WarnSeverity(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	input := `{"category":"workspace_broken","severity":"warn","description":"workspace smells wrong"}`
+	writeTranscriptLine(t, path, makeInternalIssueLine(input))
+
+	h := newCaptureHandler()
+	fc := &fakeInternalIssueCounter{}
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "" }).
+		WithInternalIssueCounter(fc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+	// agent_stream(tool_use) + internal_issue_report(WARN) + message_end = 3 records
+	recs := waitForRecords(t, h, 3, 2*time.Second)
+	cancel()
+	<-done
+
+	issueRecs := filterByAction(recs, "internal_issue_report")
+	if len(issueRecs) == 0 {
+		t.Fatalf("no internal_issue_report record, got: %v", recs)
+	}
+	if issueRecs[0]["level"] != "WARN" {
+		t.Errorf("level=%v, want WARN for severity=warn", issueRecs[0]["level"])
+	}
+	calls := fc.Calls()
+	if len(calls) == 0 || calls[0].severity != "warn" {
+		t.Errorf("counter severity=%v, want warn", calls)
+	}
+}
+
+// TestTailer_InternalIssue_MissingSeverityDefaultsError verifies missing severity
+// defaults to error.
+func TestTailer_InternalIssue_MissingSeverityDefaultsError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	input := `{"category":"auth","description":"auth broke"}`
+	writeTranscriptLine(t, path, makeInternalIssueLine(input))
+
+	h := newCaptureHandler()
+	fc := &fakeInternalIssueCounter{}
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "" }).
+		WithInternalIssueCounter(fc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+	recs := waitForRecords(t, h, 3, 2*time.Second)
+	cancel()
+	<-done
+
+	issueRecs := filterByAction(recs, "internal_issue_report")
+	if len(issueRecs) == 0 {
+		t.Fatalf("no internal_issue_report record, got: %v", recs)
+	}
+	if issueRecs[0]["level"] != "ERROR" {
+		t.Errorf("level=%v, want ERROR for missing severity", issueRecs[0]["level"])
+	}
+	calls := fc.Calls()
+	if len(calls) == 0 || calls[0].severity != "error" {
+		t.Errorf("counter severity=%v, want error (default)", calls)
+	}
+}
+
+// TestTailer_InternalIssue_UnknownCategoryClampedToOther verifies unknown
+// category is clamped to "other" in the counter but raw value is logged.
+func TestTailer_InternalIssue_UnknownCategoryClampedToOther(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	input := `{"category":"totally_unknown_future_thing","severity":"error","description":"weird thing"}`
+	writeTranscriptLine(t, path, makeInternalIssueLine(input))
+
+	h := newCaptureHandler()
+	fc := &fakeInternalIssueCounter{}
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "" }).
+		WithInternalIssueCounter(fc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+	recs := waitForRecords(t, h, 3, 2*time.Second)
+	cancel()
+	<-done
+
+	// Counter must use clamped label
+	calls := fc.Calls()
+	if len(calls) == 0 || calls[0].category != "other" {
+		t.Errorf("counter category=%v, want other for unknown input", calls)
+	}
+	// Log carries raw unclamped value for queryability
+	issueRecs := filterByAction(recs, "internal_issue_report")
+	if len(issueRecs) == 0 {
+		t.Fatalf("no internal_issue_report record, got: %v", recs)
+	}
+	if issueRecs[0]["category"] != "totally_unknown_future_thing" {
+		t.Errorf("log category=%v, want raw unclamped value", issueRecs[0]["category"])
+	}
+}
+
+// TestTailer_InternalIssue_MalformedJSONLogsErrorAndCounts verifies that a
+// malformed input JSON causes an ERROR log with parse_error field and counter
+// increment (category=other, severity=error) without panic.
+func TestTailer_InternalIssue_MalformedJSONLogsErrorAndCounts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	// valid outer transcript but the tool_use Input field is invalid JSON embedded
+	// as a raw string that the content block unmarshal captures as RawMessage, then
+	// emitInternalIssue fails to unmarshal it further.
+	input := `"not an object at all"`
+	writeTranscriptLine(t, path, makeInternalIssueLine(input))
+
+	h := newCaptureHandler()
+	fc := &fakeInternalIssueCounter{}
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "" }).
+		WithInternalIssueCounter(fc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+	// agent_stream(tool_use) + internal_issue_report(ERROR parse_error) + message_end = 3 records
+	recs := waitForRecords(t, h, 3, 2*time.Second)
+	cancel()
+	<-done
+
+	// Counter must still be incremented (never drop the signal)
+	calls := fc.Calls()
+	if len(calls) == 0 {
+		t.Fatal("InternalIssueCounter not incremented on malformed JSON")
+	}
+	if calls[0].category != "other" || calls[0].severity != "error" {
+		t.Errorf("counter labels = (%q, %q), want (other, error) on parse failure", calls[0].category, calls[0].severity)
+	}
+
+	// Must emit an ERROR log with parse_error field
+	issueRecs := filterByAction(recs, "internal_issue_report")
+	if len(issueRecs) == 0 {
+		t.Fatalf("no internal_issue_report record on parse failure, got: %v", recs)
+	}
+	ir := issueRecs[0]
+	if ir["level"] != "ERROR" {
+		t.Errorf("level=%v, want ERROR on parse failure", ir["level"])
+	}
+	if ir["parse_error"] == nil || ir["parse_error"] == "" {
+		t.Errorf("expected parse_error field on parse failure, got: %v", ir)
+	}
+}
+
+// TestTailer_InternalIssue_AllCategories verifies each valid category passes
+// through without clamping.
+func TestTailer_InternalIssue_AllCategories(t *testing.T) {
+	categories := []string{
+		"tool_error", "directive_contradiction", "workspace_broken",
+		"memory_inconsistent", "graph_inconsistent", "auth", "other",
+	}
+	for _, cat := range categories {
+		cat := cat
+		t.Run(cat, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "transcript.jsonl")
+			input := `{"category":"` + cat + `","severity":"error","description":"test ` + cat + `"}`
+			writeTranscriptLine(t, path, makeInternalIssueLine(input))
+
+			h := newCaptureHandler()
+			fc := &fakeInternalIssueCounter{}
+			tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "" }).
+				WithInternalIssueCounter(fc)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- tailer.Follow(ctx, path) }()
+			recs := waitForRecords(t, h, 3, 2*time.Second)
+			cancel()
+			<-done
+
+			calls := fc.Calls()
+			if len(calls) == 0 {
+				t.Fatalf("counter not incremented for category=%s", cat)
+			}
+			if calls[0].category != cat {
+				t.Errorf("counter category=%q, want %q", calls[0].category, cat)
+			}
+			issueRecs := filterByAction(recs, "internal_issue_report")
+			if len(issueRecs) == 0 {
+				t.Fatalf("no internal_issue_report record for category=%s, got: %v", cat, recs)
+			}
+		})
+	}
+}
+
+// TestTailer_InternalIssue_SecretFieldsRedacted verifies that secret values in
+// the description, offending_tool, and resource_id fields of an
+// internal_issue_report are scrubbed before logging. The generic agent_stream
+// INFO record still emits (tool_use), the distinct internal_issue_report record
+// must NOT contain the raw secret, and the counter must still be incremented.
+func TestTailer_InternalIssue_SecretFieldsRedacted(t *testing.T) {
+	fixtureVal := "ZZZ-FIXTURE-VALUE-0001"
+	input := `{"category":"tool_error","severity":"error","description":"value is ZZZ-FIXTURE-VALUE-0001 leaked","offending_tool":"ZZZ-FIXTURE-VALUE-0001","resource_id":"res/ZZZ-FIXTURE-VALUE-0001"}`
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	writeTranscriptLine(t, path, makeInternalIssueLine(input))
+
+	h := newCaptureHandler()
+	fc := &fakeInternalIssueCounter{}
+	tailer := NewTailer(slog.New(h), NewRedactor(map[string]string{"MY_KEY": fixtureVal}), func() string { return "turn-redact" }).
+		WithInternalIssueCounter(fc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	// agent_stream(tool_use) + internal_issue_report(ERROR) + message_end = 3 records
+	recs := waitForRecords(t, h, 3, 2*time.Second)
+	cancel()
+	<-done
+
+	// (a) generic agent_stream tool_use INFO still emits
+	agentStream := filterAgentStream(recs)
+	var hasToolUse bool
+	for _, r := range agentStream {
+		if r["stream_type"] == "tool_use" {
+			hasToolUse = true
+		}
+	}
+	if !hasToolUse {
+		t.Fatalf("no tool_use agent_stream record emitted, got: %v", agentStream)
+	}
+
+	// (b) internal_issue_report record must not contain raw secret
+	issueRecs := filterByAction(recs, "internal_issue_report")
+	if len(issueRecs) == 0 {
+		t.Fatalf("no internal_issue_report record emitted, got: %v", recs)
+	}
+	ir := issueRecs[0]
+
+	desc, _ := ir["description"].(string)
+	if strings.Contains(desc, fixtureVal) {
+		t.Errorf("secret leaked in description: %q", desc)
+	}
+	if !strings.Contains(desc, "[REDACTED:MY_KEY]") {
+		t.Errorf("description not redacted, got: %q", desc)
+	}
+
+	offTool, _ := ir["offending_tool"].(string)
+	if strings.Contains(offTool, fixtureVal) {
+		t.Errorf("secret leaked in offending_tool: %q", offTool)
+	}
+	if !strings.Contains(offTool, "[REDACTED:MY_KEY]") {
+		t.Errorf("offending_tool not redacted, got: %q", offTool)
+	}
+
+	resID, _ := ir["resource_id"].(string)
+	if strings.Contains(resID, fixtureVal) {
+		t.Errorf("secret leaked in resource_id: %q", resID)
+	}
+	if !strings.Contains(resID, "[REDACTED:MY_KEY]") {
+		t.Errorf("resource_id not redacted, got: %q", resID)
+	}
+
+	// (c) counter still incremented with correct labels
+	calls := fc.Calls()
+	if len(calls) == 0 {
+		t.Fatal("InternalIssueCounter not incremented")
+	}
+	if calls[0].category != "tool_error" || calls[0].severity != "error" {
+		t.Errorf("counter labels = (%q, %q), want (tool_error, error)", calls[0].category, calls[0].severity)
 	}
 }
 

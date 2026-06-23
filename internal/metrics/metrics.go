@@ -51,6 +51,9 @@ type Metrics struct {
 	// Conversation persistence (issue #114): upload-on-turn-finish and
 	// restore-on-boot of the S3 transcript blob.
 	ConversationOpsTotal *prometheus.CounterVec // labels: op=upload|restore, result=ok|fail|skip
+
+	// Internal issue reports from agents via the report_internal_issue MCP tool.
+	InternalIssueTotal *prometheus.CounterVec // labels: category, severity
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -112,6 +115,8 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_turn_cost_usd_total", Help: "Cumulative Claude turn cost in USD (from result.json total_cost_usd when present)."}),
 		ConversationOpsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_conversation_ops_total", Help: "Conversation transcript persistence operations by op and result."}, []string{"op", "result"}),
+		InternalIssueTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tatara_wrapper_internal_issue_total", Help: "Agent-reported internal issues observed by the wrapper tailer, by category and severity."}, []string{"category", "severity"}),
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
 		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal, m.Interjections,
@@ -119,6 +124,6 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.BootstrapHookInstall, m.LifecycleHookTotal, m.HookOutcome, m.MetricPushTotal,
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.HTTPInFlight, m.HTTPPanicsTotal,
 		m.AuthTotal, m.TurnResumes, m.OutcomeRepromptTotal, m.BootstrapRenderTotal,
-		m.TurnTokensTotal, m.TurnCostUSD, m.ConversationOpsTotal)
+		m.TurnTokensTotal, m.TurnCostUSD, m.ConversationOpsTotal, m.InternalIssueTotal)
 	return m
 }

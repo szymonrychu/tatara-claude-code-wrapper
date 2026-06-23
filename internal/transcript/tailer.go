@@ -14,6 +14,23 @@ import (
 
 const pollInterval = 200 * time.Millisecond
 
+// internalIssueToolName is the exact namespaced MCP tool name as Claude sees it.
+// The cli server registers as "tatara", so block.Name == mcp__tatara__<tool>.
+// If either the server name or tool name changes in the cli, the wrapper silently
+// stops emitting; TestInternalIssueToolNameConst guards this coupling.
+const internalIssueToolName = "mcp__tatara__report_internal_issue"
+
+// knownIssueCategories is the fixed cardinality set for issue category labels.
+var knownIssueCategories = map[string]bool{
+	"tool_error": true, "directive_contradiction": true, "workspace_broken": true,
+	"memory_inconsistent": true, "graph_inconsistent": true, "auth": true, "other": true,
+}
+
+// knownIssueSeverities is the fixed cardinality set for issue severity labels.
+var knownIssueSeverities = map[string]bool{
+	"warn": true, "error": true,
+}
+
 // maxPartialBytes caps the in-memory accumulator for partial (non-newline-
 // terminated) lines. Matches the 16 MiB scanner limit used by the stop-hook
 // reader in transcript.go. Exceeding this emits a raw event and resets
@@ -25,15 +42,23 @@ type StreamCounter interface {
 	WithLabelValues(lvs ...string) prometheus.Counter
 }
 
+// InternalIssueCounter is satisfied by *prometheus.CounterVec with labels
+// {category, severity}. It is a distinct interface from StreamCounter so the
+// call site is explicit about the 2-label shape.
+type InternalIssueCounter interface {
+	WithLabelValues(lvs ...string) prometheus.Counter
+}
+
 // Tailer reads a JSONL transcript file from the start and follows appends.
 // It re-opens the file on inode change (claude restart) and never drops a
 // malformed line (emits a raw event instead).
 type Tailer struct {
-	log        *slog.Logger
-	redactor   *Redactor
-	turnID     func() string
-	counter    StreamCounter
-	onActivity func(turnID string)
+	log                  *slog.Logger
+	redactor             *Redactor
+	turnID               func() string
+	counter              StreamCounter
+	internalIssueCounter InternalIssueCounter
+	onActivity           func(turnID string)
 }
 
 // NewTailer constructs a Tailer. turnID is called per event to get the current
@@ -48,6 +73,13 @@ func (t *Tailer) WithCounter(c StreamCounter) *Tailer {
 	return t
 }
 
+// WithInternalIssueCounter attaches a 2-label {category,severity} counter for
+// report_internal_issue tool calls. nil-safe, returns self for chaining.
+func (t *Tailer) WithInternalIssueCounter(c InternalIssueCounter) *Tailer {
+	t.internalIssueCounter = c
+	return t
+}
+
 // WithActivity attaches a hook fired once per processed transcript line that
 // carries an in-flight turn id. It is the per-turn liveness heartbeat the
 // session uses to reset its inactivity deadline. Returns self for chaining.
@@ -59,6 +91,81 @@ func (t *Tailer) WithActivity(fn func(turnID string)) *Tailer {
 func (t *Tailer) incCounter(streamType string) {
 	if t.counter != nil {
 		t.counter.WithLabelValues(streamType).Inc() //nolint:errcheck
+	}
+}
+
+// internalIssueInput is the JSON-deserialized body of a report_internal_issue call.
+type internalIssueInput struct {
+	Category      string `json:"category"`
+	Severity      string `json:"severity"`
+	Description   string `json:"description"`
+	OffendingTool string `json:"offending_tool"`
+	ResourceID    string `json:"resource_id"`
+}
+
+// emitInternalIssue is called after the generic tool_use INFO log to emit the
+// additional ERROR/WARN log and increment the internal-issue counter. rawInput is
+// the raw JSON from the transcript; free-text fields are scrubbed here before
+// logging. Never panics.
+func (t *Tailer) emitInternalIssue(turnID string, rawInput json.RawMessage) {
+	var in internalIssueInput
+	if err := json.Unmarshal(rawInput, &in); err != nil {
+		// Parse failure: log ERROR with parse_error field, still count.
+		t.log.Error("internal issue report",
+			"action", "internal_issue_report",
+			"category", "other",
+			"severity", "error",
+			"parse_error", err.Error(),
+			"turn_id", turnID,
+		)
+		if t.internalIssueCounter != nil {
+			t.internalIssueCounter.WithLabelValues("other", "error").Inc() //nolint:errcheck
+		}
+		return
+	}
+
+	// Scrub free-text fields before logging; Category/Severity are clamped to
+	// known enums and need no scrub.
+	in.Description = t.redactor.Scrub(in.Description)
+	in.OffendingTool = t.redactor.Scrub(in.OffendingTool)
+	in.ResourceID = t.redactor.Scrub(in.ResourceID)
+
+	// Clamp severity for the metric label; default to "error" on missing/unknown.
+	metricSeverity := in.Severity
+	if !knownIssueSeverities[metricSeverity] {
+		metricSeverity = "error"
+	}
+
+	// Clamp category for the metric label; default to "other" on unknown.
+	metricCategory := in.Category
+	if !knownIssueCategories[metricCategory] {
+		metricCategory = "other"
+	}
+
+	// Log at the level matching severity. Log carries raw (unclamped) values for
+	// full queryability; only the counter uses clamped labels.
+	logArgs := []any{
+		"action", "internal_issue_report",
+		"category", in.Category,
+		"severity", metricSeverity,
+		"description", in.Description,
+		"turn_id", turnID,
+	}
+	if in.OffendingTool != "" {
+		logArgs = append(logArgs, "offending_tool", in.OffendingTool)
+	}
+	if in.ResourceID != "" {
+		logArgs = append(logArgs, "resource_id", in.ResourceID)
+	}
+
+	if metricSeverity == "warn" {
+		t.log.Warn("internal issue report", logArgs...)
+	} else {
+		t.log.Error("internal issue report", logArgs...)
+	}
+
+	if t.internalIssueCounter != nil {
+		t.internalIssueCounter.WithLabelValues(metricCategory, metricSeverity).Inc() //nolint:errcheck
 	}
 }
 
@@ -348,6 +455,9 @@ func (t *Tailer) processLine(raw []byte) {
 				"input", inputStr,
 			)
 			t.incCounter("tool_use")
+			if block.Name == internalIssueToolName {
+				t.emitInternalIssue(turnID, block.Input)
+			}
 		case "tool_result":
 			contentStr := t.redactor.Scrub(string(block.Content))
 			t.log.Info("agent stream",
