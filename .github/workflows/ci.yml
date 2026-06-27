@@ -7,106 +7,11 @@ on:
     branches: [main]
 
 jobs:
-  secscan:
-    runs-on: tatara-claude-code-wrapper
-    steps:
-      - uses: actions/checkout@v4
-      - name: gitleaks
-        run: |
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz" \
-            | tar -xzf - gitleaks
-          ./gitleaks detect --source . --no-git --redact --verbose
-
-  lint:
-    runs-on: tatara-claude-code-wrapper
-    steps:
-      - uses: actions/checkout@v4
-      - name: build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
-      - uses: jdx/mise-action@v2
-        with:
-          cache: true
-      - run: pre-commit run --all-files
-
-  test:
-    runs-on: tatara-claude-code-wrapper
-    steps:
-      - uses: actions/checkout@v4
-      - name: build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
-      - uses: jdx/mise-action@v2
-        with:
-          cache: true
-      - run: mise run test
-
-  build:
-    runs-on: tatara-claude-code-wrapper
-    needs: [secscan, lint, test]
-    steps:
-      - uses: actions/checkout@v4
-      - name: build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
-      - uses: jdx/mise-action@v2
-        with:
-          cache: true
-      - run: mise run build
-
-  smoke:
-    runs-on: tatara-claude-code-wrapper
-    needs: [build]
-    steps:
-      - uses: actions/checkout@v4
-      - name: build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
-      - uses: jdx/mise-action@v2
-        with:
-          cache: true
-      - name: smoke
-        run: |
-          mise run build
-          ./bin/wrapper --help || true
-
-  image:
-    if: ${{ github.event_name == 'push' }}
-    runs-on: tatara-claude-code-wrapper
-    needs: [secscan, lint, test, build, smoke]
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
-      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: install buildctl
-        run: |
-          curl -sSfL "https://github.com/moby/buildkit/releases/download/v0.18.2/buildkit-v0.18.2.linux-amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local bin/buildctl
-      - name: build and push image
-        run: bash .github/ci/build.sh "${{ github.event.repository.name }}"
-
-  chart:
-    if: ${{ github.event_name == 'push' }}
-    runs-on: tatara-claude-code-wrapper
-    needs: [image]
-    env:
-      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
-      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: azure/setup-helm@v4
-      - name: package and push chart
-        run: |
-          SHORT_SHA="${GITHUB_SHA:0:7}"
-          VERSION="$(git describe --tags --always --dirty)"
-          NAME="$(basename "$(ls -d charts/*/)")"
-          # 'g' prefix (git-describe convention) keeps the prerelease a valid
-          # semver alphanumeric identifier. A bare short SHA that is all digits
-          # with a leading zero (e.g. 0707870) is an invalid numeric prerelease
-          # identifier and helm package rejects it ("version segment starts with 0").
-          CHART_VERSION="0.0.0-g${SHORT_SHA}"
-          helm registry login harbor.szymonrichert.pl -u "$HARBOR_USERNAME" -p "$HARBOR_PASSWORD"
-          helm package "charts/$NAME" --version "${CHART_VERSION}" --app-version "${VERSION}"
-          helm push "${NAME}-${CHART_VERSION}.tgz" oci://harbor.szymonrichert.pl/charts
+  ci:
+    uses: szymonrychu/tatara-operator/.github/workflows/ci-shared.yml@main
+    with:
+      runner-label: tatara-claude-code-wrapper
+      smoke-binary: ./bin/wrapper
+      has-chart: true
+      image-build-arg: TATARA_CLI_VERSION=7e62585
+    secrets: inherit
