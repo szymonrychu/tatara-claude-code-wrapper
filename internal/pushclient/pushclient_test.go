@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/stretchr/testify/require"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
@@ -96,6 +97,55 @@ func TestPushPostsTextWithIdentity(t *testing.T) {
 	require.Contains(t, cap.query, "job=tatara-claude-code-wrapper")
 	require.Contains(t, cap.ctype, "text/plain")
 	require.Contains(t, cap.body, "ccw_turns_total")
+}
+
+// TestPushFiltersRuntimeFamilies verifies the push body carries only the
+// wrapper-owned families (ccw_*, tatara_wrapper_*) and never the Go/process
+// runtime collectors, which the operator drops as reserved_name (issue #59).
+// The same registry still exposes go_*/process_* for the /metrics endpoint;
+// only the push path narrows.
+func TestPushFiltersRuntimeFamilies(t *testing.T) {
+	cap := &capture{}
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(collectors.NewGoCollector())
+	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	ccw := prometheus.NewCounter(prometheus.CounterOpts{Name: "ccw_turns_total", Help: "h"})
+	ccw.Inc()
+	tw := prometheus.NewCounter(prometheus.CounterOpts{Name: "tatara_wrapper_internal_issue_total", Help: "h"})
+	tw.Inc()
+	reg.MustRegister(ccw, tw)
+
+	p := pushclient.New(pushclient.Config{
+		URL:      srv.URL + "/internal/metrics/push",
+		RunID:    "run-filter",
+		Interval: time.Hour,
+	}, reg, discardLog())
+	p.Start()
+	require.Eventually(t, func() bool {
+		cap.mu.Lock()
+		defer cap.mu.Unlock()
+		return cap.hits >= 1
+	}, time.Second, 5*time.Millisecond)
+	p.Shutdown(context.Background())
+
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	require.Contains(t, cap.body, "ccw_turns_total")
+	require.Contains(t, cap.body, "tatara_wrapper_internal_issue_total")
+	require.NotContains(t, cap.body, "go_", "Go runtime families must not be pushed")
+	require.NotContains(t, cap.body, "process_", "process runtime families must not be pushed")
+
+	// The registry itself (the /metrics endpoint's gatherer) still has them.
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	var names []string
+	for _, mf := range mfs {
+		names = append(names, mf.GetName())
+	}
+	require.Contains(t, names, "go_goroutines", "runtime collectors stay on the registry for /metrics")
 }
 
 func TestShutdownDeletesSeries(t *testing.T) {

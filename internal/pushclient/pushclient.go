@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
@@ -50,7 +51,9 @@ type Pusher struct {
 	wg     sync.WaitGroup
 }
 
-// New builds a Pusher gathering from g. It applies defaults for Job and
+// New builds a Pusher gathering from g, narrowed to the wrapper-owned metric
+// families (see pushAllowedPrefixes) so the Go/process runtime collectors the
+// operator would drop are never pushed. It applies defaults for Job and
 // Interval; call Enabled to check whether pushing is configured.
 func New(cfg Config, g prometheus.Gatherer, log *slog.Logger, m ...*metrics.Metrics) *Pusher {
 	if cfg.Job == "" {
@@ -62,7 +65,7 @@ func New(cfg Config, g prometheus.Gatherer, log *slog.Logger, m ...*metrics.Metr
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Pusher{
 		cfg:    cfg,
-		g:      g,
+		g:      allowlisted(g),
 		client: &http.Client{Timeout: 10 * time.Second},
 		log:    log,
 		ctx:    ctx,
@@ -187,6 +190,43 @@ func (p *Pusher) endpoint() string {
 		sep = "&"
 	}
 	return p.cfg.URL + sep + q.Encode()
+}
+
+// pushAllowedPrefixes are the wrapper-owned metric-name prefixes the operator's
+// push-receiver accepts. The wrapper's registry also carries the Go and process
+// runtime collectors (shared with the /metrics endpoint), but the operator drops
+// those families as reserved_name - they would collide with its own collectors on
+// the shared registry - so pushing them is pure waste and pollutes
+// operator_push_series_dropped_total. Filtering the push gatherer to these
+// prefixes keeps that counter a true signal (issue #59).
+var pushAllowedPrefixes = []string{"ccw_", "tatara_wrapper_"}
+
+// allowlisted wraps g so Gather returns only families whose name matches a
+// wrapper-owned prefix. Only the push path narrows; the underlying registry (and
+// the /metrics endpoint that shares it) still exposes every family.
+func allowlisted(g prometheus.Gatherer) prometheus.Gatherer {
+	return prometheus.GathererFunc(func() ([]*dto.MetricFamily, error) {
+		mfs, err := g.Gather()
+		if err != nil {
+			return nil, err
+		}
+		kept := make([]*dto.MetricFamily, 0, len(mfs))
+		for _, mf := range mfs {
+			if allowedFamily(mf.GetName()) {
+				kept = append(kept, mf)
+			}
+		}
+		return kept, nil
+	})
+}
+
+func allowedFamily(name string) bool {
+	for _, p := range pushAllowedPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // encode gathers from g and renders the families in Prometheus text format,
