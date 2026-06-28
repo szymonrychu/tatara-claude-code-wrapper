@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -49,6 +50,44 @@ type InternalIssueCounter interface {
 	WithLabelValues(lvs ...string) prometheus.Counter
 }
 
+// ToolCallsCounter is satisfied by *prometheus.CounterVec with labels
+// {tool, outcome}. Distinct interface from StreamCounter so the 2-label shape
+// is explicit at the call site (issue #51).
+type ToolCallsCounter interface {
+	WithLabelValues(lvs ...string) prometheus.Counter
+}
+
+// tataraToolPrefix is the namespace every tatara MCP tool carries as Claude
+// sees it (the cli server registers as "tatara"). Any tool under this prefix
+// is the platform's own bounded surface, so it is kept verbatim as the metric
+// label; see clampToolName.
+const tataraToolPrefix = "mcp__tatara__"
+
+// knownBuiltinTools is the fixed cardinality set of built-in Claude Code tool
+// names kept verbatim in the ccw_tool_calls_total{tool} label. Everything not
+// here and not under tataraToolPrefix clamps to "other" so an arbitrary MCP
+// server cannot blow up label cardinality (rule 13).
+var knownBuiltinTools = map[string]bool{
+	"Bash": true, "Read": true, "Edit": true, "Write": true, "Glob": true,
+	"Grep": true, "Task": true, "TodoWrite": true, "WebFetch": true,
+	"WebSearch": true, "NotebookEdit": true,
+}
+
+// clampToolName bounds the ccw_tool_calls_total{tool} label. Built-in tools and
+// the tatara MCP surface (a platform-bounded namespace) are kept verbatim;
+// everything else - notably arbitrary third-party MCP servers - collapses to
+// "other". This mirrors clampNonMessageType and keeps cardinality bounded while
+// still giving per-tool failure rates for the tools the loop depends on.
+func clampToolName(name string) string {
+	if knownBuiltinTools[name] {
+		return name
+	}
+	if strings.HasPrefix(name, tataraToolPrefix) {
+		return name
+	}
+	return "other"
+}
+
 // Tailer reads a JSONL transcript file from the start and follows appends.
 // It re-opens the file on inode change (claude restart) and never drops a
 // malformed line (emits a raw event instead).
@@ -58,7 +97,16 @@ type Tailer struct {
 	turnID               func() string
 	counter              StreamCounter
 	internalIssueCounter InternalIssueCounter
+	toolCallsCounter     ToolCallsCounter
 	onActivity           func(turnID string)
+
+	// toolNames correlates a tool_use_id to its clamped tool name so a later
+	// tool_result (which carries only the id) can be attributed to a tool for
+	// ccw_tool_calls_total. Written on tool_use, read+deleted on tool_result,
+	// and cleared on turn change so an orphaned tool_use cannot grow it
+	// unbounded. processLine is single-goroutine, so no locking is needed.
+	toolNames map[string]string
+	tcTurnID  string
 }
 
 // NewTailer constructs a Tailer. turnID is called per event to get the current
@@ -77,6 +125,14 @@ func (t *Tailer) WithCounter(c StreamCounter) *Tailer {
 // report_internal_issue tool calls. nil-safe, returns self for chaining.
 func (t *Tailer) WithInternalIssueCounter(c InternalIssueCounter) *Tailer {
 	t.internalIssueCounter = c
+	return t
+}
+
+// WithToolCallsCounter attaches a 2-label {tool,outcome} counter for agent
+// tool calls (issue #51). nil-safe, returns self for chaining.
+func (t *Tailer) WithToolCallsCounter(c ToolCallsCounter) *Tailer {
+	t.toolCallsCounter = c
+	t.toolNames = make(map[string]string)
 	return t
 }
 
@@ -351,6 +407,13 @@ func (t *Tailer) processLine(raw []byte) {
 	// in-flight turn so the session can treat its deadline as an inactivity timer.
 	t.fireActivity(turnID)
 
+	// On turn change, drop any tool_use ids left uncorrelated by the prior turn
+	// (a tool_result that never arrived) so toolNames cannot grow unbounded.
+	if t.toolCallsCounter != nil && turnID != t.tcTurnID {
+		clear(t.toolNames)
+		t.tcTurnID = turnID
+	}
+
 	var entry transcriptEntry
 	if err := json.Unmarshal(raw, &entry); err != nil {
 		// Malformed line - emit raw event, never drop
@@ -455,6 +518,11 @@ func (t *Tailer) processLine(raw []byte) {
 				"input", inputStr,
 			)
 			t.incCounter("tool_use")
+			if t.toolCallsCounter != nil {
+				// Record id -> clamped name so the matching tool_result (which
+				// carries only the id) can be attributed to a tool.
+				t.toolNames[block.ID] = clampToolName(block.Name)
+			}
 			if block.Name == internalIssueToolName {
 				t.emitInternalIssue(turnID, block.Input)
 			}
@@ -472,6 +540,20 @@ func (t *Tailer) processLine(raw []byte) {
 				"content", contentStr,
 			)
 			t.incCounter("tool_result")
+			if t.toolCallsCounter != nil {
+				// Attribute the result to its tool via the correlation map; a
+				// result with no matching tool_use clamps to "other".
+				tool := "other"
+				if name, ok := t.toolNames[block.ToolUseID]; ok {
+					tool = name
+					delete(t.toolNames, block.ToolUseID)
+				}
+				outcome := "success"
+				if block.IsError {
+					outcome = "error"
+				}
+				t.toolCallsCounter.WithLabelValues(tool, outcome).Inc() //nolint:errcheck
+			}
 		default:
 			// Unknown block type - emit raw
 			t.log.Info("agent stream",

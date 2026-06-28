@@ -98,6 +98,23 @@ func TestTailer_UnknownNonMessageType_ClampedInMetric(t *testing.T) {
 	}
 }
 
+func TestClampToolName(t *testing.T) {
+	for _, tt := range []struct{ in, want string }{
+		{"Bash", "Bash"},
+		{"Read", "Read"},
+		{"mcp__tatara__query", "mcp__tatara__query"},
+		{"mcp__tatara__code_stats", "mcp__tatara__code_stats"},
+		{"mcp__grafana__query_prometheus", "other"},
+		{"some_arbitrary_tool", "other"},
+		{"", "other"},
+	} {
+		got := clampToolName(tt.in)
+		if got != tt.want {
+			t.Errorf("clampToolName(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestClampNonMessageType(t *testing.T) {
 	for _, tt := range []struct{ in, want string }{
 		{"system", "system"},
@@ -892,6 +909,153 @@ func (n *noopCounter) Describe(ch chan<- *prometheus.Desc) {}
 func (n *noopCounter) Collect(ch chan<- prometheus.Metric) {}
 func (n *noopCounter) Inc()                                {}
 func (n *noopCounter) Add(float64)                         {}
+
+// fakeToolCallsCounter is a test double for ToolCallsCounter.
+type fakeToolCallsCounter struct {
+	mu   sync.Mutex
+	hits []struct{ tool, outcome string }
+}
+
+func (f *fakeToolCallsCounter) WithLabelValues(lvs ...string) prometheus.Counter {
+	f.mu.Lock()
+	tool, outcome := "", ""
+	if len(lvs) > 0 {
+		tool = lvs[0]
+	}
+	if len(lvs) > 1 {
+		outcome = lvs[1]
+	}
+	f.hits = append(f.hits, struct{ tool, outcome string }{tool, outcome})
+	f.mu.Unlock()
+	return &noopCounter{}
+}
+
+func (f *fakeToolCallsCounter) Calls() []struct{ tool, outcome string } {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]struct{ tool, outcome string }, len(f.hits))
+	copy(out, f.hits)
+	return out
+}
+
+func countToolCall(calls []struct{ tool, outcome string }, tool, outcome string) int {
+	n := 0
+	for _, c := range calls {
+		if c.tool == tool && c.outcome == outcome {
+			n++
+		}
+	}
+	return n
+}
+
+// makeToolUseLineNamed crafts a tool_use content block with a given id and name
+// (no stop_reason, so the line emits exactly one agent_stream event).
+func makeToolUseLineNamed(id, name string) string {
+	return `{"type":"assistant","uuid":"uuid-tu-` + id + `","sessionId":"sess-1","timestamp":"2026-06-28T10:00:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"` + id + `","name":"` + name + `","input":{}}]}}`
+}
+
+// makeToolResultLineFor crafts a tool_result content block for a given
+// tool_use_id with the given is_error flag.
+func makeToolResultLineFor(id string, isError bool) string {
+	e := "false"
+	if isError {
+		e = "true"
+	}
+	return `{"type":"user","uuid":"uuid-tr-` + id + `","sessionId":"sess-1","timestamp":"2026-06-28T10:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + id + `","content":"out","is_error":` + e + `}]}}`
+}
+
+// TestTailer_ToolCalls_ErrorAndOk feeds a failing tool_result and a succeeding
+// one, each correlated to its tool_use, and asserts ccw_tool_calls_total
+// increments the error and success series once each with the resolved tool name.
+func TestTailer_ToolCalls_ErrorAndOk(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	writeTranscriptLine(t, path, makeToolUseLineNamed("tu_err", "mcp__tatara__query"))
+	writeTranscriptLine(t, path, makeToolResultLineFor("tu_err", true))
+	writeTranscriptLine(t, path, makeToolUseLineNamed("tu_ok", "mcp__tatara__describe"))
+	writeTranscriptLine(t, path, makeToolResultLineFor("tu_ok", false))
+
+	h := newCaptureHandler()
+	fc := &fakeToolCallsCounter{}
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "turn-1" }).
+		WithToolCallsCounter(fc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	// 4 lines -> 2 tool_use + 2 tool_result = 4 agent_stream events.
+	waitForRecords(t, h, 4, 2*time.Second)
+	cancel()
+	<-done
+
+	calls := fc.Calls()
+	if len(calls) != 2 {
+		t.Fatalf("got %d tool-call increments, want 2: %v", len(calls), calls)
+	}
+	if n := countToolCall(calls, "mcp__tatara__query", "error"); n != 1 {
+		t.Errorf("query/error increments = %d, want 1: %v", n, calls)
+	}
+	if n := countToolCall(calls, "mcp__tatara__describe", "success"); n != 1 {
+		t.Errorf("describe/success increments = %d, want 1: %v", n, calls)
+	}
+}
+
+// TestTailer_ToolCalls_UnknownToolClampedToOther verifies a tool name outside
+// the built-in set and the tatara namespace clamps to "other".
+func TestTailer_ToolCalls_UnknownToolClampedToOther(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	writeTranscriptLine(t, path, makeToolUseLineNamed("tu_g", "mcp__grafana__query_prometheus"))
+	writeTranscriptLine(t, path, makeToolResultLineFor("tu_g", false))
+
+	h := newCaptureHandler()
+	fc := &fakeToolCallsCounter{}
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "turn-1" }).
+		WithToolCallsCounter(fc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	waitForRecords(t, h, 2, 2*time.Second)
+	cancel()
+	<-done
+
+	calls := fc.Calls()
+	if len(calls) != 1 || calls[0].tool != "other" || calls[0].outcome != "success" {
+		t.Errorf("calls = %v, want one (other, success)", calls)
+	}
+}
+
+// TestTailer_ToolCalls_OrphanResultClampedToOther verifies a tool_result with no
+// preceding tool_use (id absent from the correlation map) clamps to "other".
+func TestTailer_ToolCalls_OrphanResultClampedToOther(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	writeTranscriptLine(t, path, makeToolResultLineFor("never_seen", true))
+
+	h := newCaptureHandler()
+	fc := &fakeToolCallsCounter{}
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "turn-1" }).
+		WithToolCallsCounter(fc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	waitForRecords(t, h, 1, 2*time.Second)
+	cancel()
+	<-done
+
+	calls := fc.Calls()
+	if len(calls) != 1 || calls[0].tool != "other" || calls[0].outcome != "error" {
+		t.Errorf("calls = %v, want one (other, error)", calls)
+	}
+}
 
 // makeInternalIssueLine returns a transcript line for tool_use of
 // report_internal_issue with the given JSON input string.
