@@ -2,15 +2,25 @@ name: release
 
 # Push-CD: after a green `ci` run on main, cut the semver tag the merged PR
 # declared, publish the image+chart at that version, then propagate the new
-# wrapper version into tatara-helmfile (the parent). Gated on the ci run (which
-# includes the cli build-guard test-guard stage); a failed ci run never reaches
-# this workflow, so the cascade stalls and operator deploy-supervision/cdScan
-# catches it (the build-guard failure is surfaced, never swallowed).
+# wrapper version into tatara-helmfile (the parent). Gated on a successful `ci`
+# run (lint/test/build/smoke); a failed ci run never reaches this workflow. The
+# cli MCP-tools build-guard runs in the `publish image` step below (build.sh
+# builds the Dockerfile test-guard stage first), so a cli/skills bump that drops
+# a required tool fails the publish and the cascade stalls before any tag/pin is
+# propagated -- the failure is surfaced, never swallowed.
 on:
   workflow_run:
     workflows: [ci]
     types: [completed]
     branches: [main]
+
+# Serialize releases: two merges landing close together would otherwise race on
+# tag computation/push (both read the same latest tag, compute the same next,
+# the second `git push origin <tag>` conflicts) and on the cd/deploy-train
+# branch. cancel-in-progress=false lets each in-flight release finish.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -43,11 +53,18 @@ jobs:
           curl -sSfL "https://github.com/moby/buildkit/releases/download/v0.18.2/buildkit-v0.18.2.linux-amd64.tar.gz" \
             | sudo tar -xz -C /usr/local bin/buildctl
 
-      # Re-build+push the image at the new tag. build.sh derives VERSION from
+      # Build+push the image at the new tag. build.sh first builds the Dockerfile
+      # test-guard stage (cli MCP-tools guard; fails the publish if a required
+      # tool went missing), then builds the runtime image. VERSION comes from
       # `git describe --tags`, which now resolves to the freshly-cut vX.Y.Z (and
-      # still pushes :SHORT_SHA for rollback/debug). Buildkit layer cache from the
-      # ci run makes this fast. The Dockerfile test-guard stage re-runs here too.
+      # :SHORT_SHA is still pushed for rollback/debug). BUILD_REF pins the build
+      # to the triggering run's head_sha: on workflow_run GITHUB_SHA points at the
+      # default-branch tip, which may have advanced past this commit, so without
+      # the pin the context/SHORT_SHA could diverge from the checked-out VERSION.
+      # buildkitd's persistent Ceph layer cache keeps the rebuild fast.
       - name: publish image
+        env:
+          BUILD_REF: ${{ github.event.workflow_run.head_sha }}
         run: bash .github/ci/build.sh "${{ github.event.repository.name }}"
 
       - uses: azure/setup-helm@v4

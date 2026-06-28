@@ -66,47 +66,9 @@ jobs:
           mise run build
           ./bin/wrapper --help || true
 
-  image:
-    if: ${{ github.event_name == 'push' }}
-    runs-on: tatara-claude-code-wrapper
-    needs: [secscan, lint, test, build, smoke]
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
-      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: install buildctl
-        run: |
-          curl -sSfL "https://github.com/moby/buildkit/releases/download/v0.18.2/buildkit-v0.18.2.linux-amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local bin/buildctl
-      - name: build and push image
-        run: bash .github/ci/build.sh "${{ github.event.repository.name }}"
-
-  chart:
-    if: ${{ github.event_name == 'push' }}
-    runs-on: tatara-claude-code-wrapper
-    needs: [image]
-    env:
-      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
-      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: azure/setup-helm@v4
-      - name: package and push chart
-        run: |
-          SHORT_SHA="${GITHUB_SHA:0:7}"
-          VERSION="$(git describe --tags --always --dirty)"
-          NAME="$(basename "$(ls -d charts/*/)")"
-          # 'g' prefix (git-describe convention) keeps the prerelease a valid
-          # semver alphanumeric identifier. A bare short SHA that is all digits
-          # with a leading zero (e.g. 0707870) is an invalid numeric prerelease
-          # identifier and helm package rejects it ("version segment starts with 0").
-          CHART_VERSION="0.0.0-g${SHORT_SHA}"
-          helm registry login harbor.szymonrichert.pl -u "$HARBOR_USERNAME" -p "$HARBOR_PASSWORD"
-          helm package "charts/$NAME" --version "${CHART_VERSION}" --app-version "${VERSION}"
-          helm push "${NAME}-${CHART_VERSION}.tgz" oci://harbor.szymonrichert.pl/charts
+# NOTE: image + chart publish is NOT here. On a green push-to-main run, the
+# `release` workflow (workflow_run gated on this `ci` run) cuts the semver tag,
+# then builds+pushes the image and chart at that bare X.Y.Z version. The legacy
+# per-push `image`/`chart` jobs (which double-built the image every merge and
+# published the 0.0.0-g<sha> chart scheme) are removed in favour of that single
+# semver-versioned publish path.
