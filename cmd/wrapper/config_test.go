@@ -116,3 +116,13 @@ func TestLoadConfig_FullCloneFromEnv(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, cfg.FullClone)
 }
+
+// The operator emits TATARA_WORKSPACE_FULL_CLONE="" (set-but-empty) for
+// repo-scoped pods. ParseBool("") errors, so loadConfig must treat empty as the
+// default (false) rather than failing the whole boot.
+func TestLoadConfig_FullCloneEmptyStringDefaults(t *testing.T) {
+	t.Setenv("TATARA_WORKSPACE_FULL_CLONE", "")
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.False(t, cfg.FullClone)
+}
