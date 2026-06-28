@@ -202,7 +202,7 @@ func envOr(k, def string) string {
 
 func envIntOr(k string, def int) (int, error) {
 	v, ok := os.LookupEnv(k)
-	if !ok {
+	if !ok || v == "" {
 		return def, nil
 	}
 	n, err := strconv.Atoi(v)
@@ -214,7 +214,9 @@ func envIntOr(k string, def int) (int, error) {
 
 func envBoolOr(k string, def bool) (bool, error) {
 	v, ok := os.LookupEnv(k)
-	if !ok {
+	if !ok || v == "" {
+		// A set-but-empty value (e.g. the operator emits TATARA_WORKSPACE_FULL_CLONE=""
+		// for repo-scoped pods) must fall back to the default, not fail ParseBool("").
 		return def, nil
 	}
 	b, err := strconv.ParseBool(v)
