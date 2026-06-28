@@ -75,6 +75,12 @@ type config struct {
 	S3AccessKeyID    string
 	S3SecretKey      string
 
+	// FullClone, when true, clones all history and all branches instead of
+	// --depth 1. Set by TATARA_WORKSPACE_FULL_CLONE=true; intended for
+	// project-scoped pods (brainstorm/incident/refine/healthCheck) that need
+	// cross-branch context.
+	FullClone bool
+
 	// Conversation resume (issue #114). The operator sets the S3 object key for
 	// this issue's conversation (stable per issue); the sessionId is set only
 	// when a prior conversation exists, triggering restore + `claude --resume`.
@@ -105,6 +111,10 @@ func loadConfig(args []string) (config, error) {
 		return config{}, err
 	}
 	fps, err := envBoolOr("S3_FORCE_PATH_STYLE", false)
+	if err != nil {
+		return config{}, err
+	}
+	fc, err := envBoolOr("TATARA_WORKSPACE_FULL_CLONE", false)
 	if err != nil {
 		return config{}, err
 	}
@@ -162,6 +172,8 @@ func loadConfig(args []string) (config, error) {
 		S3ForcePathStyle: fps,
 		S3AccessKeyID:    envOr("AWS_ACCESS_KEY_ID", ""),
 		S3SecretKey:      envOr("AWS_SECRET_ACCESS_KEY", ""),
+
+		FullClone: fc,
 
 		ConversationObjectKey:   envOr("CONVERSATION_OBJECT_KEY", ""),
 		ConversationSessionID:   envOr("CONVERSATION_SESSION_ID", ""),

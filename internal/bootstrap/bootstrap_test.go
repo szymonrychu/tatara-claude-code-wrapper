@@ -681,3 +681,115 @@ func TestRender_EmitsBootstrapRenderLog(t *testing.T) {
 	}
 	require.Equal(t, float64(1), renderOK, "BootstrapRenderTotal{result=ok} must be 1 after successful render")
 }
+
+// TestRender_SingleRepo_ShallowCloneByDefault asserts that with FullClone=false
+// (the default), the single-repo clone args include "--depth" and "1".
+func TestRender_SingleRepo_ShallowCloneByDefault(t *testing.T) {
+	var cloneArgs []string
+	fakeGit := func(dir string, args ...string) error {
+		for _, a := range args {
+			if a == "clone" {
+				cloneArgs = args
+			}
+		}
+		return nil
+	}
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		RepoURL:        "https://github.com/owner/repo",
+		RepoBranch:     "main",
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+		FullClone:      false,
+	}
+	require.NoError(t, bootstrap.Render(p, fakeGit))
+	require.Contains(t, cloneArgs, "--depth", "shallow clone must include --depth")
+	require.Contains(t, cloneArgs, "1", "shallow clone must include depth value 1")
+}
+
+// TestRender_SingleRepo_FullCloneOmitsDepth asserts that with FullClone=true,
+// the single-repo clone args do NOT include "--depth" or "1" as a depth flag.
+func TestRender_SingleRepo_FullCloneOmitsDepth(t *testing.T) {
+	var cloneArgs []string
+	fakeGit := func(dir string, args ...string) error {
+		for _, a := range args {
+			if a == "clone" {
+				cloneArgs = args
+			}
+		}
+		return nil
+	}
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		RepoURL:        "https://github.com/owner/repo",
+		RepoBranch:     "main",
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+		FullClone:      true,
+	}
+	require.NoError(t, bootstrap.Render(p, fakeGit))
+	require.NotContains(t, cloneArgs, "--depth", "full clone must NOT include --depth")
+}
+
+// TestRender_MultiRepo_ShallowCloneByDefault asserts that with FullClone=false,
+// multi-repo clone args include "--depth" and "1" for each repo.
+func TestRender_MultiRepo_ShallowCloneByDefault(t *testing.T) {
+	var cloneCalls [][]string
+	fakeGit := func(dir string, args ...string) error {
+		for _, a := range args {
+			if a == "clone" {
+				cloneCalls = append(cloneCalls, args)
+			}
+		}
+		return nil
+	}
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+		FullClone:      false,
+		Repos: []bootstrap.RepoSpec{
+			{Name: "a", URL: "https://github.com/owner/repo-a", Branch: "main"},
+			{Name: "b", URL: "https://github.com/owner/repo-b", Branch: "main"},
+		},
+	}
+	require.NoError(t, bootstrap.Render(p, fakeGit))
+	require.Len(t, cloneCalls, 2)
+	for _, args := range cloneCalls {
+		require.Contains(t, args, "--depth", "shallow clone must include --depth for each repo")
+		require.Contains(t, args, "1", "shallow clone must include depth value 1 for each repo")
+	}
+}
+
+// TestRender_MultiRepo_FullCloneOmitsDepth asserts that with FullClone=true,
+// multi-repo clone args do NOT include "--depth" for any repo.
+func TestRender_MultiRepo_FullCloneOmitsDepth(t *testing.T) {
+	var cloneCalls [][]string
+	fakeGit := func(dir string, args ...string) error {
+		for _, a := range args {
+			if a == "clone" {
+				cloneCalls = append(cloneCalls, args)
+			}
+		}
+		return nil
+	}
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+		FullClone:      true,
+		Repos: []bootstrap.RepoSpec{
+			{Name: "a", URL: "https://github.com/owner/repo-a", Branch: "main"},
+			{Name: "b", URL: "https://github.com/owner/repo-b", Branch: "main"},
+		},
+	}
+	require.NoError(t, bootstrap.Render(p, fakeGit))
+	require.Len(t, cloneCalls, 2)
+	for _, args := range cloneCalls {
+		require.NotContains(t, args, "--depth", "full clone must NOT include --depth for any repo")
+	}
+}

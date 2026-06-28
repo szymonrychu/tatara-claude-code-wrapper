@@ -44,7 +44,11 @@ type Params struct {
 	// TaskBranch is empty: an MR review agent works on the PR head but the turn
 	// finaliser only pushes when TaskBranch is set (issue #114 decision 4).
 	CheckoutBranch string
-	Repos          []RepoSpec
+	// FullClone, when true, skips --depth 1 so the agent gets all history and all
+	// branches. Intended for project-scoped pods (brainstorm/incident/refine/
+	// healthCheck) that need cross-branch context. Default false = shallow clone.
+	FullClone bool
+	Repos     []RepoSpec
 
 	// Lifecycle hook commands (operator-supplied via the Project CRD, delivered
 	// as HOOK_* env vars). Empty means the hook is disabled. preClone/postClone
@@ -81,11 +85,10 @@ type GitRunner func(dir string, args ...string) error
 func checkoutTaskBranch(dir, taskBranch string, git GitRunner) (resumed bool, err error) {
 	branchExists := git(dir, "ls-remote", "--exit-code", "--heads", "origin", taskBranch) == nil
 	if branchExists {
-		// Unshallow so the rebase against origin/<default> has a merge base. The
-		// clone is always --depth 1 (single-repo or multi-repo clone above), so
-		// unshallow always applies and a failure here is real (network), not the
-		// benign "already complete" case -- propagate it rather than proceed with a
-		// shallow clone whose rebase would fail with no merge base.
+		// Unshallow so the rebase against origin/<default> has a merge base. When
+		// the clone was shallow (FullClone=false), unshallow is required and a
+		// failure is real (network). When the clone was full, git fetch --unshallow
+		// is a no-op on an already-complete repo and still safe to run.
 		if err := git(dir, "fetch", "--unshallow", "origin"); err != nil {
 			return false, fmt.Errorf("unshallow for resume of %s: %w", taskBranch, err)
 		}
@@ -150,7 +153,10 @@ func Render(p Params, git GitRunner) error {
 			cloneStart := time.Now()
 			// Skip clone when the repo is already present (pod restart with persistent workspace).
 			if _, statErr := os.Stat(filepath.Join(dest, ".git")); os.IsNotExist(statErr) {
-				args := []string{"clone", "--depth", "1"}
+				args := []string{"clone"}
+				if !p.FullClone {
+					args = append(args, "--depth", "1")
+				}
 				if r.Branch != "" {
 					args = append(args, "--branch", r.Branch)
 				}
@@ -210,7 +216,10 @@ func Render(p Params, git GitRunner) error {
 		RunHook("preClone", p.HookPreClone, p.Workspace, []string{p.RepoURL}, []string{"TATARA_HOOK_REPO_URL=" + p.RepoURL}, p.HookRun, p.Log, p.M)
 		cloneStart := time.Now()
 		if _, statErr := os.Stat(filepath.Join(repoDest, ".git")); os.IsNotExist(statErr) {
-			args := []string{"clone", "--depth", "1"}
+			args := []string{"clone"}
+			if !p.FullClone {
+				args = append(args, "--depth", "1")
+			}
 			if p.RepoBranch != "" {
 				args = append(args, "--branch", p.RepoBranch)
 			}
