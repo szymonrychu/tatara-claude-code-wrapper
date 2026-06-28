@@ -173,6 +173,7 @@ func (mgr *Manager) StartTailer(ctx context.Context) {
 	tailer := transcript.NewTailer(mgr.log, redactor, mgr.currentTurnID)
 	tailer.WithCounter(mgr.m.StreamEventsTotal)
 	tailer.WithInternalIssueCounter(mgr.m.InternalIssueTotal)
+	tailer.WithToolCallsCounter(mgr.m.ToolCallsTotal)
 	tailer.WithActivity(mgr.onTailerActivity)
 	tailerCtx, cancel := context.WithCancel(ctx) //nolint:gosec // cancel is stored in mgr.tailerCancel and invoked by Shutdown/path-change restart
 	mgr.mu.Lock()

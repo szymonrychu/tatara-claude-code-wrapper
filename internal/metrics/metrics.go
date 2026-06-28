@@ -54,6 +54,13 @@ type Metrics struct {
 
 	// Internal issue reports from agents via the report_internal_issue MCP tool.
 	InternalIssueTotal *prometheus.CounterVec // labels: category, severity
+
+	// Agent tool-call outcomes observed in the transcript (issue #51): a
+	// tool_result with is_error=true is a mid-turn tool failure that otherwise
+	// completes the turn "successfully" with zero fleet-visible signal. The tool
+	// label is clamped to a bounded set (built-ins + tatara MCP surface, else
+	// "other") so cardinality stays bounded (rule 13).
+	ToolCallsTotal *prometheus.CounterVec // labels: tool, outcome=success|error
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -117,6 +124,8 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_conversation_ops_total", Help: "Conversation transcript persistence operations by op and result."}, []string{"op", "result"}),
 		InternalIssueTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "tatara_wrapper_internal_issue_total", Help: "Agent-reported internal issues observed by the wrapper tailer, by category and severity."}, []string{"category", "severity"}),
+		ToolCallsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_tool_calls_total", Help: "Agent tool calls observed in the transcript by tool name (clamped) and outcome (success|error)."}, []string{"tool", "outcome"}),
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
 		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal, m.Interjections,
@@ -124,6 +133,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.BootstrapHookInstall, m.LifecycleHookTotal, m.HookOutcome, m.MetricPushTotal,
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.HTTPInFlight, m.HTTPPanicsTotal,
 		m.AuthTotal, m.TurnResumes, m.OutcomeRepromptTotal, m.BootstrapRenderTotal,
-		m.TurnTokensTotal, m.TurnCostUSD, m.ConversationOpsTotal, m.InternalIssueTotal)
+		m.TurnTokensTotal, m.TurnCostUSD, m.ConversationOpsTotal, m.InternalIssueTotal,
+		m.ToolCallsTotal)
 	return m
 }
