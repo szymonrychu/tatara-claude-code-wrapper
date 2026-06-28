@@ -4,6 +4,11 @@ ARG GO_VERSION=1.25
 ARG NODE_VERSION=22
 ARG CLAUDE_CODE_VERSION=latest
 ARG TATARA_CLI_VERSION=f6c0bcb
+# Skills plugin ref the wrapper boot-clones at runtime. Pinned to a semver tag so
+# the skills->wrapper cd-release bump can rewrite this line (mirrors
+# TATARA_CLI_VERSION). The Go default (cmd/wrapper/config.go) stays "main" for
+# local dev; in the image this ENV pins it.
+ARG TATARA_SKILLS_REF=v0.1.0
 # renovate: repository=jdx/mise
 ARG MISE_VERSION=v2026.6.3
 
@@ -49,6 +54,11 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} && npm cache
 COPY --from=tatara-cli /usr/local/bin/tatara /usr/local/bin/tatara
 COPY --from=go-build /out/wrapper /usr/local/bin/wrapper
 COPY --from=go-build /out/cc-stop-hook /usr/local/bin/cc-stop-hook
+
+# Pin the skills ref the wrapper boot-clones (re-declare the global ARG to bring
+# it into this stage's scope, then bake it as the runtime default ENV).
+ARG TATARA_SKILLS_REF
+ENV TATARA_SKILLS_REF=${TATARA_SKILLS_REF}
 
 # non-root, writable HOME + workspace + skills clone dir (boot-cloned at runtime)
 RUN useradd -m -u 10001 agent && mkdir -p /workspace /etc/wrapper && chown -R agent:agent /workspace /etc/wrapper

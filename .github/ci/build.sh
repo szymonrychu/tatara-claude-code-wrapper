@@ -17,6 +17,10 @@ BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # Dockerfile ARG default and Makefile default.  Use the short SHA published by
 # tatara-cli CI (both SHORT_SHA and VERSION tags are pushed on every main merge).
 TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-f6c0bcb}"
+# TATARA_SKILLS_REF pins the skills plugin ref baked as the runtime ENV default;
+# keep in sync with the Dockerfile ARG default and Makefile default. Rewritten by
+# the skills->wrapper cd-release bump.
+TATARA_SKILLS_REF="${TATARA_SKILLS_REF:-v0.1.0}"
 DEST="harbor.szymonrichert.pl/containers/${REPO}"
 
 : "${GITHUB_TOKEN:?GITHUB_TOKEN required}"
@@ -46,6 +50,7 @@ buildctl --addr "$BUILDKITD_ADDR" build \
   --opt build-arg:COMMIT="${SHORT_SHA}" \
   --opt build-arg:DATE="${BUILD_DATE}" \
   --opt build-arg:TATARA_CLI_VERSION="${TATARA_CLI_VERSION}" \
+  --opt build-arg:TATARA_SKILLS_REF="${TATARA_SKILLS_REF}" \
   --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN \
   --output "type=image,\"name=${DEST}:${SHORT_SHA},${DEST}:${VERSION}\",push=true"
 
