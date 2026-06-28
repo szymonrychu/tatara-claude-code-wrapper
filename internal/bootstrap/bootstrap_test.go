@@ -269,6 +269,38 @@ func TestCheckoutTaskBranch_BranchExists_ResumesFromRemote(t *testing.T) {
 	require.Empty(t, freshCheckout, "checkout -b must NOT be called when branch already exists on remote")
 }
 
+// TestCheckoutTaskBranch_FullClone_SkipsUnshallow asserts that on a FULL clone
+// the resume path does NOT run `git fetch --unshallow` (which fatals on an
+// already-complete repo), but still fetches and checks out the task branch.
+func TestCheckoutTaskBranch_FullClone_SkipsUnshallow(t *testing.T) {
+	sg := &scriptedGit{}
+	taskBranch := "tatara/task-abc123"
+	sg.scripts = append(sg.scripts, struct {
+		match func([]string) bool
+		err   error
+	}{argsContainAll("ls-remote", "--exit-code"), nil})
+
+	p := bootstrap.Params{
+		HomeDir: t.TempDir(), Workspace: t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		RepoURL:        "https://github.com/x/y",
+		RepoBranch:     "main",
+		TaskBranch:     taskBranch,
+		FullClone:      true,
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+	}
+	require.NoError(t, bootstrap.Render(p, sg.run))
+
+	unshallow := callsContainingAll(sg.Calls, "fetch", "--unshallow")
+	require.Empty(t, unshallow, "fetch --unshallow must NOT be called on a full clone (fatals on complete repo)")
+
+	fetchBranch := callsContainingAll(sg.Calls, "fetch", "origin", taskBranch)
+	require.NotEmpty(t, fetchBranch, "expected fetch origin <taskBranch> on full-clone resume")
+	checkoutResume := callsContainingAll(sg.Calls, "checkout", "-B", taskBranch, "FETCH_HEAD")
+	require.NotEmpty(t, checkoutResume, "expected checkout -B <branch> FETCH_HEAD on full-clone resume")
+}
+
 // TestCheckoutTaskBranch_BranchAbsent_FreshBranch asserts that when ls-remote
 // returns a non-nil error (branch not found), Render issues the plain
 // "checkout -b <branch>" and does NOT fetch --unshallow or fetch origin <branch>.

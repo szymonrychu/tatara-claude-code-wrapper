@@ -82,15 +82,17 @@ type GitRunner func(dir string, args ...string) error
 // to the fresh-task path: plain "checkout -b <branch>".
 // Returns (resumed=true, nil) on the resume path, (false, nil) on the fresh
 // path, so callers can set action="resume" without a second ls-remote call.
-func checkoutTaskBranch(dir, taskBranch string, git GitRunner) (resumed bool, err error) {
+func checkoutTaskBranch(dir, taskBranch string, fullClone bool, git GitRunner) (resumed bool, err error) {
 	branchExists := git(dir, "ls-remote", "--exit-code", "--heads", "origin", taskBranch) == nil
 	if branchExists {
-		// Unshallow so the rebase against origin/<default> has a merge base. When
-		// the clone was shallow (FullClone=false), unshallow is required and a
-		// failure is real (network). When the clone was full, git fetch --unshallow
-		// is a no-op on an already-complete repo and still safe to run.
-		if err := git(dir, "fetch", "--unshallow", "origin"); err != nil {
-			return false, fmt.Errorf("unshallow for resume of %s: %w", taskBranch, err)
+		// Unshallow so the rebase against origin/<default> has a merge base. Only
+		// when the clone was shallow (FullClone=false): `git fetch --unshallow` on
+		// an already-complete repo fatals ("does not make sense"), so skip it for a
+		// full clone, which already has the full history.
+		if !fullClone {
+			if err := git(dir, "fetch", "--unshallow", "origin"); err != nil {
+				return false, fmt.Errorf("unshallow for resume of %s: %w", taskBranch, err)
+			}
 		}
 		if err := git(dir, "fetch", "origin", taskBranch); err != nil {
 			return false, fmt.Errorf("fetch remote task branch %s: %w", taskBranch, err)
@@ -177,7 +179,7 @@ func Render(p Params, git GitRunner) error {
 				// primary): a secondary repo silently left on the wrong branch
 				// would make the agent commit the wrong state. Fail loud so the
 				// operator retries the run.
-				resumed, err := checkoutTaskBranch(dest, checkoutBranch, git)
+				resumed, err := checkoutTaskBranch(dest, checkoutBranch, p.FullClone, git)
 				if err != nil {
 					if p.M != nil {
 						p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
@@ -233,7 +235,7 @@ func Render(p Params, git GitRunner) error {
 		}
 		action := "clone"
 		if checkoutBranch != "" {
-			resumed, err := checkoutTaskBranch(repoDest, checkoutBranch, git)
+			resumed, err := checkoutTaskBranch(repoDest, checkoutBranch, p.FullClone, git)
 			if err != nil {
 				if p.M != nil {
 					p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
