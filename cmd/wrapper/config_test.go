@@ -83,3 +83,23 @@ func TestLoadConfig_S3ForcePathStyleInvalid(t *testing.T) {
 	_, err := loadConfig(nil)
 	require.Error(t, err)
 }
+
+func TestLoadConfig_SkillsDefaults(t *testing.T) {
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, "https://github.com/szymonrychu/tatara-agent-skills", cfg.SkillsRepo)
+	require.Equal(t, "main", cfg.SkillsRef)
+	require.Equal(t, "", cfg.SkillProfile)
+	require.Equal(t, "/etc/wrapper/skills/skills", cfg.SkillsSrcDirs)
+}
+
+func TestLoadConfig_SkillsFromEnv(t *testing.T) {
+	t.Setenv("TATARA_SKILL_PROFILE", "implement")
+	t.Setenv("TATARA_SKILLS_REPO", "https://github.com/custom/skills")
+	t.Setenv("TATARA_SKILLS_REF", "v1.2.3")
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, "implement", cfg.SkillProfile)
+	require.Equal(t, "https://github.com/custom/skills", cfg.SkillsRepo)
+	require.Equal(t, "v1.2.3", cfg.SkillsRef)
+}

@@ -3,7 +3,7 @@
 ARG GO_VERSION=1.25
 ARG NODE_VERSION=22
 ARG CLAUDE_CODE_VERSION=latest
-ARG TATARA_CLI_VERSION=cc6b6c0
+ARG TATARA_CLI_VERSION=4593da4
 # renovate: repository=jdx/mise
 ARG MISE_VERSION=v2026.6.3
 
@@ -49,10 +49,9 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} && npm cache
 COPY --from=tatara-cli /usr/local/bin/tatara /usr/local/bin/tatara
 COPY --from=go-build /out/wrapper /usr/local/bin/wrapper
 COPY --from=go-build /out/cc-stop-hook /usr/local/bin/cc-stop-hook
-COPY templates/ /templates/
 
-# non-root, writable HOME + workspace
-RUN useradd -m -u 10001 agent && mkdir -p /workspace && chown -R agent:agent /workspace /templates
+# non-root, writable HOME + workspace + skills clone dir (boot-cloned at runtime)
+RUN useradd -m -u 10001 agent && mkdir -p /workspace /etc/wrapper && chown -R agent:agent /workspace /etc/wrapper
 
 USER agent
 ENV HOME=/home/agent HOME_DIR=/home/agent WORKSPACE=/workspace
