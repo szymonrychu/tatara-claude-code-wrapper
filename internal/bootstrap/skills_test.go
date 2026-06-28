@@ -202,9 +202,16 @@ func TestInstallSkills_CategoryLayout_FiltersCorrectly(t *testing.T) {
 	require.NoError(t, err)
 
 	dstBase := filepath.Join(ws, ".claude", "skills")
-	require.FileExists(t, filepath.Join(dstBase, "shared", "tatara-platform", "SKILL.md"))
-	require.FileExists(t, filepath.Join(dstBase, "implement", "tatara-workflow", "SKILL.md"))
-	require.NoFileExists(t, filepath.Join(dstBase, "brainstorming", "tatara-guardrails", "SKILL.md"))
+	// Skills must be FLATTENED to depth-1 (skills/<skill>/SKILL.md): Claude Code
+	// only discovers skills one level under .claude/skills, so the category dir
+	// must be dropped.
+	require.FileExists(t, filepath.Join(dstBase, "tatara-platform", "SKILL.md"))
+	require.FileExists(t, filepath.Join(dstBase, "tatara-workflow", "SKILL.md"))
+	require.NoFileExists(t, filepath.Join(dstBase, "tatara-guardrails", "SKILL.md"))
+	// No category dirs may leak into the destination.
+	require.NoDirExists(t, filepath.Join(dstBase, "shared"))
+	require.NoDirExists(t, filepath.Join(dstBase, "implement"))
+	require.NoDirExists(t, filepath.Join(dstBase, "brainstorming"))
 }
 
 // ---- exec bit preservation ----
