@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // SkillsCloneRetryDelay controls the sleep between clone retry attempts.
@@ -15,16 +17,19 @@ var SkillsCloneRetryDelay = func(attempt int) {
 	time.Sleep(time.Duration(attempt) * 2 * time.Second)
 }
 
+// skillFrontmatter is the minimal YAML shape we care about in a SKILL.md header.
+type skillFrontmatter struct {
+	Profiles []string `yaml:"profiles"`
+}
+
 // parseProfiles extracts the profiles list from a SKILL.md YAML frontmatter
 // block. Returns nil (treated as wildcard: install in any profile) when
 // frontmatter is absent, malformed, or the profiles field is not present.
-// Supports inline list form: profiles: ["a","b"] and block list form:
-//
-//	profiles:
-//	  - a
-//	  - b
+// Supports inline list form (profiles: ["a","b"]) and block list form, and
+// CRLF line endings. Uses yaml.v3 so block-scalar values (description: >)
+// cannot produce false matches.
 func parseProfiles(skillMD []byte) []string {
-	s := string(skillMD)
+	s := strings.ReplaceAll(string(skillMD), "\r\n", "\n")
 	if !strings.HasPrefix(s, "---\n") {
 		return nil
 	}
@@ -33,52 +38,11 @@ func parseProfiles(skillMD []byte) []string {
 		return nil
 	}
 	fm := s[4 : 4+end]
-	lines := strings.Split(fm, "\n")
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "profiles:") {
-			continue
-		}
-		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "profiles:"))
-		// inline list: profiles: ["a", "b"] or profiles: [a, b]
-		if strings.HasPrefix(rest, "[") {
-			inner := rest
-			if strings.HasSuffix(inner, "]") {
-				inner = inner[1 : len(inner)-1]
-			}
-			if strings.TrimSpace(inner) == "" {
-				return []string{}
-			}
-			parts := strings.Split(inner, ",")
-			out := make([]string, 0, len(parts))
-			for _, p := range parts {
-				v := strings.TrimSpace(p)
-				v = strings.Trim(v, `"'`)
-				if v != "" {
-					out = append(out, v)
-				}
-			}
-			return out
-		}
-		// block list: lines following profiles: that start with "- "
-		if rest == "" {
-			var out []string
-			for _, bl := range lines[i+1:] {
-				bt := strings.TrimSpace(bl)
-				if strings.HasPrefix(bt, "- ") {
-					v := strings.TrimSpace(strings.TrimPrefix(bt, "- "))
-					v = strings.Trim(v, `"'`)
-					out = append(out, v)
-				} else if bt != "" && !strings.HasPrefix(bt, "#") {
-					break // end of block list
-				}
-			}
-			return out
-		}
-		// single bare value (unusual)
-		return []string{strings.Trim(rest, `"'`)}
+	var out skillFrontmatter
+	if err := yaml.Unmarshal([]byte(fm), &out); err != nil {
+		return nil
 	}
-	return nil
+	return out.Profiles
 }
 
 // shouldInstall returns true when the skill should be installed for activeProfile.
@@ -140,21 +104,41 @@ func cloneSkillsRepo(p Params, git GitRunner) error {
 
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		if err := git("", "clone", "--depth", "1", "-b", ref, repo, p.SkillsCloneDir); err == nil {
+		// Remove any partial state from a previous failed attempt so that
+		// "git init" does not see a pre-existing .git and so the .git stat
+		// guard above cannot be tripped by a half-initialised directory.
+		if attempt > 1 {
+			_ = os.RemoveAll(p.SkillsCloneDir)
+		}
+		// SHA-ref-safe fetch sequence. "git clone -b <ref>" rejects raw commit
+		// SHAs ("Remote branch <sha> not found"); "git fetch origin <ref>" accepts
+		// branches, tags, and reachable commit SHAs uniformly (GitHub allows
+		// fetching any reachable SHA with --depth 1).
+		var stepErr error
+		for _, step := range []func() error{
+			func() error { return git("", "init", "-q", p.SkillsCloneDir) },
+			func() error { return git(p.SkillsCloneDir, "remote", "add", "origin", repo) },
+			func() error { return git(p.SkillsCloneDir, "fetch", "--depth", "1", "origin", ref) },
+			func() error { return git(p.SkillsCloneDir, "checkout", "-q", "--detach", "FETCH_HEAD") },
+		} {
+			if stepErr = step(); stepErr != nil {
+				break
+			}
+		}
+		if stepErr == nil {
 			if p.Log != nil {
 				p.Log.Info("skills repo cloned", "action", "skills_clone",
 					"repo", repo, "ref", ref, "dir", p.SkillsCloneDir)
 			}
 			return nil
-		} else {
-			lastErr = err
-			if p.Log != nil {
-				p.Log.Warn("skills clone attempt failed", "action", "skills_clone",
-					"attempt", attempt, "error", err)
-			}
-			if attempt < 3 {
-				SkillsCloneRetryDelay(attempt)
-			}
+		}
+		lastErr = stepErr
+		if p.Log != nil {
+			p.Log.Warn("skills clone attempt failed", "action", "skills_clone",
+				"attempt", attempt, "error", stepErr)
+		}
+		if attempt < 3 {
+			SkillsCloneRetryDelay(attempt)
 		}
 	}
 

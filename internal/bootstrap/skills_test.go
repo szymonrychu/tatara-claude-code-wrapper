@@ -74,6 +74,25 @@ func TestParseProfiles_UnterminatedFrontmatter_ReturnsNil(t *testing.T) {
 	require.Nil(t, got)
 }
 
+// TestParseProfiles_BlockScalarNoFalseMatch asserts that a "profiles:" key
+// indented inside a description: > block scalar is NOT treated as the profiles
+// field; only the top-level profiles key is returned.
+func TestParseProfiles_BlockScalarNoFalseMatch(t *testing.T) {
+	// "profiles: [\"fake\"]" is indented under "description: >" - must be ignored.
+	// The real "profiles: [\"brainstorm\"]" sits at column 0 after the block.
+	input := "---\nname: foo\ndescription: >\n  profiles: [\"fake\"]\nprofiles: [\"brainstorm\"]\n---\n# body"
+	got := parseProfiles([]byte(input))
+	require.Equal(t, []string{"brainstorm"}, got)
+}
+
+// TestParseProfiles_CRLF asserts that files with CRLF line endings are
+// correctly parsed (filtering stays active, profiles is not nil).
+func TestParseProfiles_CRLF(t *testing.T) {
+	input := "---\r\nname: foo\r\nprofiles: [\"review\"]\r\n---\r\n# body"
+	got := parseProfiles([]byte(input))
+	require.Equal(t, []string{"review"}, got)
+}
+
 // ---- filter decision tests ----
 
 func TestShouldInstall_Matrix(t *testing.T) {
@@ -258,9 +277,10 @@ func TestCloneSkillsRepo_FailOpen(t *testing.T) {
 		SkillsCloneDir: cloneDir,
 		M:              m,
 	}
+	// Fail on "fetch" (the step that breaks for SHA refs), not "clone".
 	stubGit := func(_ string, args ...string) error {
-		if len(args) > 0 && args[0] == "clone" {
-			return fmt.Errorf("simulated clone failure")
+		if len(args) > 0 && args[0] == "fetch" {
+			return fmt.Errorf("simulated fetch failure")
 		}
 		return nil
 	}
@@ -279,6 +299,84 @@ func TestCloneSkillsRepo_FailOpen(t *testing.T) {
 		}
 	}
 	require.Equal(t, float64(1), failCount, "clone failure counter must be 1")
+}
+
+// TestCloneSkillsRepo_UsesFetchNotCloneB asserts that the git command sequence
+// uses init+remote+fetch+checkout (never "clone -b"), locking in SHA-ref support.
+func TestCloneSkillsRepo_UsesFetchNotCloneB(t *testing.T) {
+	orig := SkillsCloneRetryDelay
+	SkillsCloneRetryDelay = func(int) {}
+	defer func() { SkillsCloneRetryDelay = orig }()
+
+	cloneDir := filepath.Join(t.TempDir(), "skills-clone")
+	var cmds []string
+	stubGit := func(_ string, args ...string) error {
+		cmds = append(cmds, strings.Join(args, " "))
+		return nil
+	}
+	p := Params{
+		SkillsRepo:     "https://github.com/example/repo",
+		SkillsRef:      "abc1234abc1234abc1234abc1234abc1234abc1234", // fake SHA
+		SkillsCloneDir: cloneDir,
+	}
+	require.NoError(t, cloneSkillsRepo(p, stubGit))
+
+	hasFetch := false
+	hasDetach := false
+	for _, cmd := range cmds {
+		require.NotContains(t, cmd, " clone ", "git clone must not be used for SHA refs")
+		require.NotContains(t, cmd, " -b ", "-b branch flag must not be used")
+		if strings.HasPrefix(cmd, "fetch") {
+			hasFetch = true
+		}
+		if strings.Contains(cmd, "--detach") {
+			hasDetach = true
+		}
+	}
+	require.True(t, hasFetch, "must use git fetch")
+	require.True(t, hasDetach, "must use git checkout --detach")
+}
+
+// TestCloneSkillsRepo_SHARef_RetryOnFetchFailure asserts that fetch failures
+// trigger retries and the clone eventually succeeds on the 3rd attempt.
+func TestCloneSkillsRepo_SHARef_RetryOnFetchFailure(t *testing.T) {
+	orig := SkillsCloneRetryDelay
+	SkillsCloneRetryDelay = func(int) {}
+	defer func() { SkillsCloneRetryDelay = orig }()
+
+	cloneDir := filepath.Join(t.TempDir(), "skills-clone")
+	fetchCalls := 0
+	stubGit := func(_ string, args ...string) error {
+		if len(args) > 0 && args[0] == "fetch" {
+			fetchCalls++
+			if fetchCalls < 3 {
+				return fmt.Errorf("simulated fetch failure attempt %d", fetchCalls)
+			}
+		}
+		return nil
+	}
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	p := Params{
+		SkillsRepo:     "https://github.com/example/repo",
+		SkillsRef:      "abc1234",
+		SkillsCloneDir: cloneDir,
+		M:              m,
+	}
+	require.NoError(t, cloneSkillsRepo(p, stubGit), "must succeed after retries")
+	require.Equal(t, 3, fetchCalls, "must have attempted fetch exactly 3 times")
+
+	// No failure counter since it ultimately succeeded.
+	mf, err := reg.Gather()
+	require.NoError(t, err)
+	for _, fam := range mf {
+		if fam.GetName() == "wrapper_skills_clone_failures_total" {
+			for _, mm := range fam.GetMetric() {
+				require.Equal(t, float64(0), mm.GetCounter().GetValue(),
+					"no failure counter when retries succeed")
+			}
+		}
+	}
 }
 
 func TestCloneSkillsRepo_NoRepo_NoOp(t *testing.T) {
@@ -304,8 +402,9 @@ func TestRender_SkillsCloneFailure_BootContinues(t *testing.T) {
 		SkillsRepo:     "https://github.com/szymonrychu/tatara-agent-skills",
 		SkillsCloneDir: cloneDir,
 	}
+	// Fail on "fetch" (the step that breaks for SHA refs), not "clone".
 	stubGit := func(_ string, args ...string) error {
-		if len(args) > 0 && args[0] == "clone" {
+		if len(args) > 0 && args[0] == "fetch" {
 			return fmt.Errorf("network down")
 		}
 		return nil

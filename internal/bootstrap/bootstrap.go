@@ -276,12 +276,9 @@ func Render(p Params, git GitRunner) error {
 		}
 		return err
 	}
-	if err := cloneSkillsRepo(p, git); err != nil {
-		if p.M != nil {
-			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
-		}
-		return err
-	}
+	// cloneSkillsRepo is fail-open (always returns nil); discard the error
+	// explicitly so the intent is clear and errcheck linters are satisfied.
+	_ = cloneSkillsRepo(p, git)
 	if err := installSkills(p); err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
