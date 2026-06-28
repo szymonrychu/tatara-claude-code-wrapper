@@ -103,3 +103,16 @@ func TestLoadConfig_SkillsFromEnv(t *testing.T) {
 	require.Equal(t, "https://github.com/custom/skills", cfg.SkillsRepo)
 	require.Equal(t, "v1.2.3", cfg.SkillsRef)
 }
+
+func TestLoadConfig_FullCloneDefaultFalse(t *testing.T) {
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.False(t, cfg.FullClone, "TATARA_WORKSPACE_FULL_CLONE unset must default false")
+}
+
+func TestLoadConfig_FullCloneFromEnv(t *testing.T) {
+	t.Setenv("TATARA_WORKSPACE_FULL_CLONE", "true")
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.True(t, cfg.FullClone)
+}

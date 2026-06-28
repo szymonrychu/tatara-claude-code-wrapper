@@ -44,7 +44,11 @@ type Params struct {
 	// TaskBranch is empty: an MR review agent works on the PR head but the turn
 	// finaliser only pushes when TaskBranch is set (issue #114 decision 4).
 	CheckoutBranch string
-	Repos          []RepoSpec
+	// FullClone, when true, skips --depth 1 so the agent gets all history and all
+	// branches. Intended for project-scoped pods (brainstorm/incident/refine/
+	// healthCheck) that need cross-branch context. Default false = shallow clone.
+	FullClone bool
+	Repos     []RepoSpec
 
 	// Lifecycle hook commands (operator-supplied via the Project CRD, delivered
 	// as HOOK_* env vars). Empty means the hook is disabled. preClone/postClone
@@ -78,16 +82,17 @@ type GitRunner func(dir string, args ...string) error
 // to the fresh-task path: plain "checkout -b <branch>".
 // Returns (resumed=true, nil) on the resume path, (false, nil) on the fresh
 // path, so callers can set action="resume" without a second ls-remote call.
-func checkoutTaskBranch(dir, taskBranch string, git GitRunner) (resumed bool, err error) {
+func checkoutTaskBranch(dir, taskBranch string, fullClone bool, git GitRunner) (resumed bool, err error) {
 	branchExists := git(dir, "ls-remote", "--exit-code", "--heads", "origin", taskBranch) == nil
 	if branchExists {
-		// Unshallow so the rebase against origin/<default> has a merge base. The
-		// clone is always --depth 1 (single-repo or multi-repo clone above), so
-		// unshallow always applies and a failure here is real (network), not the
-		// benign "already complete" case -- propagate it rather than proceed with a
-		// shallow clone whose rebase would fail with no merge base.
-		if err := git(dir, "fetch", "--unshallow", "origin"); err != nil {
-			return false, fmt.Errorf("unshallow for resume of %s: %w", taskBranch, err)
+		// Unshallow so the rebase against origin/<default> has a merge base. Only
+		// when the clone was shallow (FullClone=false): `git fetch --unshallow` on
+		// an already-complete repo fatals ("does not make sense"), so skip it for a
+		// full clone, which already has the full history.
+		if !fullClone {
+			if err := git(dir, "fetch", "--unshallow", "origin"); err != nil {
+				return false, fmt.Errorf("unshallow for resume of %s: %w", taskBranch, err)
+			}
 		}
 		if err := git(dir, "fetch", "origin", taskBranch); err != nil {
 			return false, fmt.Errorf("fetch remote task branch %s: %w", taskBranch, err)
@@ -150,7 +155,10 @@ func Render(p Params, git GitRunner) error {
 			cloneStart := time.Now()
 			// Skip clone when the repo is already present (pod restart with persistent workspace).
 			if _, statErr := os.Stat(filepath.Join(dest, ".git")); os.IsNotExist(statErr) {
-				args := []string{"clone", "--depth", "1"}
+				args := []string{"clone"}
+				if !p.FullClone {
+					args = append(args, "--depth", "1")
+				}
 				if r.Branch != "" {
 					args = append(args, "--branch", r.Branch)
 				}
@@ -171,7 +179,7 @@ func Render(p Params, git GitRunner) error {
 				// primary): a secondary repo silently left on the wrong branch
 				// would make the agent commit the wrong state. Fail loud so the
 				// operator retries the run.
-				resumed, err := checkoutTaskBranch(dest, checkoutBranch, git)
+				resumed, err := checkoutTaskBranch(dest, checkoutBranch, p.FullClone, git)
 				if err != nil {
 					if p.M != nil {
 						p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
@@ -210,7 +218,10 @@ func Render(p Params, git GitRunner) error {
 		RunHook("preClone", p.HookPreClone, p.Workspace, []string{p.RepoURL}, []string{"TATARA_HOOK_REPO_URL=" + p.RepoURL}, p.HookRun, p.Log, p.M)
 		cloneStart := time.Now()
 		if _, statErr := os.Stat(filepath.Join(repoDest, ".git")); os.IsNotExist(statErr) {
-			args := []string{"clone", "--depth", "1"}
+			args := []string{"clone"}
+			if !p.FullClone {
+				args = append(args, "--depth", "1")
+			}
 			if p.RepoBranch != "" {
 				args = append(args, "--branch", p.RepoBranch)
 			}
@@ -224,7 +235,7 @@ func Render(p Params, git GitRunner) error {
 		}
 		action := "clone"
 		if checkoutBranch != "" {
-			resumed, err := checkoutTaskBranch(repoDest, checkoutBranch, git)
+			resumed, err := checkoutTaskBranch(repoDest, checkoutBranch, p.FullClone, git)
 			if err != nil {
 				if p.M != nil {
 					p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
