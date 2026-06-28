@@ -189,7 +189,9 @@ func installSkills(p Params) error {
 
 // installSkillsFromSrc walks src looking for skill dirs (dirs that directly
 // contain SKILL.md). Each matched skill dir is filtered by profile and, if it
-// passes, copied wholesale into dst, preserving the relative path from src.
+// passes, copied wholesale into dst FLATTENED to the skill dir's basename
+// (dst/<skill>), dropping any category nesting from the source layout. Claude
+// Code only discovers skills one level under .claude/skills.
 func installSkillsFromSrc(src, dst string, p Params) (int, error) {
 	installed := 0
 	err := filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
@@ -221,7 +223,7 @@ func installSkillsFromSrc(src, dst string, p Params) (int, error) {
 			}
 			return filepath.SkipDir
 		}
-		target := filepath.Join(dst, rel)
+		target := filepath.Join(dst, filepath.Base(path))
 		if _, statErr := os.Stat(target); statErr == nil && p.Log != nil {
 			p.Log.Info("skill shadowed", "action", "install_skills", "rel", rel, "src", src)
 		}
