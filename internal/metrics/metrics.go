@@ -54,6 +54,10 @@ type Metrics struct {
 
 	// Internal issue reports from agents via the report_internal_issue MCP tool.
 	InternalIssueTotal *prometheus.CounterVec // labels: category, severity
+
+	// Skills delivery metrics (rule 13: boot-time clone and filter are fallible).
+	SkillsInstalled     *prometheus.CounterVec // label: profile
+	SkillsCloneFailures prometheus.Counter
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -117,6 +121,10 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_conversation_ops_total", Help: "Conversation transcript persistence operations by op and result."}, []string{"op", "result"}),
 		InternalIssueTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "tatara_wrapper_internal_issue_total", Help: "Agent-reported internal issues observed by the wrapper tailer, by category and severity."}, []string{"category", "severity"}),
+		SkillsInstalled: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wrapper_skills_installed_total", Help: "Skills installed at boot by profile."}, []string{"profile"}),
+		SkillsCloneFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "wrapper_skills_clone_failures_total", Help: "Skills repo boot-clone failures (after 3 retries)."}),
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
 		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal, m.Interjections,
@@ -124,6 +132,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.BootstrapHookInstall, m.LifecycleHookTotal, m.HookOutcome, m.MetricPushTotal,
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.HTTPInFlight, m.HTTPPanicsTotal,
 		m.AuthTotal, m.TurnResumes, m.OutcomeRepromptTotal, m.BootstrapRenderTotal,
-		m.TurnTokensTotal, m.TurnCostUSD, m.ConversationOpsTotal, m.InternalIssueTotal)
+		m.TurnTokensTotal, m.TurnCostUSD, m.ConversationOpsTotal, m.InternalIssueTotal,
+		m.SkillsInstalled, m.SkillsCloneFailures)
 	return m
 }
