@@ -398,6 +398,10 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		GrafanaMCPURL:   cfg.GrafanaMCPURL,
 		SerenaMCPURL:    cfg.SerenaMCPURL,
 		SkillsSrc:       strings.Split(cfg.SkillsSrcDirs, ":"),
+		SkillProfile:    cfg.SkillProfile,
+		SkillsRepo:      cfg.SkillsRepo,
+		SkillsRef:       cfg.SkillsRef,
+		SkillsCloneDir:  skillsCloneDir(cfg.SkillsSrcDirs),
 		HookCommand:     cfg.HookPath,
 		AllowedTools:    readLines(cfg.AllowedToolsPath),
 		EnableAllMCP:    true,
@@ -424,6 +428,19 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		Log: log,
 		M:   m,
 	}
+}
+
+// skillsCloneDir derives the skills-repo clone target from the first entry
+// in the colon-separated SkillsSrcDirs string. With the default
+// SKILLS_SRC_DIRS=/etc/wrapper/skills/skills this resolves to
+// /etc/wrapper/skills, which is the directory the boot clone populates.
+func skillsCloneDir(srcDirs string) string {
+	for _, p := range strings.SplitN(srcDirs, ":", 2) {
+		if p != "" {
+			return filepath.Dir(p)
+		}
+	}
+	return "/etc/wrapper/skills"
 }
 
 func parseLevel(s string) slog.Level {

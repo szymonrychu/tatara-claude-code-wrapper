@@ -26,6 +26,10 @@ type Params struct {
 	GrafanaMCPURL                   string
 	SerenaMCPURL                    string
 	SkillsSrc                       []string
+	SkillProfile                    string // TATARA_SKILL_PROFILE; empty = install all
+	SkillsRepo                      string // TATARA_SKILLS_REPO; URL to clone at boot
+	SkillsRef                       string // TATARA_SKILLS_REF; git ref for the clone
+	SkillsCloneDir                  string // directory where the skills repo is cloned
 	HookCommand                     string
 	AllowedTools                    []string
 	EnableAllMCP                    bool
@@ -267,6 +271,12 @@ func Render(p Params, git GitRunner) error {
 		return err
 	}
 	if err := writeClaudeJSON(p); err != nil {
+		if p.M != nil {
+			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
+		}
+		return err
+	}
+	if err := cloneSkillsRepo(p, git); err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
 		}
