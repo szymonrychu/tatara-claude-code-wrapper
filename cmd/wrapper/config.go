@@ -87,6 +87,12 @@ type config struct {
 	// OBJECT_KEY) so the operator needs no change. Surfaced to the agent via
 	// the httpapi handoff preamble on this pod's first goal submission.
 	ConversationObjectKey string
+
+	// Native Claude Code OpenTelemetry (cost/token/429 backstop). Both must be
+	// set for the wrapper to enable it: OtelEnabled alone with an empty endpoint
+	// must not turn on telemetry with nowhere to send it.
+	OtelEnabled  bool
+	OtelEndpoint string
 }
 
 func loadConfig(args []string) (config, error) {
@@ -107,6 +113,10 @@ func loadConfig(args []string) (config, error) {
 		return config{}, err
 	}
 	fc, err := envBoolOr("TATARA_WORKSPACE_FULL_CLONE", false)
+	if err != nil {
+		return config{}, err
+	}
+	oe, err := envBoolOr("OTEL_ENABLED", false)
 	if err != nil {
 		return config{}, err
 	}
@@ -165,6 +175,9 @@ func loadConfig(args []string) (config, error) {
 		FullClone: fc,
 
 		ConversationObjectKey: envOr("CONVERSATION_OBJECT_KEY", ""),
+
+		OtelEnabled:  oe,
+		OtelEndpoint: envOr("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 	}
 	if raw := os.Getenv("TATARA_REPOS"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.Repos); err != nil {
