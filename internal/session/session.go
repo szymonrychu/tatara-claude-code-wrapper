@@ -53,6 +53,13 @@ type Config struct {
 	// relaunches still use --continue (most recent), which is this same
 	// conversation once resumed.
 	ResumeSessionID string
+
+	// Kind, RepoName, Project are the pod's metric-identity labels (component 6),
+	// set once by the operator env and stamped onto every per-turn token/cost
+	// series so spend attributes to a Task kind, repo, and project.
+	Kind     string
+	RepoName string
+	Project  string
 }
 
 // HookResult is the payload cc-stop-hook POSTs to the internal endpoint.
@@ -955,15 +962,16 @@ func (mgr *Manager) Complete(r HookResult) error {
 // TurnTokens (the last-message Usage undercounts agentic turns); cost comes from
 // result.json's total_cost_usd when the agent wrote one.
 func (mgr *Manager) meterTokens(r HookResult) {
+	kind, repo, project := mgr.cfg.Kind, mgr.cfg.RepoName, mgr.cfg.Project
 	for _, t := range r.TurnTokens {
 		model := t.Model
 		if model == "" {
 			model = "unknown"
 		}
-		mgr.m.TurnTokensTotal.WithLabelValues("input", model).Add(float64(t.Input))
-		mgr.m.TurnTokensTotal.WithLabelValues("output", model).Add(float64(t.Output))
-		mgr.m.TurnTokensTotal.WithLabelValues("cache_read", model).Add(float64(t.CacheRead))
-		mgr.m.TurnTokensTotal.WithLabelValues("cache_creation", model).Add(float64(t.CacheCreation))
+		mgr.m.TurnTokensTotal.WithLabelValues("input", model, kind, repo, project).Add(float64(t.Input))
+		mgr.m.TurnTokensTotal.WithLabelValues("output", model, kind, repo, project).Add(float64(t.Output))
+		mgr.m.TurnTokensTotal.WithLabelValues("cache_read", model, kind, repo, project).Add(float64(t.CacheRead))
+		mgr.m.TurnTokensTotal.WithLabelValues("cache_creation", model, kind, repo, project).Add(float64(t.CacheCreation))
 	}
 	if len(r.ResultJSON) > 0 {
 		var rj struct {
@@ -972,10 +980,14 @@ func (mgr *Manager) meterTokens(r HookResult) {
 		if err := json.Unmarshal(r.ResultJSON, &rj); err != nil {
 			mgr.log.Warn("turn cost: malformed result.json, skipping", "err", err)
 		} else if rj.TotalCostUSD != nil {
-			mgr.m.TurnCostUSD.Add(*rj.TotalCostUSD)
+			mgr.m.TurnCostUSD.WithLabelValues(kind, repo, project).Add(*rj.TotalCostUSD)
 		}
 	}
 }
+
+// MeterTokensForTest exposes meterTokens to the external session_test package so
+// the metric-label wiring can be asserted without driving a full turn.
+func (mgr *Manager) MeterTokensForTest(r HookResult) { mgr.meterTokens(r) }
 
 func (mgr *Manager) failTimeout(id string) {
 	mgr.mu.Lock()
