@@ -126,3 +126,27 @@ func TestLoadConfig_FullCloneEmptyStringDefaults(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, cfg.FullClone)
 }
+
+func TestLoadConfig_MetricLabelEnv(t *testing.T) {
+	t.Setenv("TATARA_KIND", "review")
+	t.Setenv("TATARA_REPO", "tatara-operator")
+	t.Setenv("TATARA_PROJECT", "tatara")
+
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, "review", cfg.Kind)
+	require.Equal(t, "tatara-operator", cfg.RepoName)
+	require.Equal(t, "tatara", cfg.Project)
+}
+
+func TestLoadConfig_MetricLabelEnv_DefaultsEmpty(t *testing.T) {
+	t.Setenv("TATARA_KIND", "")
+	t.Setenv("TATARA_REPO", "")
+	t.Setenv("TATARA_PROJECT", "")
+
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, "", cfg.Kind)
+	require.Equal(t, "", cfg.RepoName)
+	require.Equal(t, "", cfg.Project)
+}

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
@@ -1776,4 +1777,59 @@ func TestResumeTurn_EmitsTurnResumesMetricAndDurationMs(t *testing.T) {
 		}
 	}
 	require.True(t, found, "no 'resumed in-flight turn after relaunch' log found")
+}
+
+func TestMeterTokens_EmitsIdentityLabels(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	mgr := session.New(
+		session.Config{Kind: "implement", RepoName: "tatara-operator", Project: "tatara"},
+		turn.NewStore(), m, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		time.Now, func() string { return "t1" },
+	)
+
+	mgr.MeterTokensForTest(session.HookResult{
+		TurnTokens: []session.TurnTokens{
+			{Model: "claude-opus-4-8", Input: 100, Output: 20, CacheRead: 500, CacheCreation: 30},
+		},
+		ResultJSON: json.RawMessage(`{"total_cost_usd": 0.25}`),
+	})
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	byName := map[string]*dto.MetricFamily{}
+	for _, mf := range mfs {
+		byName[mf.GetName()] = mf
+	}
+
+	// cache_read series carries the identity labels + value 500.
+	tok := byName["ccw_turn_tokens_total"]
+	require.NotNil(t, tok)
+	var cacheRead *dto.Metric
+	for _, mc := range tok.GetMetric() {
+		lbl := map[string]string{}
+		for _, lp := range mc.GetLabel() {
+			lbl[lp.GetName()] = lp.GetValue()
+		}
+		if lbl["type"] == "cache_read" {
+			cacheRead = mc
+			require.Equal(t, "implement", lbl["kind"])
+			require.Equal(t, "tatara-operator", lbl["repo"])
+			require.Equal(t, "tatara", lbl["project"])
+			require.Equal(t, "claude-opus-4-8", lbl["model"])
+		}
+	}
+	require.NotNil(t, cacheRead, "cache_read series missing")
+	require.Equal(t, float64(500), cacheRead.GetCounter().GetValue())
+
+	// cost carries the identity labels + value 0.25.
+	cost := byName["ccw_turn_cost_usd_total"]
+	require.NotNil(t, cost)
+	require.Len(t, cost.GetMetric(), 1)
+	lbl := map[string]string{}
+	for _, lp := range cost.GetMetric()[0].GetLabel() {
+		lbl[lp.GetName()] = lp.GetValue()
+	}
+	require.Equal(t, map[string]string{"kind": "implement", "repo": "tatara-operator", "project": "tatara"}, lbl)
+	require.Equal(t, 0.25, cost.GetMetric()[0].GetCounter().GetValue())
 }

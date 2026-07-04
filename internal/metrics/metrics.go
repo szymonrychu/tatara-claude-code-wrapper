@@ -45,8 +45,8 @@ type Metrics struct {
 	// Per-turn token/cost metrics (rule 13: tokens are the loop's primary cost
 	// driver and the clearest runaway signal). Counters keep the cumulative-spend
 	// property the operator can later budget on.
-	TurnTokensTotal *prometheus.CounterVec // labels: type=input|output|cache_read|cache_creation, model
-	TurnCostUSD     prometheus.Counter     // emitted only when result.json carries total_cost_usd
+	TurnTokensTotal *prometheus.CounterVec // labels: type=input|output|cache_read|cache_creation, model, kind, repo, project
+	TurnCostUSD     *prometheus.CounterVec // labels: kind, repo, project (from result.json total_cost_usd)
 
 	// Conversation persistence (issue #114): upload-on-turn-finish and
 	// restore-on-boot of the S3 transcript blob.
@@ -121,9 +121,9 @@ func New(reg prometheus.Registerer) *Metrics {
 		BootstrapRenderTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_bootstrap_render_total", Help: "Bootstrap config-render steps by result (ok|fail)."}, []string{"result"}),
 		TurnTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ccw_turn_tokens_total", Help: "Claude tokens consumed per turn, summed across the turn, by token type and model."}, []string{"type", "model"}),
-		TurnCostUSD: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "ccw_turn_cost_usd_total", Help: "Cumulative Claude turn cost in USD (from result.json total_cost_usd when present)."}),
+			Name: "ccw_turn_tokens_total", Help: "Claude tokens consumed per turn, summed across the turn, by token type, model, Task kind, repo, and project."}, []string{"type", "model", "kind", "repo", "project"}),
+		TurnCostUSD: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_turn_cost_usd_total", Help: "Cumulative Claude turn cost in USD (from result.json total_cost_usd when present), by Task kind, repo, and project."}, []string{"kind", "repo", "project"}),
 		ConversationOpsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_conversation_ops_total", Help: "Conversation transcript persistence operations by op and result."}, []string{"op", "result"}),
 		InternalIssueTotal: prometheus.NewCounterVec(prometheus.CounterOpts{

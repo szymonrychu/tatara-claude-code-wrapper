@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
@@ -86,4 +87,52 @@ func TestMetrics_StreamEventsTotal(t *testing.T) {
 		}
 	}
 	t.Fatal("ccw_stream_events_total not found")
+}
+
+// TestMetrics_TokenCostLabels asserts the token+cost metrics carry the
+// kind/repo/project labels sourced from the pod env (component 6). Table-driven
+// over both families.
+func TestMetrics_TokenCostLabels(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+
+	m.TurnTokensTotal.WithLabelValues("cache_read", "claude-sonnet-5", "review", "tatara-operator", "tatara").Add(42)
+	m.TurnCostUSD.WithLabelValues("review", "tatara-operator", "tatara").Add(0.5)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	byName := map[string]*dto.MetricFamily{}
+	for _, mf := range mfs {
+		byName[mf.GetName()] = mf
+	}
+
+	cases := []struct {
+		metric     string
+		wantLabels map[string]string
+		wantValue  float64
+	}{
+		{
+			metric:     "ccw_turn_tokens_total",
+			wantLabels: map[string]string{"type": "cache_read", "model": "claude-sonnet-5", "kind": "review", "repo": "tatara-operator", "project": "tatara"},
+			wantValue:  42,
+		},
+		{
+			metric:     "ccw_turn_cost_usd_total",
+			wantLabels: map[string]string{"kind": "review", "repo": "tatara-operator", "project": "tatara"},
+			wantValue:  0.5,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.metric, func(t *testing.T) {
+			mf := byName[tc.metric]
+			require.NotNil(t, mf, "family %s not registered", tc.metric)
+			require.Len(t, mf.GetMetric(), 1)
+			got := map[string]string{}
+			for _, lp := range mf.GetMetric()[0].GetLabel() {
+				got[lp.GetName()] = lp.GetValue()
+			}
+			require.Equal(t, tc.wantLabels, got)
+			require.Equal(t, tc.wantValue, mf.GetMetric()[0].GetCounter().GetValue())
+		})
+	}
 }
