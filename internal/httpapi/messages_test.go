@@ -24,6 +24,7 @@ import (
 type fakeCtl struct {
 	submitID       string
 	submitErr      error
+	submitErrs     []error // if set, consumed in order per call; falls back to submitErr once exhausted
 	interjectErr   error
 	interjected    string
 	completed      session.HookResult
@@ -33,6 +34,11 @@ type fakeCtl struct {
 
 func (f *fakeCtl) Submit(text, cb string) (string, error) {
 	f.submittedTexts = append(f.submittedTexts, text)
+	if len(f.submitErrs) > 0 {
+		err := f.submitErrs[0]
+		f.submitErrs = f.submitErrs[1:]
+		return f.submitID, err
+	}
 	return f.submitID, f.submitErr
 }
 func (f *fakeCtl) Interject(text string) error         { f.interjected = text; return f.interjectErr }
@@ -225,6 +231,32 @@ func TestPostMessage_NoHandoffKey_NoPreamble(t *testing.T) {
 	require.Equal(t, http.StatusAccepted, rec.Code)
 
 	require.Equal(t, []string{"do the thing"}, ctl.submittedTexts)
+}
+
+// TestPostMessage_HandoffPreamble_SurvivesFailedFirstSubmit verifies that a
+// failed first Submit (e.g. pod still Booting) does not permanently consume
+// the one-shot handoff preamble: the retry must still carry it.
+func TestPostMessage_HandoffPreamble_SurvivesFailedFirstSubmit(t *testing.T) {
+	ctl := &fakeCtl{submitID: "t", submitErrs: []error{errors.New("session not ready")}}
+	api := httpapi.New(httpapi.Deps{Ctl: ctl, Store: turn.NewStore(), HandoffKey: "issue-42"})
+
+	body, _ := json.Marshal(map[string]string{"text": "do the thing"})
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	rec1 := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec1, req1)
+	require.Equal(t, http.StatusServiceUnavailable, rec1.Code)
+
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	rec2 := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec2, req2)
+	require.Equal(t, http.StatusAccepted, rec2.Code)
+
+	require.Len(t, ctl.submittedTexts, 2)
+	want := "Continuation key: issue-42. If you have prior context, call get_handoff " +
+		"with this key before starting, and write_handoff an updated summary before " +
+		"you finish.\n\ndo the thing"
+	require.Equal(t, want, ctl.submittedTexts[0], "failed first submission must still carry the preamble")
+	require.Equal(t, want, ctl.submittedTexts[1], "retry must carry the preamble since the first submit never succeeded")
 }
 
 // newAPIWithLog builds an API that writes structured logs to logBuf.

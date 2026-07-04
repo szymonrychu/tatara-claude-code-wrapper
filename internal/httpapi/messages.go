@@ -86,15 +86,23 @@ func (a *API) postMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	text := req.Text
-	if a.handoffKey != "" && a.handoffSent.CompareAndSwap(false, true) {
+	claimedPreamble := a.handoffKey != "" && a.handoffSent.CompareAndSwap(false, true)
+	if claimedPreamble {
 		text = fmt.Sprintf(handoffPreambleFmt, a.handoffKey, req.Text)
 	}
 	id, err := a.ctl.Submit(text, req.CallbackURL)
-	if errors.Is(err, session.ErrBusy) {
-		http.Error(w, "session busy", http.StatusConflict)
-		return
-	}
 	if err != nil {
+		// Submit failed - this pod's first goal never actually went out, so
+		// release the one-shot claim: the retry (or a concurrent caller)
+		// must still get the handoff preamble, otherwise cross-pod
+		// continuity is silently lost.
+		if claimedPreamble {
+			a.handoffSent.Store(false)
+		}
+		if errors.Is(err, session.ErrBusy) {
+			http.Error(w, "session busy", http.StatusConflict)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
