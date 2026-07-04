@@ -29,11 +29,18 @@ type config struct {
 	// CheckoutBranch is a branch to check out read-only after clone when no
 	// TaskBranch is set (issue #114 decision 4: an MR review agent works on the
 	// PR head but never pushes). TaskBranch takes precedence when both are set.
-	CheckoutBranch      string
-	DefaultCallbackURL  string
-	OperatorPushURL     string
-	RunID               string
-	PodName             string
+	CheckoutBranch     string
+	DefaultCallbackURL string
+	OperatorPushURL    string
+	RunID              string
+	PodName            string
+	// Metric identity labels (component 6): the operator sets these on the pod
+	// env so the wrapper's per-turn token/cost metrics attribute spend to a
+	// Task kind, repo, and project. Empty for values the operator does not set
+	// (e.g. RepoName is empty for project-scoped kinds).
+	Kind                string
+	RepoName            string
+	Project             string
 	TurnTimeoutSeconds  int
 	BootTimeoutSeconds  int
 	PushIntervalSeconds int
@@ -138,6 +145,9 @@ func loadConfig(args []string) (config, error) {
 		OperatorPushURL:     envOr("OPERATOR_PUSH_URL", ""),
 		RunID:               envOr("RUN_ID", ""),
 		PodName:             envOr("POD_NAME", ""),
+		Kind:                envOr("TATARA_KIND", ""),
+		RepoName:            envOr("TATARA_REPO", ""),
+		Project:             envOr("TATARA_PROJECT", ""),
 		TurnTimeoutSeconds:  ti,
 		BootTimeoutSeconds:  bt,
 		PushIntervalSeconds: pi,
