@@ -32,7 +32,7 @@ type Metrics struct {
 	AuthTotal *prometheus.CounterVec // label: result=ok|rejected
 
 	// Turn resume counter (rule 13: distinct fallible business action).
-	TurnResumes *prometheus.CounterVec // labels: result=ok|write_fail, resume_mode=nudge|complete_from_transcript
+	TurnResumes *prometheus.CounterVec // labels: result=ok|write_fail, resume_mode=nudge|resubmit|complete_from_transcript
 
 	// Outcome-rejection re-prompt counter (rule 13): a critical outcome tool
 	// (decline_implementation/already_done) the operator rejected, surfaced back
@@ -115,7 +115,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		AuthTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_auth_total", Help: "Auth outcomes by result (ok|rejected)."}, []string{"result"}),
 		TurnResumes: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ccw_turn_resumes_total", Help: "Turn resume attempts by result (ok|write_fail) and mode (nudge|complete_from_transcript)."}, []string{"result", "resume_mode"}),
+			Name: "ccw_turn_resumes_total", Help: "Turn resume attempts by result (ok|write_fail) and mode (nudge|resubmit|complete_from_transcript)."}, []string{"result", "resume_mode"}),
 		OutcomeRepromptTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_outcome_reprompt_total", Help: "Critical-outcome MCP tool rejections re-prompted to the agent, by tool and result."}, []string{"tool", "result"}),
 		BootstrapRenderTotal: prometheus.NewCounterVec(prometheus.CounterOpts{

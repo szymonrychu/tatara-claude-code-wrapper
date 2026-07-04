@@ -143,6 +143,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	sess := session.New(session.Config{
 		ClaudePath:      cfg.ClaudePath,
 		Workspace:       cfg.Workspace,
+		HomeDir:         cfg.HomeDir,
 		Env:             claudeEnv(cfg),
 		Model:           cfg.Model,
 		Effort:          cfg.Effort,

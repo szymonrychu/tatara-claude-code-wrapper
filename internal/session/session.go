@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/convstore"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/transcript"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
@@ -35,8 +37,13 @@ var ErrBusy = errors.New("session busy")
 var ErrNotBusy = errors.New("no in-flight turn to interject")
 
 type Config struct {
-	ClaudePath  string
-	Workspace   string
+	ClaudePath string
+	Workspace  string
+	// HomeDir is claude's $HOME on this pod. Used only to locate
+	// ~/.claude/projects/<dir>/*.jsonl (convstore.TranscriptDir) for the
+	// shouldResume on-disk transcript check; "" disables that check (no false
+	// resume from a directory we cannot compute).
+	HomeDir     string
 	Env         []string
 	Model       string
 	Effort      string
@@ -522,7 +529,8 @@ func (mgr *Manager) watch(proc claudeProcess) {
 	// terminal death where no relaunch occurs).
 	mgr.m.ClaudeRestarts.Inc()
 
-	if rerr := mgr.relaunch(); rerr != nil {
+	resumed, rerr := mgr.relaunch()
+	if rerr != nil {
 		mgr.mu.Lock()
 		mgr.state = Dead
 		mgr.mu.Unlock()
@@ -532,20 +540,24 @@ func (mgr *Manager) watch(proc claudeProcess) {
 		}
 		return
 	}
-	mgr.log.Info("claude relaunched after exit", "attempt", attempt, "resumed_turn", inFlight)
+	mgr.log.Info("claude relaunched after exit", "attempt", attempt, "resumed_turn", inFlight, "resumed_conversation", resumed)
 	if inFlight != "" {
-		mgr.resumeTurn(inFlight)
+		mgr.resumeTurn(inFlight, resumed)
 	}
 }
 
 // relaunch spawns a fresh claude (with --continue when a conversation exists),
 // rewires the PTY, restarts the reader+watcher, and waits for boot. The new
 // watch goroutine handles the next death (restarts persists across relaunches).
-func (mgr *Manager) relaunch() error {
+// The returned bool reports whether an existing conversation was resumed
+// (--continue); the caller (watch) threads it into resumeTurn so a fresh
+// relaunch re-submits the original prompt instead of nudging a conversation
+// that was never restored (finding 2).
+func (mgr *Manager) relaunch() (resumed bool, err error) {
 	resume := mgr.shouldResume()
 	proc, err := mgr.spawn(mgr.cfg, resume)
 	if err != nil {
-		return err
+		return false, err
 	}
 	mgr.mu.Lock()
 	// Re-check stopping under the lock after spawn (finding 8): if Shutdown ran
@@ -553,7 +565,7 @@ func (mgr *Manager) relaunch() error {
 	if mgr.stopping {
 		mgr.mu.Unlock()
 		_ = proc.Close()
-		return fmt.Errorf("session is shutting down")
+		return false, fmt.Errorf("session is shutting down")
 	}
 	old := mgr.proc
 	mgr.proc, mgr.w = proc, proc
@@ -580,45 +592,103 @@ func (mgr *Manager) relaunch() error {
 	if resume && mgr.OnRestart != nil {
 		mgr.OnRestart()
 	}
-	return nil
+	return resume, nil
 }
 
 // shouldResume reports whether a prior conversation exists to --continue.
 // Invariant: resume only when a transcript was actually persisted (a turn has
-// completed, or a transcript path was recorded by a Stop hook). An in-flight
-// turn (mgr.current != "") is NOT sufficient on its own: Submit() sets
-// mgr.current the instant a turn is accepted, before claude has written
-// anything to disk, so a crash in that window has no conversation to
-// --continue into. Passing --continue there makes claude exit immediately
-// ("No conversation found to continue"), burning the whole restart budget on
-// an identical crash loop.
+// completed, a transcript path was recorded by a Stop hook, or a transcript
+// JSONL already exists on disk). An in-flight turn (mgr.current != "") is NOT
+// sufficient on its own: Submit() sets mgr.current the instant a turn is
+// accepted, before claude has written anything to disk, so a crash in that
+// window has no conversation to --continue into. Passing --continue there
+// makes claude exit immediately ("No conversation found to continue"),
+// burning the whole restart budget on an identical crash loop.
+//
+// The on-disk check covers a genuine mid-first-turn crash: claude did real
+// work and wrote ~/.claude/projects/<dir>/<sid>.jsonl, but the crash itself
+// killed the Stop hook before it could POST transcriptPath back. Without this
+// check that shape would relaunch fresh and discard a resumable conversation,
+// which is worse than the boot-crash bug this function was hardened against.
+// --continue's own precondition is exactly "does a transcript exist on disk",
+// so checking it directly here keeps shouldResume in lockstep with it.
 func (mgr *Manager) shouldResume() bool {
 	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-	return mgr.turnsCompleted > 0 || mgr.transcriptPath != ""
+	turnsCompleted := mgr.turnsCompleted
+	transcriptPath := mgr.transcriptPath
+	mgr.mu.Unlock()
+	if turnsCompleted > 0 || transcriptPath != "" {
+		return true
+	}
+	return mgr.transcriptExistsOnDisk()
 }
 
-// resumeTurn restores the in-flight turn after a crash+relaunch. --continue has
-// already restored the full conversation to disk, so resumeTurn first reads the
-// last message of the restored transcript to decide what the crash interrupted:
+// transcriptExistsOnDisk reports whether claude has any transcript on disk in
+// this pod's transcript directory (~/.claude/projects/<ProjectDirName(Workspace)>,
+// computed via convstore.TranscriptDir). It only checks for *presence* of any
+// *.jsonl, NOT a specific session id: at the point shouldResume runs (a crash
+// relaunch, never initial boot), --continue resumes "the most recent
+// conversation in the workspace" and there is no reliable session id to scope
+// to for the target case (a mid-first-turn crash whose Stop hook never fired,
+// so mgr.currentSessionID is still ""). Correctness rests on the one-pod =
+// one-conversation invariant: this pod owns its filesystem and writes at most
+// one conversation into this dir (its own, plus at most one Restore/Fork blob
+// at boot which IS this pod's conversation). A stray extra .jsonl would let
+// --continue pick a different conversation than the crashed turn; that is not
+// reachable in the current architecture but is not enforced here, so the match
+// count is logged for observability. Returns false (never resume) when HomeDir
+// or Workspace is unset, since TranscriptDir would be meaningless, and on any
+// glob error - this can only add resumes, never weaken the boot-crash-loop
+// protection.
+func (mgr *Manager) transcriptExistsOnDisk() bool {
+	if mgr.cfg.HomeDir == "" || mgr.cfg.Workspace == "" {
+		return false
+	}
+	dir := convstore.TranscriptDir(mgr.cfg.HomeDir, mgr.cfg.Workspace)
+	matches, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	if err != nil {
+		mgr.log.Warn("resume: transcript glob failed; treating as no on-disk transcript",
+			"action", "should_resume", "dir", dir, "err", err)
+		return false
+	}
+	if len(matches) == 0 {
+		return false
+	}
+	mgr.log.Info("resume: on-disk transcript present; relaunch will --continue",
+		"action", "should_resume", "dir", dir, "jsonl_count", len(matches))
+	return true
+}
+
+// resumeTurn restores the in-flight turn after a crash+relaunch. resumed
+// reports whether relaunch actually resumed an existing conversation
+// (--continue); it must never be assumed true just because a turn was in
+// flight (that was the original boot-crash bug).
 //
-//   - Turn still in flight (last message is the user prompt, a tool_result, or
-//     an assistant tool_use awaiting a tool) -> nudge: write a plain submit
-//     keystroke so claude picks up where it left off. The original prompt is NOT
-//     re-pasted (--continue already restored it; re-pasting would double-submit).
-//     A fresh timer replaces the stale one watch() stopped before relaunch, and
-//     the same turn id is kept so the eventual Stop hook still correlates.
+//   - resumed==false (fresh relaunch, no --continue): nothing was restored,
+//     so there is no conversation for a bare submit keystroke to land in.
+//     Re-send the turn's original prompt in full (paste+submit) from the
+//     store so claude actually runs it, instead of wedging Busy until
+//     TurnTimeout on an empty conversation.
+//   - resumed==true: --continue has restored the full conversation to disk,
+//     so resumeTurn reads the last message of the restored transcript to
+//     decide what the crash interrupted:
+//   - Turn still in flight (last message is the user prompt, a tool_result,
+//     or an assistant tool_use awaiting a tool) -> nudge: write a plain
+//     submit keystroke so claude picks up where it left off. The original
+//     prompt is NOT re-pasted (--continue already restored it; re-pasting
+//     would double-submit).
 //   - Turn already finished before the crash (last message is a terminal
-//     assistant answer, Stop hook never landed) -> complete from transcript: do
-//     NOT submit. A bare submit here injects an empty user turn and triggers
-//     duplicate work (hazard 1); leaving the turn unresolved wedges it Busy until
-//     TurnTimeout (hazard 2). Instead synthesize the result from the restored
-//     transcript so the operator gets the real output and the turn resolves now.
+//     assistant answer, Stop hook never landed) -> complete from
+//     transcript: do NOT submit. A bare submit here injects an empty user
+//     turn and triggers duplicate work (hazard 1); leaving the turn
+//     unresolved wedges it Busy until TurnTimeout (hazard 2). Instead
+//     synthesize the result from the restored transcript so the operator
+//     gets the real output and the turn resolves now.
 //
 // Any transcript read error or ambiguous shape falls through to the nudge so
 // resume is never worse than the pre-transcript behavior. No-op if the turn was
 // resolved during relaunch.
-func (mgr *Manager) resumeTurn(id string) {
+func (mgr *Manager) resumeTurn(id string, resumed bool) {
 	mgr.mu.Lock()
 	if mgr.current != id || mgr.state != Ready {
 		mgr.mu.Unlock()
@@ -638,6 +708,13 @@ func (mgr *Manager) resumeTurn(id string) {
 	path := mgr.transcriptPath
 	mgr.mu.Unlock()
 
+	if !resumed {
+		// Fresh relaunch: --continue restored nothing. A bare nudge here would
+		// land in an empty conversation and never actually re-run the turn.
+		mgr.resubmitOriginalPrompt(id, w, seq, started)
+		return
+	}
+
 	// Decide nudge vs complete-from-transcript by reading the restored transcript.
 	// tool_use is a mid-turn stop_reason (claude paused to run a tool), so it stays
 	// in-flight and falls through to the nudge; only a terminal assistant answer
@@ -656,33 +733,72 @@ func (mgr *Manager) resumeTurn(id string) {
 	}
 
 	// In-flight turn: send only the submit keystroke - the prompt is already in the
-	// restored conversation via --continue (finding 1).
+	// restored conversation via --continue.
 	if _, err := w.Write([]byte(seq.Submit)); err != nil {
 		mgr.m.TurnResumes.WithLabelValues("write_fail", "nudge").Inc()
 		mgr.failTurn(id, fmt.Sprintf("resume write submit: %v", err))
 		return
 	}
+	mgr.installResumeTimer(id, started, "nudge")
+}
 
-	// Re-acquire to install the fresh timer and flip state. Re-check that the
-	// turn is still current (a concurrent failTurn/Complete may have cleared it
-	// during the write). If it's no longer current, do nothing.
+// resubmitOriginalPrompt re-sends a turn's original prompt in full
+// (paste+submit) after a fresh relaunch (no --continue): nothing was restored,
+// so the bare-nudge sequence has no conversation to land in and the crashed
+// turn would otherwise never actually re-run. text comes back from the store
+// (the same prompt Submit originally wrote), and the write mirrors Submit's
+// own paste+SubmitDelay+submit sequence. Falls back to a bare nudge only if
+// the store has no record or empty text for id (should not happen in
+// practice; keeps resume no worse than a plain nudge).
+func (mgr *Manager) resubmitOriginalPrompt(id string, w ptyWriter, seq SubmitSequence, started time.Time) {
+	rec, ok := mgr.store.Get(id)
+	if !ok || rec.Text == "" {
+		mgr.log.Error("resume: turn text unavailable for fresh-relaunch resubmit; falling back to nudge",
+			"action", "turn_resume", "turn_id", id)
+		if _, err := w.Write([]byte(seq.Submit)); err != nil {
+			mgr.m.TurnResumes.WithLabelValues("write_fail", "nudge").Inc()
+			mgr.failTurn(id, fmt.Sprintf("resume write submit: %v", err))
+			return
+		}
+		mgr.installResumeTimer(id, started, "nudge")
+		return
+	}
+	if _, err := w.Write([]byte(seq.PasteStart + rec.Text + seq.PasteEnd)); err != nil {
+		mgr.m.TurnResumes.WithLabelValues("write_fail", "resubmit").Inc()
+		mgr.failTurn(id, fmt.Sprintf("resume write paste: %v", err))
+		return
+	}
+	time.Sleep(mgr.cfg.SubmitDelay)
+	if _, err := w.Write([]byte(seq.Submit)); err != nil {
+		mgr.m.TurnResumes.WithLabelValues("write_fail", "resubmit").Inc()
+		mgr.failTurn(id, fmt.Sprintf("resume write submit: %v", err))
+		return
+	}
+	mgr.installResumeTimer(id, started, "resubmit")
+}
+
+// installResumeTimer re-acquires the lock to install a fresh turn timer and
+// flip state back to Busy after a successful resume write (nudge or
+// resubmit), then records the outcome. Re-checks mgr.current in case a
+// concurrent failTurn/Complete cleared it during the write (no-op if so).
+func (mgr *Manager) installResumeTimer(id string, started time.Time, mode string) {
 	mgr.mu.Lock()
 	if mgr.current != id {
 		mgr.mu.Unlock()
 		return
 	}
-	// Install a fresh timer so the resumed turn gets a full TurnTimeout budget
-	// (finding 2). The old timer was stopped by watch() before relaunch. The timer
-	// is a relative AfterFunc, so the fresh budget needs no separate anchor field;
-	// crucially we do NOT touch currentStarted, so TurnDuration still reflects the
-	// full wall-clock including pre-crash time (audit finding 3).
+	// Install a fresh timer so the resumed turn gets a full TurnTimeout budget.
+	// The old timer was stopped by watch() before relaunch. The timer is a
+	// relative AfterFunc, so the fresh budget needs no separate anchor field;
+	// crucially we do NOT touch currentStarted, so TurnDuration still reflects
+	// the full wall-clock including pre-crash time (audit finding 3).
 	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.failTimeout(id) })
 	mgr.state = Busy
 	now := mgr.now()
 	mgr.mu.Unlock()
-	mgr.m.TurnResumes.WithLabelValues("ok", "nudge").Inc()
+	mgr.m.TurnResumes.WithLabelValues("ok", mode).Inc()
 	mgr.log.Info("resumed in-flight turn after relaunch", "action", "turn_resume", "turn_id", id,
-		"resume_mode", "nudge", "duration_ms", now.Sub(started).Milliseconds())
+		"resume_mode", mode, "duration_ms", now.Sub(started).Milliseconds())
 }
 
 // completeFromTranscript resolves an in-flight turn whose output claude finished

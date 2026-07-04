@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -154,6 +155,13 @@ func (st *spawnTracker) resume() bool {
 // short BootTimeout so bootWait exits fast (BootTimeout < minBoot=4s).
 func newRecoverMgr(t *testing.T, ids []string, maxRestarts int, st *spawnTracker) (*session.Manager, *turn.Store) {
 	t.Helper()
+	return newRecoverMgrWithRegistry(t, ids, maxRestarts, st, prometheus.NewRegistry())
+}
+
+// newRecoverMgrWithRegistry is newRecoverMgr with an explicit Prometheus
+// registry so a caller can assert resume-mode metrics.
+func newRecoverMgrWithRegistry(t *testing.T, ids []string, maxRestarts int, st *spawnTracker, reg *prometheus.Registry) (*session.Manager, *turn.Store) {
+	t.Helper()
 	store := turn.NewStore()
 	idx := 0
 	m := session.New(
@@ -165,7 +173,7 @@ func newRecoverMgr(t *testing.T, ids []string, maxRestarts int, st *spawnTracker
 			MaxRestarts: maxRestarts,
 		},
 		store,
-		metrics.New(prometheus.NewRegistry()),
+		metrics.New(reg),
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 		func() time.Time { return time.Unix(100, 0) },
 		func() string {
@@ -303,6 +311,61 @@ func TestWatch_MidTurnDeath_RelaunchesAndResumes(t *testing.T) {
 	rec2, ok2 := store.Get("turn-1")
 	require.True(t, ok2)
 	require.Equal(t, turn.Running, rec2.State, "turn must still be running after relaunch")
+}
+
+// TestWatch_BootCrashFreshRelaunch_ResubmitsOriginalPrompt: a crash happens
+// before any transcript exists anywhere (no Stop hook, nothing on disk), the
+// exact boot-crash window the shouldResume fix relaunches fresh for (no
+// --continue). The in-flight turn's prompt never reached claude - resumeTurn
+// must re-send the FULL original prompt (paste+submit), not a bare nudge into
+// an empty conversation. A bare nudge here (finding 2) lands in nothing and
+// wedges the turn Busy until TurnTimeout instead of actually re-running it.
+func TestWatch_BootCrashFreshRelaunch_ResubmitsOriginalPrompt(t *testing.T) {
+	first := newFakeProc()
+	second := newFakeProc()
+	third := newFakeProc() // safety valve for the new watch goroutine
+
+	st := newSpawnTracker(second, third)
+
+	reg := prometheus.NewRegistry()
+	mgr, store := newRecoverMgrWithRegistry(t, []string{"turn-1"}, 3, st, reg)
+	injectAndStart(t, mgr, first)
+
+	id, err := mgr.Submit("do the important thing", "https://cb/x")
+	require.NoError(t, err)
+	require.Equal(t, "turn-1", id)
+
+	// No transcript exists anywhere: relaunch must be fresh.
+	require.False(t, mgr.ShouldResumeForTest(),
+		"no completed turn, no persisted transcript, no on-disk jsonl: relaunch must be fresh")
+
+	first.kill()
+
+	require.Eventually(t, func() bool { return st.calls() >= 1 }, 2*time.Second, 10*time.Millisecond,
+		"spawn not called for relaunch")
+	require.False(t, st.resume(), "fresh relaunch must not pass --continue (nothing to resume)")
+
+	// Resubmit writes paste, sleeps SubmitDelay, then writes the submit keystroke;
+	// wait for the full sequence, not just the first (paste) write.
+	require.Eventually(t, func() bool {
+		return strings.Contains(string(second.bytes()), session.DefaultSubmitSeq.Submit)
+	}, 2*time.Second, 10*time.Millisecond, "second proc did not receive the resubmitted turn")
+
+	w := string(second.bytes())
+	assert.Contains(t, w, "do the important thing",
+		"a fresh relaunch must re-send the original prompt: --continue restored nothing to nudge")
+	assert.Contains(t, w, session.DefaultSubmitSeq.Submit, "resubmit must still end with the submit keystroke")
+
+	rec, ok := store.Get("turn-1")
+	require.True(t, ok)
+	require.Equal(t, turn.Running, rec.State, "turn must still be running (re-submitted, not failed/wedged)")
+
+	// The resume must be metered under the distinct resubmit mode, not nudge, so a
+	// regression that relabels the fresh-relaunch resubmit is caught.
+	require.Eventually(t, func() bool { return resumeModeCount(t, reg, "ok", "resubmit") == 1 },
+		2*time.Second, 10*time.Millisecond, "TurnResumes{ok,resubmit} must be 1 after a fresh-relaunch resubmit")
+	require.Equal(t, float64(0), resumeModeCount(t, reg, "ok", "nudge"),
+		"a fresh relaunch must not record a nudge resume")
 }
 
 // TestWatch_DeathAtCap_FailsFastAndStaysDead: exhaust the restart budget.
