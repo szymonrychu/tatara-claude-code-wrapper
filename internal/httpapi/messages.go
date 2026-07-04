@@ -68,6 +68,13 @@ type postMessageReq struct {
 	CallbackURL string `json:"callbackUrl"`
 }
 
+// handoffPreambleFmt is the continuation preamble (handoff-continuation design,
+// component 3) prepended to this pod's FIRST goal submission when a handoff
+// key is configured. The `/handoff` skill drives get_handoff/write_handoff;
+// the wrapper itself never calls chat.
+const handoffPreambleFmt = "Continuation key: %s. If you have prior context, call get_handoff " +
+	"with this key before starting, and write_handoff an updated summary before you finish.\n\n%s"
+
 func (a *API) postMessage(w http.ResponseWriter, r *http.Request) {
 	var req postMessageReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Text == "" {
@@ -78,7 +85,11 @@ func (a *API) postMessage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	id, err := a.ctl.Submit(req.Text, req.CallbackURL)
+	text := req.Text
+	if a.handoffKey != "" && a.handoffSent.CompareAndSwap(false, true) {
+		text = fmt.Sprintf(handoffPreambleFmt, a.handoffKey, req.Text)
+	}
+	id, err := a.ctl.Submit(text, req.CallbackURL)
 	if errors.Is(err, session.ErrBusy) {
 		http.Error(w, "session busy", http.StatusConflict)
 		return

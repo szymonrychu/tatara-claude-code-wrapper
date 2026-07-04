@@ -28,15 +28,19 @@ type fakeCtl struct {
 	interjected    string
 	completed      session.HookResult
 	transcriptPath string
+	submittedTexts []string
 }
 
-func (f *fakeCtl) Submit(text, cb string) (string, error) { return f.submitID, f.submitErr }
-func (f *fakeCtl) Interject(text string) error            { f.interjected = text; return f.interjectErr }
-func (f *fakeCtl) Complete(r session.HookResult) error    { f.completed = r; return nil }
-func (f *fakeCtl) Snapshot() session.Snapshot             { return session.Snapshot{State: session.Ready} }
-func (f *fakeCtl) TranscriptPath() string                 { return f.transcriptPath }
-func (f *fakeCtl) Alive() bool                            { return true }
-func (f *fakeCtl) Shutdown(context.Context) error         { return nil }
+func (f *fakeCtl) Submit(text, cb string) (string, error) {
+	f.submittedTexts = append(f.submittedTexts, text)
+	return f.submitID, f.submitErr
+}
+func (f *fakeCtl) Interject(text string) error         { f.interjected = text; return f.interjectErr }
+func (f *fakeCtl) Complete(r session.HookResult) error { f.completed = r; return nil }
+func (f *fakeCtl) Snapshot() session.Snapshot          { return session.Snapshot{State: session.Ready} }
+func (f *fakeCtl) TranscriptPath() string              { return f.transcriptPath }
+func (f *fakeCtl) Alive() bool                         { return true }
+func (f *fakeCtl) Shutdown(context.Context) error      { return nil }
 
 func newAPI(ctl httpapi.SessionController, store *turn.Store) *httpapi.API {
 	return httpapi.New(httpapi.Deps{Ctl: ctl, Store: store}) // Verifier nil -> public router skips OIDC in test mode
@@ -178,6 +182,49 @@ func TestPostMessage_HTTPClusterCallbackAccepted(t *testing.T) {
 	rec := httptest.NewRecorder()
 	api.TestRouter().ServeHTTP(rec, req)
 	require.Equal(t, http.StatusAccepted, rec.Code)
+}
+
+// TestPostMessage_HandoffPreamble_FirstSubmissionOnly verifies the handoff
+// continuation preamble (spec component 3) is prepended to the goal text on
+// this pod's FIRST /v1/messages submission only, and carries the configured
+// handoff key.
+func TestPostMessage_HandoffPreamble_FirstSubmissionOnly(t *testing.T) {
+	ctl := &fakeCtl{submitID: "t"}
+	api := httpapi.New(httpapi.Deps{Ctl: ctl, Store: turn.NewStore(), HandoffKey: "issue-42"})
+
+	body1, _ := json.Marshal(map[string]string{"text": "do the thing"})
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body1))
+	rec1 := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec1, req1)
+	require.Equal(t, http.StatusAccepted, rec1.Code)
+
+	body2, _ := json.Marshal(map[string]string{"text": "second goal"})
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body2))
+	rec2 := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec2, req2)
+	require.Equal(t, http.StatusAccepted, rec2.Code)
+
+	require.Len(t, ctl.submittedTexts, 2)
+	want := "Continuation key: issue-42. If you have prior context, call get_handoff " +
+		"with this key before starting, and write_handoff an updated summary before " +
+		"you finish.\n\ndo the thing"
+	require.Equal(t, want, ctl.submittedTexts[0], "first submission must carry the handoff preamble")
+	require.Equal(t, "second goal", ctl.submittedTexts[1], "second submission must NOT carry the preamble")
+}
+
+// TestPostMessage_NoHandoffKey_NoPreamble verifies the preamble is absent
+// entirely when CONVERSATION_OBJECT_KEY (HandoffKey) is unset.
+func TestPostMessage_NoHandoffKey_NoPreamble(t *testing.T) {
+	ctl := &fakeCtl{submitID: "t"}
+	api := httpapi.New(httpapi.Deps{Ctl: ctl, Store: turn.NewStore()})
+
+	body, _ := json.Marshal(map[string]string{"text": "do the thing"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+
+	require.Equal(t, []string{"do the thing"}, ctl.submittedTexts)
 }
 
 // newAPIWithLog builds an API that writes structured logs to logBuf.

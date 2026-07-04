@@ -99,26 +99,24 @@ suppresses onboarding, folder-trust, and custom-API-key prompts by seeding
 appears on every boot; the wrapper detects it in the PTY ring buffer and
 accepts it before accepting turns. See `docs/spike-findings.md`.
 
-## Conversation persistence (issue #114)
+## Handoff continuation (replaces issue #114 S3 conversation persistence)
 
-When the operator configures an S3 bucket, the wrapper persists the Claude
-conversation so a fresh pod resumes it instead of starting empty. See
-`docs/conversation-resume-spike.md` for the mechanism and `internal/storage`
-(S3 client) + `internal/convstore` (path derivation, upload/restore/fork).
+Every pod now boots fresh: `internal/storage` (the S3 client) and the S3
+restore/fork/upload path in `internal/convstore` were removed. Continuity
+across pods is carried by a compact, chat-backed **handoff** instead of a
+replayed transcript (see `docs/superpowers/specs/2026-07-04-handoff-
+continuation-design.md` in the parent `tatara` repo, component 3).
 
-- UPLOAD: after each turn (before the operator callback) the session transcript
-  is uploaded to `CONVERSATION_OBJECT_KEY`, and its sessionId is reported back.
-- RESTORE: on boot, if `CONVERSATION_SESSION_ID` is set, the transcript is
-  downloaded to `~/.claude/projects/<cwd>/<sid>.jsonl` and claude launches with
-  `--resume <sid>`. If instead `CONVERSATION_FORK_FROM_KEY` is set (a
-  brainstorm-derived issue's first run), the parent conversation is copied onto
-  this issue's own key and resumed (forked).
+- `CONVERSATION_OBJECT_KEY` (env name unchanged so the operator needs no
+  change) is now the **handoff key**: on this pod's first `/v1/messages`
+  submission, the wrapper prepends a preamble telling the agent to call
+  `get_handoff` with this key before starting and `write_handoff` an updated
+  summary before finishing. The wrapper itself never calls chat - the agent
+  does, via the `/handoff` skill and the tatara-cli MCP tools.
 - REVIEW: an MR review pod sets `CHECKOUT_BRANCH` (the PR head) and no
   `TASK_BRANCH`, so it works on the PR code read-only and never pushes.
-
-Everything is gated on `S3_BUCKET`: with no bucket the wrapper behaves exactly
-as before (no upload, no restore), and every S3 op is best-effort (a failure
-logs and falls back to a fresh session).
+- `internal/convstore.TranscriptDir` is kept: it backs the boot-crash fix's
+  on-disk transcript check (`session.shouldResume`), unrelated to S3.
 
 ## Build
 
