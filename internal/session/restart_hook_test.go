@@ -1,6 +1,7 @@
 package session_test
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -8,8 +9,9 @@ import (
 )
 
 // TestOnRestart_FiresOnResumeRelaunch asserts the conversationRestart callback
-// runs after a crash-relaunch that resumed an existing conversation (a turn was
-// in flight, so shouldResume() is true and spawn uses --continue).
+// runs after a crash-relaunch that resumed an existing conversation (a
+// transcript was persisted, so shouldResume() is true and spawn uses
+// --continue).
 func TestOnRestart_FiresOnResumeRelaunch(t *testing.T) {
 	first := newFakeProc()
 	second := newFakeProc()
@@ -24,6 +26,9 @@ func TestOnRestart_FiresOnResumeRelaunch(t *testing.T) {
 	// Submit a turn so the conversation exists -> relaunch resumes (--continue).
 	_, err := mgr.Submit("hello", "https://cb/x")
 	require.NoError(t, err)
+	// A prior turn's hook would have persisted a transcript in production; an
+	// in-flight turn alone (mgr.current set) is not enough to resume.
+	mgr.SetTranscriptPathForTest(filepath.Join(t.TempDir(), "session.jsonl"))
 
 	first.kill()
 

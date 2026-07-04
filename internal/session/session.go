@@ -312,6 +312,10 @@ func (mgr *Manager) SetTranscriptPathForTest(path string) {
 	mgr.transcriptPath = path
 }
 
+// ShouldResumeForTest exposes shouldResume to the external session_test
+// package so the boot-crash resume invariant can be asserted directly. Test-only.
+func (mgr *Manager) ShouldResumeForTest() bool { return mgr.shouldResume() }
+
 // RingContainsForTest reports whether the ring buffer currently holds needle.
 // Test-only; lets relaunch tests assert the ring was reset.
 func (mgr *Manager) RingContainsForTest(needle string) bool {
@@ -579,13 +583,19 @@ func (mgr *Manager) relaunch() error {
 	return nil
 }
 
-// shouldResume reports whether a prior conversation exists to --continue. A
-// death during the very first boot (no turn ever submitted, none completed)
-// relaunches fresh; anything later resumes.
+// shouldResume reports whether a prior conversation exists to --continue.
+// Invariant: resume only when a transcript was actually persisted (a turn has
+// completed, or a transcript path was recorded by a Stop hook). An in-flight
+// turn (mgr.current != "") is NOT sufficient on its own: Submit() sets
+// mgr.current the instant a turn is accepted, before claude has written
+// anything to disk, so a crash in that window has no conversation to
+// --continue into. Passing --continue there makes claude exit immediately
+// ("No conversation found to continue"), burning the whole restart budget on
+// an identical crash loop.
 func (mgr *Manager) shouldResume() bool {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
-	return mgr.current != "" || mgr.turnsCompleted > 0 || mgr.transcriptPath != ""
+	return mgr.turnsCompleted > 0 || mgr.transcriptPath != ""
 }
 
 // resumeTurn restores the in-flight turn after a crash+relaunch. --continue has

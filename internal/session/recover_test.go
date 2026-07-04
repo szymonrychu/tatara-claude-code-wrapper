@@ -274,6 +274,11 @@ func TestWatch_MidTurnDeath_RelaunchesAndResumes(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, turn.Running, rec.State)
 
+	// A genuine mid-turn crash (as opposed to a boot-crash in the instant after
+	// Submit) implies claude has actually been working and has a transcript on
+	// disk; a prior turn's hook would have recorded that path in production.
+	mgr.SetTranscriptPathForTest(filepath.Join(t.TempDir(), "session.jsonl"))
+
 	// Kill the first proc (simulate crash)
 	first.kill()
 
