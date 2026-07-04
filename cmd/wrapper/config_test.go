@@ -49,6 +49,22 @@ func TestLoadConfig_EffortFromEnv(t *testing.T) {
 	require.Equal(t, "xhigh", cfg.Effort)
 }
 
+func TestLoadConfig_WorkerModelEffortDefaults(t *testing.T) {
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, "sonnet", cfg.WorkerModel)
+	require.Equal(t, "low", cfg.WorkerEffort)
+}
+
+func TestLoadConfig_WorkerModelEffortFromEnv(t *testing.T) {
+	t.Setenv("TATARA_WORKER_MODEL", "haiku")
+	t.Setenv("TATARA_WORKER_EFFORT", "medium")
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, "haiku", cfg.WorkerModel)
+	require.Equal(t, "medium", cfg.WorkerEffort)
+}
+
 func TestLoadConfig_S3DefaultsOff(t *testing.T) {
 	cfg, err := loadConfig(nil)
 	require.NoError(t, err)

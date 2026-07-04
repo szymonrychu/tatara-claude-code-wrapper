@@ -1743,27 +1743,29 @@ func TestResumeTurn_EmitsTurnResumesMetricAndDurationMs(t *testing.T) {
 	require.NoError(t, err)
 
 	// Kill first proc; watch() fires, relaunches to second, resumeTurn is called.
+	// No transcript exists anywhere, so this is a fresh relaunch: resumeTurn
+	// resubmits the original prompt (paste, sleep SubmitDelay, then submit), so
+	// wait on the metric itself rather than on the PTY bytes to avoid racing the
+	// SubmitDelay sleep between the two writes.
 	first.kill()
 
-	// Wait for the resume nudge to be written to second proc.
-	require.Eventually(t, func() bool { return len(second.bytes()) > 0 },
-		3*time.Second, 10*time.Millisecond, "resumeTurn did not send nudge to relaunched proc")
-
-	// Verify TurnResumes{result=ok} incremented.
-	mfs, _ := reg.Gather()
-	var resumeOK float64
-	for _, mf := range mfs {
-		if mf.GetName() == "ccw_turn_resumes_total" {
-			for _, mm := range mf.GetMetric() {
-				for _, lp := range mm.GetLabel() {
-					if lp.GetName() == "result" && lp.GetValue() == "ok" {
-						resumeOK = mm.GetCounter().GetValue()
+	resumeOKMetric := func() float64 {
+		mfs, _ := reg.Gather()
+		for _, mf := range mfs {
+			if mf.GetName() == "ccw_turn_resumes_total" {
+				for _, mm := range mf.GetMetric() {
+					for _, lp := range mm.GetLabel() {
+						if lp.GetName() == "result" && lp.GetValue() == "ok" {
+							return mm.GetCounter().GetValue()
+						}
 					}
 				}
 			}
 		}
+		return 0
 	}
-	require.Equal(t, float64(1), resumeOK, "TurnResumes{result=ok} must be 1 after a successful resume")
+	require.Eventually(t, func() bool { return resumeOKMetric() == 1 },
+		3*time.Second, 10*time.Millisecond, "TurnResumes{result=ok} must be 1 after a successful resume")
 
 	// Verify log includes duration_ms.
 	data := buf.Bytes()

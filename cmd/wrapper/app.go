@@ -143,6 +143,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	sess := session.New(session.Config{
 		ClaudePath:      cfg.ClaudePath,
 		Workspace:       cfg.Workspace,
+		HomeDir:         cfg.HomeDir,
 		Env:             claudeEnv(cfg),
 		Model:           cfg.Model,
 		Effort:          cfg.Effort,
@@ -420,6 +421,8 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		CheckoutBranch:  cfg.CheckoutBranch,
 		FullClone:       cfg.FullClone,
 		Repos:           cfg.Repos,
+		WorkerModel:     cfg.WorkerModel,
+		WorkerEffort:    cfg.WorkerEffort,
 
 		HookPreClone:             cfg.HookPreClone,
 		HookPostClone:            cfg.HookPostClone,

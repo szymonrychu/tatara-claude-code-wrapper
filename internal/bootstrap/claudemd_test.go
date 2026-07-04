@@ -52,3 +52,25 @@ func TestRender_DirectivePresentWithoutGlobalClaudeMd(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(b), "comment_on_issue")
 }
+
+// Component 2: the main agent should delegate mechanical implementation and
+// read-only code search to the cheap-model worker subagents (implementer,
+// explorer), keeping planning/design/review/merge on itself.
+func TestRender_AppendsWorkerDelegationDirective(t *testing.T) {
+	home := t.TempDir()
+	ws := t.TempDir()
+
+	p := bootstrap.Params{
+		HomeDir:     home,
+		Workspace:   ws,
+		HookCommand: "/usr/local/bin/cc-stop-hook",
+	}
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { return nil }))
+
+	b, err := os.ReadFile(filepath.Join(home, ".claude", "CLAUDE.md"))
+	require.NoError(t, err)
+	got := string(b)
+	require.Contains(t, got, "implementer")
+	require.Contains(t, got, "explorer")
+	require.Contains(t, got, "planning")
+}

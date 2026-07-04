@@ -50,6 +50,13 @@ type Params struct {
 	FullClone bool
 	Repos     []RepoSpec
 
+	// WorkerModel/WorkerEffort pin the cheap-model worker subagents (Component
+	// 2: implementer, explorer) written to .claude/agents/. Defaults resolved
+	// by cmd/wrapper/config.go (TATARA_WORKER_MODEL="sonnet",
+	// TATARA_WORKER_EFFORT="low").
+	WorkerModel  string
+	WorkerEffort string
+
 	// Lifecycle hook commands (operator-supplied via the Project CRD, delivered
 	// as HOOK_* env vars). Empty means the hook is disabled. preClone/postClone
 	// are fired by Render around each clone; the conversation/turn hooks are
@@ -262,7 +269,7 @@ func Render(p Params, git GitRunner) error {
 		}
 		return err
 	}
-	globalClaudeMd := strings.TrimLeft(p.GlobalClaudeMd+headlessDirective, "\n")
+	globalClaudeMd := strings.TrimLeft(p.GlobalClaudeMd+headlessDirective+delegationDirective, "\n")
 	if err := os.WriteFile(filepath.Join(claudeHome, "CLAUDE.md"), []byte(globalClaudeMd), 0o644); err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
@@ -276,6 +283,12 @@ func Render(p Params, git GitRunner) error {
 		return err
 	}
 	if err := writeSettings(p, claudeHome); err != nil {
+		if p.M != nil {
+			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
+		}
+		return err
+	}
+	if err := writeAgents(p, claudeHome); err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
 		}
@@ -327,6 +340,28 @@ the options and your recommendation there and continue with your best judgement.
 If a decision blocks you from making any progress at all, call
 decline_implementation with the reason. The issue thread is your only channel to
 a human.
+`
+
+// delegationDirective is appended to the agent's global CLAUDE.md on every
+// bootstrap (Component 2: workflow delegation). It routes mechanical work to
+// the cheap-model worker subagents written to .claude/agents/ so planning
+// tokens stay on the main model.
+const delegationDirective = `
+
+---
+
+## Delegate mechanical work to worker subagents
+
+Two worker subagents are available, pinned to a cheaper model: delegate to
+them instead of doing this work yourself.
+
+- **implementer**: mechanical implementation, editing, and test-writing from
+  a spec you have already decided on.
+- **explorer**: read-only code search, locating where something lives in
+  the codebase.
+
+Keep planning, design, review, and merge decisions on yourself. Delegate the
+mechanical legwork; do not delegate the thinking.
 `
 
 func writeIfSet(path, content string) error {
