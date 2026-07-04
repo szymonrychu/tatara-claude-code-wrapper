@@ -420,6 +420,8 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		CheckoutBranch:  cfg.CheckoutBranch,
 		FullClone:       cfg.FullClone,
 		Repos:           cfg.Repos,
+		WorkerModel:     cfg.WorkerModel,
+		WorkerEffort:    cfg.WorkerEffort,
 
 		HookPreClone:             cfg.HookPreClone,
 		HookPostClone:            cfg.HookPostClone,
