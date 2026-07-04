@@ -8,7 +8,6 @@ import (
 	"strconv"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
-	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/storage"
 )
 
 type config struct {
@@ -75,33 +74,19 @@ type config struct {
 	HookAgentTurnFinished    string
 	HookConversationFinished string
 
-	// S3 conversation persistence (issue #114). Off unless S3Bucket is set.
-	// The operator injects these from a ConfigMap (endpoint/bucket/region/
-	// prefix/path-style) plus a k8s secret (the AWS_* creds).
-	S3Endpoint       string
-	S3Bucket         string
-	S3Region         string
-	S3KeyPrefix      string
-	S3ForcePathStyle bool
-	S3AccessKeyID    string
-	S3SecretKey      string
-
 	// FullClone, when true, clones all history and all branches instead of
 	// --depth 1. Set by TATARA_WORKSPACE_FULL_CLONE=true; intended for
 	// project-scoped pods (brainstorm/incident/refine/healthCheck) that need
 	// cross-branch context.
 	FullClone bool
 
-	// Conversation resume (issue #114). The operator sets the S3 object key for
-	// this issue's conversation (stable per issue); the sessionId is set only
-	// when a prior conversation exists, triggering restore + `claude --resume`.
+	// ConversationObjectKey is the wrapper's stable-per-issue handoff key
+	// (handoff-continuation design, component 3). Formerly also the S3
+	// conversation-transcript object key (issue #114); the S3 restore/upload
+	// path was removed, but the env name is kept unchanged (CONVERSATION_
+	// OBJECT_KEY) so the operator needs no change. Surfaced to the agent via
+	// the httpapi handoff preamble on this pod's first goal submission.
 	ConversationObjectKey string
-	ConversationSessionID string
-	// ConversationForkFromKey, when set on a first run with no own conversation
-	// yet, makes the wrapper copy that parent conversation onto this issue's own
-	// key and resume it (issue #114 decision 3: brainstorm conversation forked
-	// per issue).
-	ConversationForkFromKey string
 }
 
 func loadConfig(args []string) (config, error) {
@@ -118,10 +103,6 @@ func loadConfig(args []string) (config, error) {
 		return config{}, err
 	}
 	pi, err := envIntOr("PUSH_INTERVAL_SECONDS", 15)
-	if err != nil {
-		return config{}, err
-	}
-	fps, err := envBoolOr("S3_FORCE_PATH_STYLE", false)
 	if err != nil {
 		return config{}, err
 	}
@@ -181,19 +162,9 @@ func loadConfig(args []string) (config, error) {
 		HookAgentTurnFinished:    envOr("HOOK_AGENT_TURN_FINISHED", ""),
 		HookConversationFinished: envOr("HOOK_CONVERSATION_FINISHED", ""),
 
-		S3Endpoint:       envOr("S3_ENDPOINT", ""),
-		S3Bucket:         envOr("S3_BUCKET", ""),
-		S3Region:         envOr("S3_REGION", ""),
-		S3KeyPrefix:      envOr("S3_KEY_PREFIX", ""),
-		S3ForcePathStyle: fps,
-		S3AccessKeyID:    envOr("AWS_ACCESS_KEY_ID", ""),
-		S3SecretKey:      envOr("AWS_SECRET_ACCESS_KEY", ""),
-
 		FullClone: fc,
 
-		ConversationObjectKey:   envOr("CONVERSATION_OBJECT_KEY", ""),
-		ConversationSessionID:   envOr("CONVERSATION_SESSION_ID", ""),
-		ConversationForkFromKey: envOr("CONVERSATION_FORK_FROM_KEY", ""),
+		ConversationObjectKey: envOr("CONVERSATION_OBJECT_KEY", ""),
 	}
 	if raw := os.Getenv("TATARA_REPOS"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.Repos); err != nil {
@@ -240,19 +211,4 @@ func envBoolOr(k string, def bool) (bool, error) {
 		return false, fmt.Errorf("env %s: %w", k, err)
 	}
 	return b, nil
-}
-
-// S3Config maps the wrapper config to the storage client config. The
-// upload/restore wiring (subtask 4) constructs the client from this when
-// storage.Config.Enabled() (i.e. a bucket is set).
-func (c config) S3Config() storage.Config {
-	return storage.Config{
-		Endpoint:       c.S3Endpoint,
-		Bucket:         c.S3Bucket,
-		Region:         c.S3Region,
-		KeyPrefix:      c.S3KeyPrefix,
-		ForcePathStyle: c.S3ForcePathStyle,
-		AccessKeyID:    c.S3AccessKeyID,
-		SecretKey:      c.S3SecretKey,
-	}
 }

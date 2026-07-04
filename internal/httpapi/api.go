@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -39,22 +40,31 @@ type Deps struct {
 	Log      *slog.Logger
 	Registry *prometheus.Registry
 	Metrics  *metrics.Metrics
+	// HandoffKey is the wrapper's stable-per-issue CONVERSATION_OBJECT_KEY,
+	// reused (component 3 of the handoff-continuation design) as the chat
+	// handoff key. When set, it is surfaced to the agent via a preamble on
+	// this pod's first /v1/messages submission.
+	HandoffKey string
 }
 
 type API struct {
-	ctl   SessionController
-	store *turn.Store
-	v     *auth.Verifier
-	log   *slog.Logger
-	reg   *prometheus.Registry
-	m     *metrics.Metrics
+	ctl        SessionController
+	store      *turn.Store
+	v          *auth.Verifier
+	log        *slog.Logger
+	reg        *prometheus.Registry
+	m          *metrics.Metrics
+	handoffKey string
+	// handoffSent guards the one-time handoff preamble: true once the first
+	// goal submission for this pod has been sent.
+	handoffSent atomic.Bool
 }
 
 func New(d Deps) *API {
 	if d.Log == nil {
 		d.Log = slog.Default()
 	}
-	return &API{ctl: d.Ctl, store: d.Store, v: d.Verifier, log: d.Log, reg: d.Registry, m: d.Metrics}
+	return &API{ctl: d.Ctl, store: d.Store, v: d.Verifier, log: d.Log, reg: d.Registry, m: d.Metrics, handoffKey: d.HandoffKey}
 }
 
 // requestLogger is a chi middleware that logs each request at INFO on completion

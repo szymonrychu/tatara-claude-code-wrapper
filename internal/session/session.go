@@ -54,13 +54,6 @@ type Config struct {
 	SubmitSeq   SubmitSequence
 	MaxRestarts int // crash-relaunch budget per session; default 3
 
-	// ResumeSessionID, when set, makes the INITIAL boot resume a specific prior
-	// conversation by id (claude --resume <id>) rather than starting fresh. Set
-	// by the app after a cross-pod transcript restore (issue #114). Crash
-	// relaunches still use --continue (most recent), which is this same
-	// conversation once resumed.
-	ResumeSessionID string
-
 	// Kind, RepoName, Project are the pod's metric-identity labels (component 6),
 	// set once by the operator env and stamped onto every per-turn token/cost
 	// series so spend attributes to a Task kind, repo, and project.
