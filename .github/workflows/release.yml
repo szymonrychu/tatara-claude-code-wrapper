@@ -34,21 +34,22 @@ jobs:
       HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
       HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
     steps:
-      # persist-credentials: false is REQUIRED. By default checkout writes an
-      # `http.https://github.com/.extraheader` Authorization header carrying the
-      # read-only default GITHUB_TOKEN into .git/config. That header is applied
-      # to every request to github.com and OVERRIDES the userinfo in an explicit
-      # push URL, so the cd-release `cut tag` step's
-      # `git push https://x-access-token:${TATARA_CD_TOKEN}@github.com/...` would
-      # authenticate as github-actions[bot] (not the PAT) and get a 403
-      # "Permission denied to github-actions[bot]". Not persisting the credential
-      # leaves the token-URL push to authenticate as the PAT. Tags are still
-      # fetched here (checkout uses the token in-run; it just does not persist it).
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           fetch-tags: true
+          # persist-credentials: false is REQUIRED for the tag push to work.
+          # With the default (true), checkout writes an
+          # `http.https://github.com/.extraheader` Authorization header carrying
+          # the read-only default GITHUB_TOKEN (github-actions[bot]). That header
+          # applies to every github.com request and OVERRIDES the TATARA_CD_TOKEN
+          # embedded in the cd-release `cut tag` push URL, so the tag push is
+          # rejected 403 (denied to github-actions[bot]). Dropping the persisted
+          # credential lets the action's PAT-in-URL push authenticate as the bot.
+          # The other steps do not need it: `publish image` clones via a buildkit
+          # frontend secret, `cut tag`/`bump` set their own authenticated origin
+          # URLs, and `publish chart` logs in with harbor creds.
           persist-credentials: false
 
       # Read the merged PR's semver:* label, compute + push the next tag (vX.Y.Z).
