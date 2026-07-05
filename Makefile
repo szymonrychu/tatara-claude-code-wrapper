@@ -8,6 +8,7 @@ COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 CLAUDE_CODE_VERSION ?= latest
 TATARA_CLI_VERSION ?= f6c0bcb
+TATARA_SKILLS_REF ?= v0.1.0
 IMAGE_REF := $(REGISTRY)/$(IMAGE_NAME):$(VERSION)
 MODPATH := github.com/szymonrychu/tatara-claude-code-wrapper
 
@@ -29,6 +30,7 @@ image:
 	docker buildx build --platform=linux/amd64 \
 	  --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) \
 	  --build-arg CLAUDE_CODE_VERSION=$(CLAUDE_CODE_VERSION) --build-arg TATARA_CLI_VERSION=$(TATARA_CLI_VERSION) \
+	  --build-arg TATARA_SKILLS_REF=$(TATARA_SKILLS_REF) \
 	  -t $(IMAGE_REF) --load .
 push: image ; docker push $(IMAGE_REF)
 chart-test: ; helm unittest charts/tatara-claude-code-wrapper

@@ -1,0 +1,104 @@
+name: release
+
+# Push-CD: after a green `ci` run on main, cut the semver tag the merged PR
+# declared, publish the image+chart at that version, then propagate the new
+# wrapper version into tatara-helmfile (the parent). Gated on a successful `ci`
+# run (lint/test/build/smoke); a failed ci run never reaches this workflow. The
+# cli MCP-tools build-guard runs in the `publish image` step below (build.sh
+# builds the Dockerfile test-guard stage first), so a cli/skills bump that drops
+# a required tool fails the publish and the cascade stalls before any tag/pin is
+# propagated -- the failure is surfaced, never swallowed.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+# Serialize releases: two merges landing close together would otherwise race on
+# tag computation/push (both read the same latest tag, compute the same next,
+# the second `git push origin <tag>` conflicts) and on the cd/deploy-train
+# branch. cancel-in-progress=false lets each in-flight release finish.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Only on a successful ci run that was itself a push-to-main (not a PR run).
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' }}
+    runs-on: tatara-claude-code-wrapper
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      # Read the merged PR's semver:* label, compute + push the next tag (vX.Y.Z).
+      - name: cut tag
+        id: tag
+        uses: szymonrychu/tatara-helmfile/.github/actions/cd-release@main
+        with:
+          mode: tag
+          token: ${{ secrets.TATARA_CD_TOKEN }}
+
+      - name: install buildctl
+        run: |
+          curl -sSfL "https://github.com/moby/buildkit/releases/download/v0.18.2/buildkit-v0.18.2.linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local bin/buildctl
+
+      # Build+push the image at the new tag. build.sh first builds the Dockerfile
+      # test-guard stage (cli MCP-tools guard; fails the publish if a required
+      # tool went missing), then builds the runtime image. VERSION comes from
+      # `git describe --tags`, which now resolves to the freshly-cut vX.Y.Z (and
+      # :SHORT_SHA is still pushed for rollback/debug). BUILD_REF pins the build
+      # to the triggering run's head_sha: on workflow_run GITHUB_SHA points at the
+      # default-branch tip, which may have advanced past this commit, so without
+      # the pin the context/SHORT_SHA could diverge from the checked-out VERSION.
+      # buildkitd's persistent Ceph layer cache keeps the rebuild fast.
+      - name: publish image
+        env:
+          BUILD_REF: ${{ github.event.workflow_run.head_sha }}
+        run: bash .github/ci/build.sh "${{ github.event.repository.name }}"
+
+      - uses: azure/setup-helm@v4
+
+      # Charts publish bare X.Y.Z (drop the legacy 0.0.0-g<sha> scheme).
+      - name: publish chart
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          CHART_VERSION="${VERSION#v}"
+          NAME="$(basename "$(ls -d charts/*/)")"
+          helm registry login harbor.szymonrichert.pl -u "$HARBOR_USERNAME" -p "$HARBOR_PASSWORD"
+          helm package "charts/$NAME" --version "${CHART_VERSION}" --app-version "${VERSION}"
+          helm push "${NAME}-${CHART_VERSION}.tgz" oci://harbor.szymonrichert.pl/charts
+
+      # Propagate vX.Y.Z into tatara-helmfile: both wrapper image pins rewritten
+      # lockstep in ONE commit on the cd/deploy-train branch (cd-release handles
+      # the coalescing branch + auto-merge label).
+      - name: bump tatara-helmfile
+        uses: szymonrychu/tatara-helmfile/.github/actions/cd-release@main
+        with:
+          mode: bump
+          token: ${{ secrets.TATARA_CD_TOKEN }}
+          parent_repo: szymonrychu/tatara-helmfile
+          new_value: ${{ steps.tag.outputs.version }}
+          pins: |
+            [
+              {
+                "file": "values/project-tatara/common.yaml",
+                "pattern": "^(\\s*image: )harbor\\.szymonrichert\\.pl/containers/tatara-claude-code-wrapper:.*$",
+                "value_template": "\\1harbor.szymonrichert.pl/containers/tatara-claude-code-wrapper:{{version}}"
+              },
+              {
+                "file": "values/project-infrastructure/common.yaml",
+                "pattern": "^(\\s*image: )harbor\\.szymonrichert\\.pl/containers/tatara-claude-code-wrapper:.*$",
+                "value_template": "\\1harbor.szymonrichert.pl/containers/tatara-claude-code-wrapper:{{version}}"
+              }
+            ]
