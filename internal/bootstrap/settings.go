@@ -21,6 +21,11 @@ func writeSettings(p Params, claudeHome string) error {
 			"Stop": []hookMatcher{{Matcher: "", Hooks: []hookCmd{{Type: "command", Command: p.HookCommand}}}},
 		},
 		"enableAllProjectMcpServers": p.EnableAllMCP,
+		"attribution": map[string]any{
+			"commit":     "",
+			"pr":         "",
+			"sessionUrl": false,
+		},
 	}
 	if p.Effort != "" {
 		settings["effortLevel"] = p.Effort

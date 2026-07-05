@@ -64,6 +64,21 @@ func TestWriteSettings_BypassDefaultMode_AutoApprovesDispatch(t *testing.T) {
 	}
 }
 
+func TestWriteSettings_AttributionDisabled(t *testing.T) {
+	home := t.TempDir()
+	if err := writeSettings(Params{HookCommand: "/x"}, home); err != nil {
+		t.Fatalf("writeSettings: %v", err)
+	}
+	m := readSettings(t, home)
+	attr, ok := m["attribution"].(map[string]any)
+	if !ok {
+		t.Fatal("attribution missing")
+	}
+	if attr["commit"] != "" || attr["pr"] != "" || attr["sessionUrl"] != false {
+		t.Errorf("attribution not disabled: %#v", attr)
+	}
+}
+
 func TestWriteSettings_AllowListNeverDropsDispatchTools(t *testing.T) {
 	// If a non-empty allow-list is ever supplied, it must include the dispatch
 	// tools (Agent, Workflow) so a future switch away from bypassPermissions
