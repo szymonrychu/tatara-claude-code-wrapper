@@ -1,10 +1,43 @@
 package main
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+// configEnvKeys is every environment variable loadConfig consults. TestMain
+// unsets them all before the suite runs so the default-assertion tests below
+// exercise the compiled defaults, not whatever the host environment happens to
+// carry. The CI `test` job runs on an in-cluster ARC runner in the same
+// namespace as the wrapper, so ambient vars like TATARA_SKILLS_REF and EFFORT
+// are present and would otherwise mask the defaults and fail the build.
+var configEnvKeys = []string{
+	"HTTP_ADDR", "INTERNAL_ADDR", "OIDC_ISSUER", "OIDC_AUDIENCE", "LOG_LEVEL",
+	"MODEL", "EFFORT", "PERMISSION_MODE", "REPO_URL", "REPO_BRANCH", "GIT_TOKEN",
+	"GIT_USER_NAME", "GIT_USER_EMAIL", "TASK_BRANCH", "CHECKOUT_BRANCH",
+	"DEFAULT_CALLBACK_URL", "OPERATOR_PUSH_URL", "RUN_ID", "POD_NAME",
+	"TATARA_KIND", "TATARA_REPO", "TATARA_PROJECT", "TURN_TIMEOUT_SECONDS",
+	"BOOT_TIMEOUT_SECONDS", "PUSH_INTERVAL_SECONDS", "WEBHOOK_RETRIES",
+	"WORKSPACE", "HOME_DIR", "CLAUDE_PATH", "HOOK_PATH", "GLOBAL_CLAUDE_MD_PATH",
+	"PROJECT_CLAUDE_MD_PATH", "MCP_BASE_PATH", "MCP_OVERLAY_DIR",
+	"TATARA_GRAFANA_MCP_URL", "TATARA_SERENA_URL", "SKILLS_SRC_DIRS",
+	"TATARA_SKILL_PROFILE", "TATARA_SKILLS_REPO", "TATARA_SKILLS_REF",
+	"ALLOWED_TOOLS_PATH", "TATARA_WORKER_MODEL", "TATARA_WORKER_EFFORT",
+	"HOOK_PRE_CLONE", "HOOK_POST_CLONE", "HOOK_CONVERSATION_START",
+	"HOOK_CONVERSATION_RESTART", "HOOK_AGENT_TURN_FINISHED",
+	"HOOK_CONVERSATION_FINISHED", "TATARA_WORKSPACE_FULL_CLONE",
+	"CONVERSATION_OBJECT_KEY", "OTEL_ENABLED", "OTEL_EXPORTER_OTLP_ENDPOINT",
+	"TATARA_REPOS",
+}
+
+func TestMain(m *testing.M) {
+	for _, k := range configEnvKeys {
+		_ = os.Unsetenv(k)
+	}
+	os.Exit(m.Run())
+}
 
 func TestLoadConfig_Defaults(t *testing.T) {
 	cfg, err := loadConfig(nil)
