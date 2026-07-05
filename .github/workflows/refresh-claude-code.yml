@@ -1,0 +1,77 @@
+name: refresh-claude-code
+
+# Daily check for a newer @anthropic-ai/claude-code npm release. When npm
+# publishes a version above the pinned Dockerfile `ARG CLAUDE_CODE_VERSION`,
+# open a semver:patch PR bumping the pin and enable auto-merge. A green `ci`
+# run then cascades through `release`, which rebuilds+publishes the wrapper
+# image at the new claude version (the claude layer is isolated, so only it
+# rebuilds). Mirrors the bot-authored auto-merge-PR pattern from tatara-helmfile
+# cd-release: szymonrychu-bot identity, PAT-in-URL push, gh label + auto-merge.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: refresh-claude-code
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: tatara-claude-code-wrapper
+    env:
+      GH_TOKEN: ${{ secrets.TATARA_CD_TOKEN }}
+      TOKEN: ${{ secrets.TATARA_CD_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # We push the bump branch with a PAT-in-URL below; the persisted
+          # default GITHUB_TOKEN header would otherwise override it (see the
+          # release workflow for the same reason).
+          persist-credentials: false
+
+      - name: check npm and open bump PR
+        run: |
+          set -euo pipefail
+
+          # Dependency-light: read the npm registry latest tag with curl (no
+          # node/npm setup needed on the runner).
+          latest="$(curl -fsSL https://registry.npmjs.org/@anthropic-ai/claude-code/latest \
+            | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)"
+          current="$(sed -n 's/^ARG CLAUDE_CODE_VERSION=//p' Dockerfile | head -1)"
+          echo "current=$current latest=$latest"
+          if [ -z "$latest" ]; then
+            echo "::error::could not resolve npm latest for @anthropic-ai/claude-code" >&2
+            exit 1
+          fi
+          if [ "$current" = "$latest" ]; then
+            echo "already pinned to $latest; nothing to do"
+            exit 0
+          fi
+
+          branch="deps/claude-code-${latest}"
+          if gh pr list --repo "$REPO" --head "$branch" --state open \
+              --json number --jq '.[0].number' | grep -q .; then
+            echo "bump PR for $latest already open"
+            exit 0
+          fi
+
+          git config user.name "szymonrychu-bot"
+          git config user.email "szymonrychu-bot@users.noreply.github.com"
+          git checkout -B "$branch"
+          sed -i "s/^ARG CLAUDE_CODE_VERSION=.*/ARG CLAUDE_CODE_VERSION=${latest}/" Dockerfile
+          git add Dockerfile
+          git commit -m "chore(deps): bump claude-code to ${latest}"
+          git push -f "https://x-access-token:${TOKEN}@github.com/${REPO}.git" "HEAD:${branch}"
+
+          gh label create semver:patch --repo "$REPO" --color 0e8a16 \
+            --description "tatara CD dependency bump" 2>/dev/null || true
+          url="$(gh pr create --repo "$REPO" --base main --head "$branch" \
+            --title "chore(deps): bump claude-code to ${latest}" \
+            --body "Automated: @anthropic-ai/claude-code ${current} -> ${latest}. A green ci run cascades to a rebuilt+published wrapper image at the new claude version.")"
+          # REST label add (repo scope only, unlike `gh pr edit --add-label`).
+          num="${url##*/}"
+          gh api -X POST "repos/$REPO/issues/$num/labels" -f "labels[]=semver:patch" >/dev/null
+          gh pr merge "$url" --repo "$REPO" --auto --squash
+          echo "opened + auto-merge enabled: $url"
