@@ -53,8 +53,9 @@ CONTEXT="https://github.com/szymonrychu/${REPO}.git#${BUILD_REF}"
 # command exits non-zero BEFORE the runtime image below is built/pushed. This is
 # the explicit driver the guard needs: buildkit does dead-stage elimination, so
 # building only the runtime target would never reach test-guard (it is not in
-# the runtime DAG). `--output type=cacheonly` builds the stage without exporting
-# an image; the work is cached for the runtime build that follows.
+# the runtime DAG). Omitting --output builds the stage without exporting an
+# image (result stays in the buildkitd cache); the cacheonly exporter does
+# not exist in deployed buildctl.
 echo "buildkit: running cli MCP-tools build-guard (target=test-guard)"
 buildctl --addr "$BUILDKITD_ADDR" build \
   --frontend dockerfile.v0 \
