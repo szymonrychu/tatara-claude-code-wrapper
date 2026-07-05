@@ -3,7 +3,7 @@
 ARG GO_VERSION=1.25
 ARG NODE_VERSION=22
 ARG CLAUDE_CODE_VERSION=latest
-ARG TATARA_CLI_VERSION=f6c0bcb
+ARG TATARA_CLI_VERSION=v0.4.1
 # Skills plugin ref the wrapper boot-clones at runtime. Pinned to a semver tag so
 # the skills->wrapper cd-release bump can rewrite this line (mirrors
 # TATARA_CLI_VERSION). The Go default (cmd/wrapper/config.go) stays "main" for
