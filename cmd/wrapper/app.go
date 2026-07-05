@@ -379,6 +379,20 @@ func claudeEnv(cfg config) []string {
 	if cfg.HomeDir != "" {
 		env = append(env, "HOME="+cfg.HomeDir)
 	}
+	// Native Claude Code OTel (cost/token/429 backstop): only enable when both
+	// the flag is set AND an endpoint is configured, so a set-but-empty
+	// OTEL_EXPORTER_OTLP_ENDPOINT can never turn on telemetry with nowhere to
+	// send it (the envboolor-empty-bootcrash pitfall, applied here to endpoint).
+	if cfg.OtelEnabled && cfg.OtelEndpoint != "" {
+		env = append(env,
+			"CLAUDE_CODE_ENABLE_TELEMETRY=1",
+			"OTEL_METRICS_EXPORTER=otlp",
+			"OTEL_LOGS_EXPORTER=otlp",
+			"OTEL_EXPORTER_OTLP_PROTOCOL=grpc",
+			"OTEL_EXPORTER_OTLP_ENDPOINT="+cfg.OtelEndpoint,
+			"OTEL_METRIC_EXPORT_INTERVAL=60000",
+		)
+	}
 	return env
 }
 
