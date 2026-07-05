@@ -62,8 +62,7 @@ buildctl --addr "$BUILDKITD_ADDR" build \
   --opt filename=Dockerfile \
   --opt target=test-guard \
   --opt build-arg:TATARA_CLI_VERSION="${TATARA_CLI_VERSION}" \
-  --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN \
-  --output type=cacheonly
+  --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN
 
 # Remote git context (buildkitd clones the private repo, like kaniko did).
 # MUST be https:// (NOT git://): buildkit's GIT_AUTH_TOKEN basic-auth extraheader
