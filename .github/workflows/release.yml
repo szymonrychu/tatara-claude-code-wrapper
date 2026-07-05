@@ -34,11 +34,22 @@ jobs:
       HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
       HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
     steps:
+      # persist-credentials: false is REQUIRED. By default checkout writes an
+      # `http.https://github.com/.extraheader` Authorization header carrying the
+      # read-only default GITHUB_TOKEN into .git/config. That header is applied
+      # to every request to github.com and OVERRIDES the userinfo in an explicit
+      # push URL, so the cd-release `cut tag` step's
+      # `git push https://x-access-token:${TATARA_CD_TOKEN}@github.com/...` would
+      # authenticate as github-actions[bot] (not the PAT) and get a 403
+      # "Permission denied to github-actions[bot]". Not persisting the credential
+      # leaves the token-URL push to authenticate as the PAT. Tags are still
+      # fetched here (checkout uses the token in-run; it just does not persist it).
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       # Read the merged PR's semver:* label, compute + push the next tag (vX.Y.Z).
       - name: cut tag
