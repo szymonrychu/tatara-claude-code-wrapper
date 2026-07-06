@@ -71,14 +71,21 @@ ENV HOME=/home/agent HOME_DIR=/home/agent WORKSPACE=/workspace
 # mise: per-user tool-version manager for the agent (matches the infra builder
 # pattern). Installed as `agent` so it lands in /home/agent/.local; never as root.
 # Each cloned repo pins its build tools in a root .mise.toml; the agent runs
-# `mise install` per repo. Python is the one GLOBAL tool baked here: pre-commit
-# (and its python hooks: end-of-file-fixer, yamllint, etc.) is a Python app and
-# the node:bookworm-slim base has no python3 -- without a global python `mise use
-# -g python`, `pre-commit install` fails with `/usr/bin/env: python3: not found`.
+# `mise install` per repo. Python + pre-commit are baked GLOBALLY here: the
+# wrapper runs `pre-commit install` in every cloned repo (bootstrap hooks), so
+# pre-commit must be on PATH even when a repo does not pin it in its own
+# .mise.toml (e.g. tatara-agent-skills, tatara-documentation). pre-commit is a
+# Python app and the node:bookworm-slim base has no python3, so a global python
+# is baked with it (its hooks -- end-of-file-fixer, yamllint -- are Python too).
+# python.github_attestations is disabled below: python-build-standalone builds
+# before ~late-2024 (e.g. the 3.12.4 some repos pin) ship no GitHub attestations
+# and mise >= 2026.6 rejects them by default; the download checksum still applies.
 ARG MISE_VERSION
 ENV MISE_VERSION=${MISE_VERSION}
 # renovate: repository=python/cpython
 ARG PYTHON_VERSION=3.13
+# renovate: repository=pre-commit/pre-commit
+ARG PRECOMMIT_VERSION=4.6.0
 RUN curl https://mise.run | sh \
     && /home/agent/.local/bin/mise --version \
     && /home/agent/.local/bin/mise settings set plugin_autoupdate_last_check_duration "0" \
@@ -87,8 +94,11 @@ RUN curl https://mise.run | sh \
     && /home/agent/.local/bin/mise settings set task_run_auto_install "true" \
     && /home/agent/.local/bin/mise settings set experimental "true" \
     && /home/agent/.local/bin/mise settings set trusted_config_paths "/workspace" \
+    && /home/agent/.local/bin/mise settings set python.github_attestations "false" \
     && /home/agent/.local/bin/mise use -g "python@${PYTHON_VERSION}" \
     && /home/agent/.local/bin/mise exec -- python3 --version \
+    && /home/agent/.local/bin/mise use -g "pre-commit@${PRECOMMIT_VERSION}" \
+    && /home/agent/.local/bin/mise exec -- pre-commit --version \
     && printf '%s\n' \
         'export PATH="$HOME/.local/bin:$PATH"' \
         'eval "$("$HOME/.local/bin/mise" activate bash)"' \
