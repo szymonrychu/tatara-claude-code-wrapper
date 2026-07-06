@@ -89,7 +89,19 @@ jobs:
           NAME="$(basename "$(ls -d charts/*/)")"
           helm registry login harbor.szymonrichert.pl -u "$HARBOR_USERNAME" -p "$HARBOR_PASSWORD"
           helm package "charts/$NAME" --version "${CHART_VERSION}" --app-version "${VERSION}"
-          helm push "${NAME}-${CHART_VERSION}.tgz" oci://harbor.szymonrichert.pl/charts
+          # Chart tags in Harbor are immutable. If this version already exists (a
+          # prior release cut it before the git tags were realigned below it), the
+          # push returns 412 precondition. Immutability guarantees identical
+          # content, so that push is a benign no-op: swallow it and let the release
+          # proceed to the helmfile bump instead of wedging the CD cascade. Any
+          # other push failure (auth, network) still fails the release.
+          rc=0
+          push_out="$(helm push "${NAME}-${CHART_VERSION}.tgz" oci://harbor.szymonrichert.pl/charts 2>&1)" || rc=$?
+          echo "$push_out"
+          if [ "$rc" -ne 0 ]; then
+            echo "$push_out" | grep -qiE 'configured as immutable|status code 412' || exit "$rc"
+            echo "chart ${NAME}:${CHART_VERSION} already published (immutable); treating as no-op."
+          fi
 
       # Propagate vX.Y.Z into tatara-helmfile: both wrapper image pins rewritten
       # lockstep in ONE commit on the cd/deploy-train branch (cd-release handles
