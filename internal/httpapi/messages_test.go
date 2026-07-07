@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/httpapi"
@@ -263,6 +264,81 @@ func TestPostMessage_HandoffPreamble_SurvivesFailedFirstSubmit(t *testing.T) {
 func newAPIWithLog(ctl httpapi.SessionController, store *turn.Store, logBuf io.Writer) *httpapi.API {
 	log := slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	return httpapi.New(httpapi.Deps{Ctl: ctl, Store: store, Log: log})
+}
+
+// newAPIWithLogLevel builds an API whose logger filters at the given level.
+func newAPIWithLogLevel(ctl httpapi.SessionController, store *turn.Store, logBuf io.Writer, level slog.Level) *httpapi.API {
+	log := slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: level}))
+	return httpapi.New(httpapi.Deps{Ctl: ctl, Store: store, Log: log})
+}
+
+// requestHandledRoutes returns the route field of every "request handled" log
+// line in data.
+func requestHandledRoutes(t *testing.T, data string) []string {
+	t.Helper()
+	var routes []string
+	for ln := range strings.SplitSeq(strings.TrimRight(data, "\n"), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(ln), &m) == nil && m["msg"] == "request handled" {
+			if r, ok := m["route"].(string); ok {
+				routes = append(routes, r)
+			}
+		}
+	}
+	return routes
+}
+
+// TestRouter_ProbeRoutesNotLoggedAtInfo verifies that the kubelet/Prometheus
+// probe routes (/healthz, /readyz, /metrics) do NOT emit a "request handled"
+// INFO line, so the access log at the default level is not drowned in probe
+// noise (every ~10s per probe). Real business requests still log.
+func TestRouter_ProbeRoutesNotLoggedAtInfo(t *testing.T) {
+	var logBuf bytes.Buffer
+	reg := prometheus.NewRegistry()
+	api := httpapi.New(httpapi.Deps{
+		Ctl:      &aliveCtl{},
+		Store:    turn.NewStore(),
+		Log:      slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		Registry: reg,
+	})
+
+	for _, route := range []string{"/healthz", "/readyz", "/metrics"} {
+		req := httptest.NewRequest(http.MethodGet, route, nil)
+		api.Router().ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	routes := requestHandledRoutes(t, logBuf.String())
+	for _, r := range routes {
+		require.NotContains(t, []string{"/healthz", "/readyz", "/metrics"}, r,
+			"probe route %q must not emit a request-handled INFO line", r)
+	}
+}
+
+// TestRouter_ProbeRoutesLoggedAtDebug verifies the probe access logs are only
+// demoted, not dropped: at LOG_LEVEL=debug they reappear for troubleshooting.
+func TestRouter_ProbeRoutesLoggedAtDebug(t *testing.T) {
+	var logBuf bytes.Buffer
+	api := newAPIWithLogLevel(&aliveCtl{}, turn.NewStore(), &logBuf, slog.LevelDebug)
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	api.Router().ServeHTTP(httptest.NewRecorder(), req)
+
+	require.Contains(t, requestHandledRoutes(t, logBuf.String()), "/readyz",
+		"probe route must still log at debug level")
+}
+
+// TestRouter_BusinessRouteLoggedAtInfo verifies a real request still emits its
+// "request handled" INFO line after the probe demotion.
+func TestRouter_BusinessRouteLoggedAtInfo(t *testing.T) {
+	var logBuf bytes.Buffer
+	api := newAPIWithLog(&fakeCtl{submitID: "turn-x"}, turn.NewStore(), &logBuf)
+
+	body, _ := json.Marshal(map[string]string{"text": "hello", "callbackUrl": ""})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	api.Router().ServeHTTP(httptest.NewRecorder(), req)
+
+	require.Contains(t, requestHandledRoutes(t, logBuf.String()), "/v1/messages",
+		"business route must still log at info level")
 }
 
 // TestRouter_EmitsRequestHandledLog verifies the logging middleware writes a

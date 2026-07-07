@@ -429,11 +429,14 @@ func (t *Tailer) processLine(raw []byte) {
 	}
 
 	if entry.Message == nil {
-		// Non-message line (system, summary, etc.) - passthrough.
-		// Clamp the metric label to a known set; use the raw type only in the log
-		// (logs are not cardinality-bound).
+		// Non-message line: Claude Code transcript housekeeping (system, summary,
+		// mode, permission-mode, file-history-snapshot, attachment, ai-title, ...)
+		// carrying no agent/user content. Logged at DEBUG so the default INFO
+		// stream shows only real messages and tool usage; the metric still counts
+		// every entry. Clamp the metric label to a known set; use the raw type
+		// only in the log (logs are not cardinality-bound).
 		metricType := clampNonMessageType(entry.Type)
-		t.log.Info("agent stream",
+		t.log.Debug("agent stream",
 			"action", "agent_stream",
 			"stream_type", entry.Type,
 			"session_id", entry.SessionID,

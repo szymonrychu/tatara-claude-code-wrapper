@@ -67,9 +67,21 @@ func New(d Deps) *API {
 	return &API{ctl: d.Ctl, store: d.Store, v: d.Verifier, log: d.Log, reg: d.Registry, m: d.Metrics, handoffKey: d.HandoffKey}
 }
 
-// requestLogger is a chi middleware that logs each request at INFO on completion
-// with request_id, user (from OIDC claims if present), route, method, status,
-// and duration_ms. Wires obs.RequestLogger into every handler (rules 12+13).
+// probeRoutes are the infra-plane endpoints whose access logs are pure noise at
+// INFO: kubelet hits /healthz + /readyz every ~10s and Prometheus scrapes
+// /metrics on its own interval. Their "request handled" line is demoted to DEBUG
+// so the default-level access log shows only real requests; set LOG_LEVEL=debug
+// to see them again.
+var probeRoutes = map[string]bool{
+	"/healthz": true,
+	"/readyz":  true,
+	"/metrics": true,
+}
+
+// requestLogger is a chi middleware that logs each request on completion with
+// request_id, user (from OIDC claims if present), route, method, status, and
+// duration_ms. Business requests log at INFO (rules 12+13); infra-plane probe
+// routes log at DEBUG (see probeRoutes).
 func (a *API) requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -80,14 +92,19 @@ func (a *API) requestLogger(next http.Handler) http.Handler {
 		if claims, ok := auth.ClaimsFromContext(r.Context()); ok {
 			user = claims.Subject
 		}
-		obs.RequestLogger(a.log, obs.RequestFields{
+		lg := obs.RequestLogger(a.log, obs.RequestFields{
 			RequestID:  middleware.GetReqID(r.Context()),
 			User:       user,
 			Route:      r.URL.Path,
 			Method:     r.Method,
 			Status:     ww.Status(),
 			DurationMs: time.Since(start).Milliseconds(),
-		}).Info("request handled")
+		})
+		if probeRoutes[r.URL.Path] {
+			lg.Debug("request handled")
+		} else {
+			lg.Info("request handled")
+		}
 	})
 }
 
