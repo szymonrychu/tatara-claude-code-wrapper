@@ -2,5 +2,10 @@ apiVersion: v2
 name: tatara-claude-code-wrapper
 description: Single-session Claude Code supervisor (interactive PTY + Stop-hook API)
 type: application
-version: 0.1.14
-appVersion: "0.1.14"
+# Placeholder values only. The real chart version and appVersion are injected at
+# release time by `helm package --version <X.Y.Z> --app-version <vX.Y.Z>` in
+# .github/workflows/release.yml, computed from the freshly-cut git tag. Nothing
+# reads these hard-coded values in a published chart, so they are pinned to the
+# 0.0.0 sentinel to avoid drift against the git-tag/Harbor version of record.
+version: 0.0.0
+appVersion: "0.0.0"
