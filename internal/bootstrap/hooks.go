@@ -19,26 +19,29 @@ import (
 func InstallHooks(workspace string, repos []RepoSpec, repoURL string, cmd CmdRunnerDir, log *slog.Logger, m *metrics.Metrics) {
 	dirs := repoDirs(workspace, repos, repoURL)
 	for _, dir := range dirs {
-		runHookInstall(dir, "mise", []string{"install"}, cmd, log, m)
-		runHookInstall(dir, "pre-commit", []string{"install", "--hook-type", "pre-commit", "--hook-type", "pre-push"}, cmd, log, m)
+		runHookInstall(dir, "mise", "mise", []string{"install"}, cmd, log, m)
+		runHookInstall(dir, "mise", "pre-commit", []string{"exec", "--", "pre-commit", "install", "--hook-type", "pre-commit", "--hook-type", "pre-push"}, cmd, log, m)
 	}
 }
 
-func runHookInstall(dir, tool string, args []string, cmd CmdRunnerDir, log *slog.Logger, m *metrics.Metrics) {
+// runHookInstall runs binary with args in dir, recording the prometheus metric
+// and log under label (which may differ from binary when the tool is invoked
+// through a runner like mise exec).
+func runHookInstall(dir, binary, label string, args []string, cmd CmdRunnerDir, log *slog.Logger, m *metrics.Metrics) {
 	start := time.Now()
-	err := cmd(dir, tool, args...)
+	err := cmd(dir, binary, args...)
 	result := "ok"
 	if err != nil {
 		result = "fail"
 	}
 	if m != nil {
-		m.BootstrapHookInstall.WithLabelValues(result, tool).Inc()
+		m.BootstrapHookInstall.WithLabelValues(result, label).Inc()
 	}
 	if log != nil {
 		if err != nil {
-			log.Warn("hook install failed (best-effort)", "action", "hook_install", "tool", tool, "dir", dir, "error", err, "duration_ms", time.Since(start).Milliseconds())
+			log.Warn("hook install failed (best-effort)", "action", "hook_install", "tool", label, "dir", dir, "error", err, "duration_ms", time.Since(start).Milliseconds())
 		} else {
-			log.Info("hook install ok", "action", "hook_install", "tool", tool, "dir", dir, "duration_ms", time.Since(start).Milliseconds())
+			log.Info("hook install ok", "action", "hook_install", "tool", label, "dir", dir, "duration_ms", time.Since(start).Milliseconds())
 		}
 	}
 }

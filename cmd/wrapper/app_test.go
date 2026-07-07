@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -38,5 +39,53 @@ func requireNoOtelEnv(t *testing.T, env []string) {
 		require.NotContains(t, e, "OTEL_EXPORTER_OTLP_PROTOCOL")
 		require.NotContains(t, e, "OTEL_EXPORTER_OTLP_ENDPOINT")
 		require.NotContains(t, e, "OTEL_METRIC_EXPORT_INTERVAL")
+	}
+}
+
+// TestSetGitHubTokenEnv verifies that setGitHubTokenEnv propagates the bot PAT
+// to the env vars that mise and aqua honor for authenticated GitHub API calls.
+func TestSetGitHubTokenEnv(t *testing.T) {
+	tests := []struct {
+		name    string
+		token   string
+		wantSet bool
+		wantVal string
+	}{
+		{ //nolint:gosec // not a real credential: table-driven test fixture
+			name:    "sets both vars when token non-empty",
+			token:   "test-bot-pat-value",
+			wantSet: true,
+			wantVal: "test-bot-pat-value",
+		},
+		{
+			name:    "leaves vars unset when token empty",
+			token:   "",
+			wantSet: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = os.Unsetenv("GITHUB_TOKEN")
+			_ = os.Unsetenv("MISE_GITHUB_TOKEN")
+			t.Cleanup(func() {
+				_ = os.Unsetenv("GITHUB_TOKEN")
+				_ = os.Unsetenv("MISE_GITHUB_TOKEN")
+			})
+
+			setGitHubTokenEnv(tc.token)
+
+			ghVal, ghOk := os.LookupEnv("GITHUB_TOKEN")
+			miseVal, miseOk := os.LookupEnv("MISE_GITHUB_TOKEN")
+
+			if tc.wantSet {
+				require.True(t, ghOk, "GITHUB_TOKEN must be set")
+				require.Equal(t, tc.wantVal, ghVal)
+				require.True(t, miseOk, "MISE_GITHUB_TOKEN must be set")
+				require.Equal(t, tc.wantVal, miseVal)
+			} else {
+				require.False(t, ghOk, "GITHUB_TOKEN must not be set when token is empty")
+				require.False(t, miseOk, "MISE_GITHUB_TOKEN must not be set when token is empty")
+			}
+		})
 	}
 }

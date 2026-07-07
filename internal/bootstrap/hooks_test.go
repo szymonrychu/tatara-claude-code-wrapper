@@ -16,10 +16,9 @@ import (
 )
 
 // TestInstallHooks_SingleRepo asserts that InstallHooks calls mise install and
-// pre-commit install --hook-type pre-commit --hook-type pre-push in the repo's
-// namespace subdir (workspace/<owner>/<repo>) when repos is empty and repoURL is
-// set. Single-repo clones into a subdir (not the workspace root), so hooks must
-// install there.
+// mise exec -- pre-commit install ... in the repo's namespace subdir
+// (workspace/<owner>/<repo>) when repos is empty and repoURL is set.
+// pre-commit is invoked via mise exec so mise's shim path is not required.
 func TestInstallHooks_SingleRepo(t *testing.T) {
 	type call struct {
 		dir  string
@@ -36,7 +35,7 @@ func TestInstallHooks_SingleRepo(t *testing.T) {
 	workspace := "/tmp/ws"
 	bootstrap.InstallHooks(workspace, nil, "https://github.com/x/y", fakeCmd, nil, nil)
 
-	require.Len(t, calls, 2, "expected 2 calls: mise install + pre-commit install")
+	require.Len(t, calls, 2, "expected 2 calls: mise install + mise exec -- pre-commit install")
 
 	repoDir := filepath.Join(workspace, "x", "y")
 	miseCall := calls[0]
@@ -46,8 +45,8 @@ func TestInstallHooks_SingleRepo(t *testing.T) {
 
 	pcCall := calls[1]
 	require.Equal(t, repoDir, pcCall.dir, "hooks must install in the repo namespace subdir, not the workspace root")
-	require.Equal(t, "pre-commit", pcCall.name)
-	require.Equal(t, []string{"install", "--hook-type", "pre-commit", "--hook-type", "pre-push"}, pcCall.args)
+	require.Equal(t, "mise", pcCall.name, "pre-commit must be invoked via mise exec")
+	require.Equal(t, []string{"exec", "--", "pre-commit", "install", "--hook-type", "pre-commit", "--hook-type", "pre-push"}, pcCall.args)
 }
 
 // TestInstallHooks_MultiRepo asserts that InstallHooks calls mise+pre-commit
@@ -77,11 +76,11 @@ func TestInstallHooks_MultiRepo(t *testing.T) {
 	require.Equal(t, "/tmp/ws/owner/tatara-cli", calls[0].dir)
 	require.Equal(t, "mise", calls[0].name)
 	require.Equal(t, "/tmp/ws/owner/tatara-cli", calls[1].dir)
-	require.Equal(t, "pre-commit", calls[1].name)
+	require.Equal(t, "mise", calls[1].name, "pre-commit must be invoked via mise exec")
 	require.Equal(t, "/tmp/ws/owner/tatara-memory", calls[2].dir)
 	require.Equal(t, "mise", calls[2].name)
 	require.Equal(t, "/tmp/ws/owner/tatara-memory", calls[3].dir)
-	require.Equal(t, "pre-commit", calls[3].name)
+	require.Equal(t, "mise", calls[3].name, "pre-commit must be invoked via mise exec")
 }
 
 // TestInstallHooks_BestEffort asserts that a failure in mise install or
@@ -94,8 +93,8 @@ func TestInstallHooks_BestEffort(t *testing.T) {
 	var calls []call
 	fakeCmd := func(dir, name string, args ...string) error {
 		calls = append(calls, call{dir: dir, name: name})
-		// Always fail mise install to simulate missing mise
-		if name == "mise" {
+		// Fail only mise install (args==["install"]), not mise exec
+		if name == "mise" && len(args) == 1 && args[0] == "install" {
 			return errFake("mise not found")
 		}
 		return nil
@@ -105,10 +104,10 @@ func TestInstallHooks_BestEffort(t *testing.T) {
 	// Must not panic or return error - InstallHooks is void
 	bootstrap.InstallHooks(workspace, nil, "https://github.com/x/y", fakeCmd, nil, nil)
 
-	// Even though mise failed, pre-commit install must still be attempted
-	require.Len(t, calls, 2, "both calls must be attempted even when mise fails")
+	// Even though mise install failed, mise exec -- pre-commit install must still be attempted
+	require.Len(t, calls, 2, "both calls must be attempted even when mise install fails")
 	require.Equal(t, "mise", calls[0].name)
-	require.Equal(t, "pre-commit", calls[1].name)
+	require.Equal(t, "mise", calls[1].name, "pre-commit must be invoked via mise exec")
 }
 
 // TestInstallHooks_NoRepo asserts that InstallHooks is a no-op when both
@@ -148,7 +147,8 @@ func TestInstallHooks_MetricOk(t *testing.T) {
 // BootstrapHookInstall with result=fail and still attempts the next command.
 func TestInstallHooks_MetricFail(t *testing.T) {
 	fakeCmd := func(dir, name string, args ...string) error {
-		if name == "mise" {
+		// Fail only mise install, not mise exec -- pre-commit
+		if name == "mise" && len(args) == 1 && args[0] == "install" {
 			return errFake("mise not found")
 		}
 		return nil
@@ -204,6 +204,41 @@ func TestInstallHooks_LogsViaInjectedLogger(t *testing.T) {
 		}
 	}
 	require.True(t, found, "no hook_install log line emitted by injected logger")
+}
+
+// TestInstallHooks_PreCommitMetricLabelIsPreCommit asserts that the prometheus
+// metric label for pre-commit install is "pre-commit" even though the binary
+// invoked is "mise" (via mise exec --).
+func TestInstallHooks_PreCommitMetricLabelIsPreCommit(t *testing.T) {
+	fakeCmd := func(dir, name string, args ...string) error { return nil }
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	bootstrap.InstallHooks("/tmp/ws", nil, "https://github.com/x/y", fakeCmd, nil, m)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+
+	toolLabels := map[string]float64{}
+	for _, mf := range mfs {
+		if mf.GetName() == "ccw_bootstrap_hook_install_total" {
+			for _, metric := range mf.GetMetric() {
+				var tool, result string
+				for _, lp := range metric.GetLabel() {
+					switch lp.GetName() {
+					case "tool":
+						tool = lp.GetValue()
+					case "result":
+						result = lp.GetValue()
+					}
+				}
+				if result == "ok" {
+					toolLabels[tool] += metric.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	require.Equal(t, float64(1), toolLabels["mise"], "mise install must be labeled tool=mise")
+	require.Equal(t, float64(1), toolLabels["pre-commit"], "pre-commit must be labeled tool=pre-commit even when invoked via mise exec")
 }
 
 // errFake is a simple error type for tests.

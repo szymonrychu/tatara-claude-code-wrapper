@@ -65,6 +65,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	if err := bootstrap.Render(buildBootstrapParams(cfg, log, m), gitRunner()); err != nil {
 		return nil, err
 	}
+	setGitHubTokenEnv(cfg.GitToken)
 	bootstrap.InstallHooks(cfg.Workspace, cfg.Repos, cfg.RepoURL, execRunnerDir(log), log, m)
 	if err := tataraLookAndRegister(cfg.Workspace, execRunner(log)); err != nil {
 		log.Error("tatara MCP registration failed; agent will have no operator tools", "error", err)
@@ -432,6 +433,18 @@ func execRunner(log *slog.Logger) bootstrap.CmdRunner {
 		log.Info("mcp-config registered tatara server", "cmd", name, "args", args)
 		return nil
 	}
+}
+
+// setGitHubTokenEnv propagates the bot PAT to GITHUB_TOKEN and
+// MISE_GITHUB_TOKEN so that mise (and the aqua backend) can make
+// authenticated GitHub API calls during tool installs. Both keys carry a
+// _TOKEN suffix and are therefore auto-redacted from logs by secretsFromEnv.
+func setGitHubTokenEnv(token string) {
+	if token == "" {
+		return
+	}
+	os.Setenv("GITHUB_TOKEN", token)      //nolint:errcheck,gosec // os.Setenv only fails on invalid key
+	os.Setenv("MISE_GITHUB_TOKEN", token) //nolint:errcheck,gosec
 }
 
 func execRunnerDir(log *slog.Logger) bootstrap.CmdRunnerDir {
