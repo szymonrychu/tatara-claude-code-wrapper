@@ -98,6 +98,71 @@ func TestTailer_UnknownNonMessageType_ClampedInMetric(t *testing.T) {
 	}
 }
 
+// TestTailer_NonMessageLineLogsAtDebug verifies that transcript housekeeping
+// entries with no message body (system/summary and Claude Code's own
+// mode/permission-mode/file-history-snapshot/attachment/ai-title bookkeeping)
+// are demoted to DEBUG so the default INFO stream shows only real agent/user
+// messages and tool usage.
+func TestTailer_NonMessageLineLogsAtDebug(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	writeTranscriptLine(t, path, `{"type":"file-history-snapshot","uuid":"u1","sessionId":"s1","timestamp":"2026-07-07T00:00:00.000Z"}`)
+
+	h := newCaptureHandler()
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	recs := waitForRecords(t, h, 1, 2*time.Second)
+	cancel()
+	<-done
+
+	stream := filterAgentStream(recs)
+	if len(stream) == 0 {
+		t.Fatalf("expected an agent_stream record, got: %v", recs)
+	}
+	if stream[0]["level"] != "DEBUG" {
+		t.Errorf("non-message passthrough level=%v, want DEBUG", stream[0]["level"])
+	}
+}
+
+// TestTailer_RealMessageLogsAtInfo locks the contract that real agent content
+// (a text content block) stays at INFO after the passthrough demotion.
+func TestTailer_RealMessageLogsAtInfo(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	writeTranscriptLine(t, path, assistantTextLine(t))
+
+	h := newCaptureHandler()
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	recs := waitForRecords(t, h, 1, 2*time.Second)
+	cancel()
+	<-done
+
+	var text map[string]any
+	for _, r := range filterAgentStream(recs) {
+		if r["stream_type"] == "text" {
+			text = r
+			break
+		}
+	}
+	if text == nil {
+		t.Fatalf("no text agent_stream record, got: %v", recs)
+	}
+	if text["level"] != "INFO" {
+		t.Errorf("text content level=%v, want INFO", text["level"])
+	}
+}
+
 func TestClampToolName(t *testing.T) {
 	for _, tt := range []struct{ in, want string }{
 		{"Bash", "Bash"},
