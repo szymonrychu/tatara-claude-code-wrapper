@@ -318,6 +318,7 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		SkillsRepo:      cfg.SkillsRepo,
 		SkillsRef:       cfg.SkillsRef,
 		SkillsCloneDir:  skillsCloneDir(cfg.SkillsSrcDirs),
+		AgentsSrc:       []string{filepath.Join(skillsCloneDir(cfg.SkillsSrcDirs), ".claude", "agents")},
 		HookCommand:     cfg.HookPath,
 		AllowedTools:    readLines(cfg.AllowedToolsPath),
 		EnableAllMCP:    true,
@@ -333,8 +334,6 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		CheckoutBranch:  cfg.CheckoutBranch,
 		FullClone:       cfg.FullClone,
 		Repos:           cfg.Repos,
-		WorkerModel:     cfg.WorkerModel,
-		WorkerEffort:    cfg.WorkerEffort,
 
 		HookPreClone:             cfg.HookPreClone,
 		HookPostClone:            cfg.HookPostClone,
@@ -376,7 +375,20 @@ func parseLevel(s string) slog.Level {
 }
 
 func claudeEnv(cfg config) []string {
-	env := append(os.Environ(), "TERM=xterm-256color")
+	env := []string{"TERM=xterm-256color"}
+	for _, e := range os.Environ() {
+		// Strip any ambient CLAUDE_CODE_SUBAGENT_MODEL: it forces every
+		// subagent onto one model, silently overriding the typed agents'
+		// baked model: frontmatter (explorer=haiku/tester=haiku,sonnet/
+		// builder=sonnet/architect=opus - task-kind redesign Decision 6).
+		// The wrapper itself never sets this; the strip is a
+		// belt-and-suspenders guard in case an operator/chart change ever
+		// adds it as a pod env var.
+		if strings.HasPrefix(e, "CLAUDE_CODE_SUBAGENT_MODEL=") {
+			continue
+		}
+		env = append(env, e)
+	}
 	if cfg.HomeDir != "" {
 		env = append(env, "HOME="+cfg.HomeDir)
 	}

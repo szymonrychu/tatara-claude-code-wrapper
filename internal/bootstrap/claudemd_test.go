@@ -53,9 +53,9 @@ func TestRender_DirectivePresentWithoutGlobalClaudeMd(t *testing.T) {
 	require.Contains(t, string(b), "comment_on_issue")
 }
 
-// Component 2: the main agent should delegate mechanical implementation and
-// read-only code search to the cheap-model worker subagents (implementer,
-// explorer), keeping planning/design/review/merge on itself.
+// task-kind redesign Decision 6: the main agent should delegate work to the
+// typed subagents (explorer/tester/builder/architect), keeping
+// planning/design/review/merge on itself.
 func TestRender_AppendsWorkerDelegationDirective(t *testing.T) {
 	home := t.TempDir()
 	ws := t.TempDir()
@@ -70,7 +70,9 @@ func TestRender_AppendsWorkerDelegationDirective(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join(home, ".claude", "CLAUDE.md"))
 	require.NoError(t, err)
 	got := string(b)
-	require.Contains(t, got, "implementer")
 	require.Contains(t, got, "explorer")
+	require.Contains(t, got, "tester")
+	require.Contains(t, got, "builder")
+	require.Contains(t, got, "architect")
 	require.Contains(t, got, "planning")
 }

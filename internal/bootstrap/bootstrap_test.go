@@ -75,6 +75,32 @@ func TestRender_WritesClaudeMdSettingsSkillsAndMergesMCP(t *testing.T) {
 	require.Empty(t, gitCalls)
 }
 
+func TestRender_InstallsAgentsFromClonedSkillsRepo(t *testing.T) {
+	orig := bootstrap.SkillsCloneRetryDelay
+	bootstrap.SkillsCloneRetryDelay = func(int) {}
+	defer func() { bootstrap.SkillsCloneRetryDelay = orig }()
+
+	agentsSrc := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(agentsSrc, "explorer.md"), []byte("---\nname: explorer\nmodel: haiku\n---\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(agentsSrc, "builder.md"), []byte("---\nname: builder\nmodel: sonnet\n---\n"), 0o644))
+
+	ws := t.TempDir()
+	p := bootstrap.Params{
+		HomeDir:        t.TempDir(),
+		Workspace:      ws,
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+		AgentsSrc:      []string{agentsSrc},
+	}
+	stubGit := func(string, ...string) error { return nil }
+	require.NoError(t, bootstrap.Render(p, stubGit))
+
+	dst := filepath.Join(ws, ".claude", "agents")
+	require.FileExists(t, filepath.Join(dst, "explorer.md"))
+	require.FileExists(t, filepath.Join(dst, "builder.md"))
+}
+
 func TestRender_ClonesRepoWhenURLSet(t *testing.T) {
 	var gitCalls [][]string
 	p := bootstrap.Params{

@@ -42,6 +42,20 @@ func requireNoOtelEnv(t *testing.T, env []string) {
 	}
 }
 
+func TestBuildBootstrapParams_DerivesAgentsSrcFromSkillsCloneDir(t *testing.T) {
+	cfg := config{SkillsSrcDirs: "/etc/wrapper/skills/skills"}
+	params := buildBootstrapParams(cfg, nil, nil)
+	require.Equal(t, []string{"/etc/wrapper/skills/.claude/agents"}, params.AgentsSrc)
+}
+
+func TestClaudeEnv_StripsAmbientSubagentModelOverride(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_SUBAGENT_MODEL", "opus")
+	env := claudeEnv(config{})
+	for _, e := range env {
+		require.NotContains(t, e, "CLAUDE_CODE_SUBAGENT_MODEL")
+	}
+}
+
 // TestSetGitHubTokenEnv verifies that setGitHubTokenEnv propagates the bot PAT
 // to the env vars that mise and aqua honor for authenticated GitHub API calls.
 func TestSetGitHubTokenEnv(t *testing.T) {
