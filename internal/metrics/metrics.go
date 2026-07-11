@@ -61,6 +61,7 @@ type Metrics struct {
 	// Skills delivery metrics (rule 13: boot-time clone and filter are fallible).
 	SkillsInstalled     *prometheus.CounterVec // label: profile
 	SkillsCloneFailures prometheus.Counter
+	AgentsInstalled     prometheus.Counter // total typed-agent .md files installed at boot
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -128,6 +129,8 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "wrapper_skills_installed_total", Help: "Skills installed at boot by profile."}, []string{"profile"}),
 		SkillsCloneFailures: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "wrapper_skills_clone_failures_total", Help: "Skills repo boot-clone failures (after 3 retries)."}),
+		AgentsInstalled: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "wrapper_agents_installed_total", Help: "Typed subagent .md files installed at boot."}),
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
 		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal, m.Interjections,
@@ -136,6 +139,6 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.HTTPInFlight, m.HTTPPanicsTotal,
 		m.AuthTotal, m.TurnResumes, m.OutcomeRepromptTotal, m.BootstrapRenderTotal,
 		m.TurnTokensTotal, m.TurnCostUSD, m.InternalIssueTotal,
-		m.ToolCallsTotal, m.SkillsInstalled, m.SkillsCloneFailures)
+		m.ToolCallsTotal, m.SkillsInstalled, m.SkillsCloneFailures, m.AgentsInstalled)
 	return m
 }

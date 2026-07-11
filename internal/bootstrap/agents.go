@@ -4,49 +4,74 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
-// writeAgents emits the cheap-model worker subagent definitions
-// (.claude/agents/implementer.md, explorer.md) into claudeHome. These are
-// invoked by the main (Opus) agent for mechanical implementation and
-// read-only code search respectively (Component 2: workflow delegation).
-func writeAgents(p Params, claudeHome string) error {
-	dir := filepath.Join(claudeHome, "agents")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+// installAgents copies typed subagent definitions (flat *.md files, one
+// level deep - no subdirectories, no SKILL.md-style marker) from each
+// AgentsSrc directory into <workspace>/.claude/agents. This mirrors
+// installSkills's clone-then-copy path (same already-cloned skills-repo
+// checkout, same later-source-wins flatten semantics) but does not
+// profile-gate: the typed agents (explorer/tester/builder/architect) are a
+// shared dispatch palette used by implement's rigid skill and by any other
+// kind's Agent-tool subagent fan-out (brainstorm/incident/review alike, per
+// the task-kind redesign's "subagents are still first-class" mandate), not a
+// single profile's concern - and there are only four files, so the token
+// cost of always installing all of them is negligible next to the skills
+// corpus that profile-gating exists to bound.
+func installAgents(p Params) error {
+	dst := filepath.Join(p.Workspace, ".claude", "agents")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return fmt.Errorf("mkdir agents: %w", err)
 	}
-	implementer := fmt.Sprintf(`---
-name: implementer
-description: Use for mechanical implementation, editing, or test-writing from a clear spec. Does not plan or design; hands back when the spec is ambiguous.
-model: %s
-effort: %s
----
-
-You are the implementer subagent. You take a clear, already-decided spec
-(what to change, in which files, and why) and make the mechanical edits:
-write code, write tests, fix straightforward bugs. You do not make design
-decisions, choose architecture, or decide what to build; that is the main
-agent's job. If the spec is ambiguous or a non-obvious tradeoff appears,
-stop and report back rather than guessing.
-`, p.WorkerModel, p.WorkerEffort)
-	explorer := fmt.Sprintf(`---
-name: explorer
-description: Use for read-only code search and locating things - finding where a symbol, config, or behavior lives in the codebase. Never edits files.
-model: %s
-effort: %s
----
-
-You are the explorer subagent. You search and read the codebase to locate
-things: where a function is defined, where a config value is consumed,
-which files implement a behavior. You are read-only: never edit, write, or
-run mutating commands. Report file paths and line numbers back to the
-caller, not full file dumps.
-`, p.WorkerModel, p.WorkerEffort)
-	if err := os.WriteFile(filepath.Join(dir, "implementer.md"), []byte(implementer), 0o644); err != nil {
-		return fmt.Errorf("write implementer.md: %w", err)
+	total := 0
+	for _, src := range p.AgentsSrc {
+		if src == "" {
+			continue
+		}
+		if _, err := os.Stat(src); os.IsNotExist(err) {
+			continue
+		}
+		n, err := installAgentsFromSrc(src, dst, p)
+		if err != nil {
+			return fmt.Errorf("install agents from %s: %w", src, err)
+		}
+		total += n
 	}
-	if err := os.WriteFile(filepath.Join(dir, "explorer.md"), []byte(explorer), 0o644); err != nil {
-		return fmt.Errorf("write explorer.md: %w", err)
+	if p.Log != nil {
+		p.Log.Info("agents installed", "action", "install_agents", "count", total)
+	}
+	if p.M != nil {
+		p.M.AgentsInstalled.Add(float64(total))
 	}
 	return nil
+}
+
+// installAgentsFromSrc copies every top-level *.md file in src into dst.
+// Unlike installSkillsFromSrc, this does not recurse: agent definitions ship
+// as flat files at the plugin's .claude/agents/ root, not one-dir-per-item.
+func installAgentsFromSrc(src, dst string, p Params) (int, error) {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return 0, fmt.Errorf("read dir %s: %w", src, err)
+	}
+	installed := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			return installed, fmt.Errorf("stat %s: %w", e.Name(), err)
+		}
+		target := filepath.Join(dst, e.Name())
+		if _, statErr := os.Stat(target); statErr == nil && p.Log != nil {
+			p.Log.Info("agent shadowed", "action", "install_agents", "name", e.Name(), "src", src)
+		}
+		if err := copyFile(filepath.Join(src, e.Name()), target, info.Mode().Perm()); err != nil {
+			return installed, fmt.Errorf("copy agent %s: %w", e.Name(), err)
+		}
+		installed++
+	}
+	return installed, nil
 }

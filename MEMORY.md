@@ -1,5 +1,33 @@
 # MEMORY.md - tatara-claude-code-wrapper
 
+- 2026-07-11 (task-kind redesign, typed-agent install path): Added
+  installAgents/installAgentsFromSrc (internal/bootstrap/agents.go),
+  mirroring installSkills's clone-then-copy path but flat (*.md files, no
+  SKILL.md marker, no profiles: gate - only four files, shared dispatch
+  palette across kinds, not worth gating). Retired writeAgents entirely
+  (was: two hardcoded Go-templated agents, implementer/explorer, parameterized
+  by WorkerModel/WorkerEffort) - the tatara-agent-skills plugin's four typed
+  agents (explorer/tester/builder/architect, baked model: frontmatter)
+  replace them outright; explorer was a direct name collision so coexistence
+  would have been silently order-dependent. Removed Params.WorkerModel/
+  WorkerEffort and TATARA_WORKER_MODEL/TATARA_WORKER_EFFORT env (dead:
+  grepped tatara-operator, it never set them). New Params.AgentsSrc, derived
+  in buildBootstrapParams from the existing skillsCloneDir(cfg.SkillsSrcDirs)
+  + ".claude/agents" - no new operator-facing env. Agents install to
+  <workspace>/.claude/agents (project-level, matching installSkills's
+  <workspace>/.claude/skills - NOT claudeHome, where the old writeAgents
+  wrote). Also hardened claudeEnv to strip any ambient
+  CLAUDE_CODE_SUBAGENT_MODEL from os.Environ() before spawning claude: the
+  wrapper never sets it itself (confirmed by grep), but it passes
+  os.Environ() through unfiltered, so an operator/chart env addition of that
+  name would have silently forced every subagent onto one model, overriding
+  the typed agents' per-file model: frontmatter. New metric
+  wrapper_agents_installed_total. Also updated the global CLAUDE.md
+  delegationDirective const (and its test) to name the four typed agents
+  instead of the retired implementer/explorer - left stale it would have
+  actively instructed the main agent to delegate to a subagent
+  (implementer) that no longer exists.
+
 - 2026-07-04 (handoff-continuation design, component 3): Removed the never-deployed S3 conversation persistence (issue #114) entirely - internal/storage (S3 client) deleted; internal/convstore stripped down to ProjectDirName+TranscriptDir (KEPT: session.shouldResume's transcriptExistsOnDisk boot-crash check depends on TranscriptDir, unrelated to S3). Also removed: session.Config.ResumeSessionID + its `--resume <sid>` branch in pty.go claudeArgs (cross-pod resume-by-id had no producer left), config S3*/ConversationSessionID/ConversationForkFromKey fields+envs, metrics.ConversationOpsTotal, aws-sdk-go-v2/smithy-go deps (go mod tidy). CONVERSATION_OBJECT_KEY is KEPT as the env name (operator needs no change) but repurposed as the handoff key: httpapi.API gained handoffKey+handoffSent (atomic.Bool, CompareAndSwap so it's a true one-shot even if the guard were ever hit concurrently), and postMessage prepends a fixed preamble ("Continuation key: <key>. If you have prior context, call get_handoff with this key before starting, and write_handoff an updated summary before you finish.\n\n") to the FIRST /v1/messages submission only. The wrapper never calls chat itself - the agent does via the /handoff skill (tatara-agent-skills) + the tatara-cli MCP tools (write_handoff/get_handoff/list_handoffs/delete_handoff, other repos' components). Added a grep-guard test (cmd/wrapper/guard_no_s3_test.go) that walks the whole module for banned S3/ResumeSessionID identifiers so a future re-add of any of this is caught immediately, not just at review time.
 
 - 2026-06-28 (skills-phase2): Boot-clone tatara-agent-skills at TATARA_SKILLS_REF (default main) into /etc/wrapper/skills; installSkills filters each skill dir (SKILL.md `profiles:` frontmatter) against TATARA_SKILL_PROFILE; fail-open on clone failure (WARN + metric, no crash). Dropped 20 baked skills from templates/skills + COPY in Dockerfile. New Params fields: SkillProfile/SkillsRepo/SkillsRef/SkillsCloneDir. SkillsCloneDir derived from parent of first SkillsSrc entry in buildBootstrapParams. SkillsCloneRetryDelay exported var for test override. New metrics: wrapper_skills_installed_total{profile}, wrapper_skills_clone_failures_total. Hand-parser for profiles: frontmatter (no yaml dep). Default SKILLS_SRC_DIRS=/etc/wrapper/skills/skills.

@@ -24,7 +24,7 @@ var configEnvKeys = []string{
 	"PROJECT_CLAUDE_MD_PATH", "MCP_BASE_PATH", "MCP_OVERLAY_DIR",
 	"TATARA_GRAFANA_MCP_URL", "TATARA_SERENA_URL", "SKILLS_SRC_DIRS",
 	"TATARA_SKILL_PROFILE", "TATARA_SKILLS_REPO", "TATARA_SKILLS_REF",
-	"ALLOWED_TOOLS_PATH", "TATARA_WORKER_MODEL", "TATARA_WORKER_EFFORT",
+	"ALLOWED_TOOLS_PATH",
 	"HOOK_PRE_CLONE", "HOOK_POST_CLONE", "HOOK_CONVERSATION_START",
 	"HOOK_CONVERSATION_RESTART", "HOOK_AGENT_TURN_FINISHED",
 	"HOOK_CONVERSATION_FINISHED", "TATARA_WORKSPACE_FULL_CLONE",
@@ -80,22 +80,6 @@ func TestLoadConfig_EffortFromEnv(t *testing.T) {
 	cfg, err := loadConfig(nil)
 	require.NoError(t, err)
 	require.Equal(t, "xhigh", cfg.Effort)
-}
-
-func TestLoadConfig_WorkerModelEffortDefaults(t *testing.T) {
-	cfg, err := loadConfig(nil)
-	require.NoError(t, err)
-	require.Equal(t, "sonnet", cfg.WorkerModel)
-	require.Equal(t, "low", cfg.WorkerEffort)
-}
-
-func TestLoadConfig_WorkerModelEffortFromEnv(t *testing.T) {
-	t.Setenv("TATARA_WORKER_MODEL", "haiku")
-	t.Setenv("TATARA_WORKER_EFFORT", "medium")
-	cfg, err := loadConfig(nil)
-	require.NoError(t, err)
-	require.Equal(t, "haiku", cfg.WorkerModel)
-	require.Equal(t, "medium", cfg.WorkerEffort)
 }
 
 // TestLoadConfig_ConversationObjectKeyIsHandoffKey verifies CONVERSATION_

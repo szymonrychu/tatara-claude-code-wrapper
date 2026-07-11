@@ -30,16 +30,24 @@ type Params struct {
 	SkillsRepo                      string // TATARA_SKILLS_REPO; URL to clone at boot
 	SkillsRef                       string // TATARA_SKILLS_REF; git ref for the clone
 	SkillsCloneDir                  string // directory where the skills repo is cloned
-	HookCommand                     string
-	AllowedTools                    []string
-	EnableAllMCP                    bool
-	PermissionMode                  string
-	Effort                          string // claude reasoning-effort level for the agent session
-	AnthropicAPIKey                 string // used to seed customApiKeyResponses (last 20 chars)
-	RepoURL, RepoBranch             string
-	GitToken                        string // private-repo auth for clone + the agent's push (read from $GIT_TOKEN at runtime, never written to disk)
-	GitUserName, GitUserEmail       string // commit identity for the agent
-	TaskBranch                      string // work branch the operator opens the PR from; checked out after clone
+	// AgentsSrc lists directories whose top-level *.md files are installed
+	// into <workspace>/.claude/agents: the typed subagent definitions shipped
+	// by tatara-agent-skills (explorer/tester/builder/architect, model
+	// tiering baked into each file's own frontmatter - see task-kind
+	// redesign Decision 6). Derived from the same skills-repo clone as
+	// SkillsSrc; not profile-gated (see agents.go doc comment for why).
+	// Later sources win on name collision.
+	AgentsSrc                 []string
+	HookCommand               string
+	AllowedTools              []string
+	EnableAllMCP              bool
+	PermissionMode            string
+	Effort                    string // claude reasoning-effort level for the agent session
+	AnthropicAPIKey           string // used to seed customApiKeyResponses (last 20 chars)
+	RepoURL, RepoBranch       string
+	GitToken                  string // private-repo auth for clone + the agent's push (read from $GIT_TOKEN at runtime, never written to disk)
+	GitUserName, GitUserEmail string // commit identity for the agent
+	TaskBranch                string // work branch the operator opens the PR from; checked out after clone
 	// CheckoutBranch is checked out (read-only, never pushed) after clone when
 	// TaskBranch is empty: an MR review agent works on the PR head but the turn
 	// finaliser only pushes when TaskBranch is set (issue #114 decision 4).
@@ -49,13 +57,6 @@ type Params struct {
 	// healthCheck) that need cross-branch context. Default false = shallow clone.
 	FullClone bool
 	Repos     []RepoSpec
-
-	// WorkerModel/WorkerEffort pin the cheap-model worker subagents (Component
-	// 2: implementer, explorer) written to .claude/agents/. Defaults resolved
-	// by cmd/wrapper/config.go (TATARA_WORKER_MODEL="sonnet",
-	// TATARA_WORKER_EFFORT="low").
-	WorkerModel  string
-	WorkerEffort string
 
 	// Lifecycle hook commands (operator-supplied via the Project CRD, delivered
 	// as HOOK_* env vars). Empty means the hook is disabled. preClone/postClone
@@ -288,12 +289,6 @@ func Render(p Params, git GitRunner) error {
 		}
 		return err
 	}
-	if err := writeAgents(p, claudeHome); err != nil {
-		if p.M != nil {
-			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
-		}
-		return err
-	}
 	if err := writeClaudeJSON(p); err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
@@ -304,6 +299,12 @@ func Render(p Params, git GitRunner) error {
 	// explicitly so the intent is clear and errcheck linters are satisfied.
 	_ = cloneSkillsRepo(p, git)
 	if err := installSkills(p); err != nil {
+		if p.M != nil {
+			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
+		}
+		return err
+	}
+	if err := installAgents(p); err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
 		}
@@ -343,22 +344,25 @@ a human.
 `
 
 // delegationDirective is appended to the agent's global CLAUDE.md on every
-// bootstrap (Component 2: workflow delegation). It routes mechanical work to
-// the cheap-model worker subagents written to .claude/agents/ so planning
-// tokens stay on the main model.
+// bootstrap (task-kind redesign Decision 6: typed-agent install path). It
+// routes work to the typed subagents installed into .claude/agents/ (shipped
+// by tatara-agent-skills) so planning tokens stay on the main model and
+// model tiering is structural via each file's own frontmatter.
 const delegationDirective = `
 
 ---
 
-## Delegate mechanical work to worker subagents
+## Delegate work to typed subagents
 
-Two worker subagents are available, pinned to a cheaper model: delegate to
-them instead of doing this work yourself.
+Four typed subagents are available via the Agent tool, each pinned to a
+model tier via its own frontmatter: delegate to them instead of doing this
+work yourself.
 
-- **implementer**: mechanical implementation, editing, and test-writing from
-  a spec you have already decided on.
 - **explorer**: read-only code search, locating where something lives in
   the codebase.
+- **tester**: run and write tests.
+- **builder**: multi-file implementation from a clear, already-decided plan.
+- **architect**: hard reasoning, design, and adversarial verification.
 
 Keep planning, design, review, and merge decisions on yourself. Delegate the
 mechanical legwork; do not delegate the thinking.

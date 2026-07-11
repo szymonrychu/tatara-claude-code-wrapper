@@ -60,10 +60,6 @@ type config struct {
 	SkillsRef           string // TATARA_SKILLS_REF; git ref to clone
 	AllowedToolsPath    string
 	Repos               []bootstrap.RepoSpec
-	// WorkerModel/WorkerEffort pin the cheap-model worker subagents (Component
-	// 2: implementer, explorer) the bootstrap writer emits to .claude/agents/.
-	WorkerModel  string
-	WorkerEffort string
 
 	// Lifecycle hook commands (set by the operator via HOOK_* env vars). Empty
 	// means the hook is disabled.
@@ -162,8 +158,6 @@ func loadConfig(args []string) (config, error) {
 		SkillsRepo:          envOr("TATARA_SKILLS_REPO", "https://github.com/szymonrychu/tatara-agent-skills"),
 		SkillsRef:           envOr("TATARA_SKILLS_REF", "main"),
 		AllowedToolsPath:    envOr("ALLOWED_TOOLS_PATH", "/etc/wrapper/allowed-tools.txt"),
-		WorkerModel:         envOr("TATARA_WORKER_MODEL", "sonnet"),
-		WorkerEffort:        envOr("TATARA_WORKER_EFFORT", "low"),
 
 		HookPreClone:             envOr("HOOK_PRE_CLONE", ""),
 		HookPostClone:            envOr("HOOK_POST_CLONE", ""),
