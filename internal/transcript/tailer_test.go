@@ -1684,3 +1684,93 @@ func TestTailer_DrainInternalIssues_ResetsOnNewTurn(t *testing.T) {
 		t.Errorf("turn-y drain = %v, want [turn two issue]", got)
 	}
 }
+
+// TestTailer_CaughtUpToWaitsForUnterminatedPartialLine reproduces the second,
+// worse consequence of a readPos-before-processLine bug: readPos must count
+// only bytes processLine has fully returned from, never bytes merely read
+// into the `partial` buffer. If a turn's final line (a report_internal_issue
+// call) is flushed to disk without its trailing newline yet, Follow can only
+// buffer it as `partial` - it is not accumulated. If readPos were advanced
+// for those buffered-but-unprocessed bytes, CaughtUpTo would report
+// "caught up" immediately even though the report was never accumulated,
+// silently dropping it - the worst case, since it defeats the whole
+// catch-up fix with no timeout/warning to signal anything went wrong. This
+// test drives the tailer through exactly that window and asserts CaughtUpTo
+// correctly WAITS (does not report caught-up) until the newline arrives and
+// the line is processed, and that the report is not lost.
+func TestTailer_CaughtUpToWaitsForUnterminatedPartialLine(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	firstLine := `{"type":"assistant","uuid":"u0","sessionId":"s1","timestamp":"2026-07-12T00:00:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"working on it"}]}}`
+	writeTranscriptLine(t, path, firstLine)
+
+	h := newCaptureHandler()
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "turn-partial-1" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+
+	// Wait for the first line to be processed - proves Follow has hit EOF and
+	// is sitting in its poll-interval sleep with readPos == len(firstLine)+1.
+	waitForRecords(t, h, 1, 3*time.Second)
+
+	// Append the turn's last line WITHOUT a trailing newline: the bytes land
+	// on disk (os.Stat below counts them, exactly as DrainInternalIssues'
+	// target does) but Follow can only buffer them as `partial` until the
+	// newline arrives.
+	lastLineBody := makeInternalIssueLine(`{"category":"tool_error","severity":"error","description":"the tool blew up"}`)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := f.WriteString(lastLineBody); err != nil {
+		t.Fatalf("write partial line: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	target := fi.Size()
+
+	// Give Follow several poll cycles to read the unterminated bytes into
+	// partial - proving they are on-disk-but-unprocessed, not merely
+	// "not yet read" - before asserting CaughtUpTo's behavior.
+	time.Sleep(3 * pollInterval)
+
+	if tailer.CaughtUpTo(target, 50*time.Millisecond) {
+		t.Fatalf("CaughtUpTo(target) = true for a transcript line still buffered as partial (unprocessed); readPos must only count fully-processed bytes")
+	}
+	if got := tailer.DrainInternalIssues("turn-partial-1"); got != nil {
+		t.Fatalf("DrainInternalIssues = %+v before the partial line was processed; report must not surface before processLine ran", got)
+	}
+
+	// The newline arrives, completing the line; Follow's next poll processes it.
+	f2, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := f2.WriteString("\n"); err != nil {
+		t.Fatalf("write newline: %v", err)
+	}
+	if err := f2.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if !tailer.CaughtUpTo(target, 3*time.Second) {
+		t.Fatalf("CaughtUpTo(target) did not catch up after the line's trailing newline was written and processed")
+	}
+	cancel()
+	<-done
+
+	got := tailer.DrainInternalIssues("turn-partial-1")
+	want := turn.InternalIssueReport{Category: "tool_error", Severity: "error", Description: "the tool blew up"}
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("DrainInternalIssues = %+v, want [%+v] (report on disk with no trailing newline yet at drain time must not be dropped)", got, want)
+	}
+}

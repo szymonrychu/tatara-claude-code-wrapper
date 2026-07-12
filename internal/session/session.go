@@ -1249,6 +1249,9 @@ func (mgr *Manager) DrainInternalIssues(turnID string) []turn.InternalIssueRepor
 			mgr.log.Warn("transcript tailer did not catch up before internal-issue drain; reports may be incomplete",
 				"action", "internal_issue_drain", "turn_id", turnID, "path", path)
 		}
+	} else {
+		mgr.log.Warn("could not stat transcript for internal-issue drain catch-up; draining without waiting",
+			"action", "internal_issue_drain", "turn_id", turnID, "path", path, "err", err.Error())
 	}
 	return tailer.DrainInternalIssues(turnID)
 }

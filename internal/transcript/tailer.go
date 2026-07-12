@@ -120,12 +120,18 @@ type Tailer struct {
 	internalIssues []turn.InternalIssueReport
 	iiTurnID       string
 
-	// readPos is the number of bytes Follow has consumed from the current
-	// transcript file (reset to 0 on open/reopen). Used by CaughtUpTo so a
-	// turn-boundary drain can wait for the tailer to have read everything on
-	// disk as of a stat taken at the drain call, closing the poll-interval
-	// race where DrainInternalIssues runs before Follow's next poll has read
-	// the turn's final line (issue found on PR #105).
+	// readPos is the number of bytes Follow has fully processed (handed to
+	// and returned from processLine) from the current transcript file (reset
+	// to 0 on open/reopen) - never bytes merely read into a buffer, since a
+	// trailing line with no newline yet is buffered in `partial` but not
+	// processed. Used by CaughtUpTo so a turn-boundary drain can wait for the
+	// tailer to have processed everything on disk as of a stat taken at the
+	// drain call, closing the poll-interval race where DrainInternalIssues
+	// runs before Follow's next poll has read the turn's final line (issue
+	// found on PR #105), and the worse race where readPos was previously
+	// advanced before processing, letting the drain believe it had caught up
+	// while the turn's last report_internal_issue sat unprocessed in
+	// `partial` (issue found in review of that fix).
 	readPos atomic.Int64
 }
 
@@ -395,22 +401,28 @@ func (t *Tailer) Follow(ctx context.Context, path string) error {
 
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
-			// Every byte read here has been consumed from the underlying file,
-			// whether it completed a line or is a partial trailing chunk at
-			// EOF; track it so CaughtUpTo can tell a turn-boundary drain
-			// whether Follow has read as far as a given on-disk size.
-			t.readPos.Add(int64(len(line)))
+			// readPos must count only bytes that have been fully handed to and
+			// returned from processLine - never bytes merely read into a
+			// buffer. Advancing it earlier would let CaughtUpTo (polled from
+			// the drain goroutine) observe "caught up" for a line that has
+			// been read off disk but not yet accumulated, dropping the
+			// report a turn-boundary drain is waiting on.
 			// Could be a partial line if err == io.EOF
 			if err == nil {
-				// Complete line: append partial if any
+				// Complete line: append partial if any, process it, then
+				// advance readPos by the full processed length (any
+				// previously-buffered partial bytes plus this line).
 				full := append(partial, line...)
 				partial = nil
 				t.processLine(full)
+				t.readPos.Add(int64(len(full)))
 			} else {
-				// Partial line at EOF - accumulate up to cap
+				// Partial line at EOF - accumulate up to cap. Do NOT advance
+				// readPos here: these bytes are buffered but unprocessed.
 				partial = append(partial, line...)
 				if len(partial) >= maxPartialBytes {
 					t.processLine(partial)
+					t.readPos.Add(int64(len(partial)))
 					partial = nil
 				}
 			}
