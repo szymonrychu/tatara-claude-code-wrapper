@@ -20,6 +20,7 @@ import (
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/transcript"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
 )
 
@@ -1842,4 +1843,63 @@ func TestManager_DrainInternalIssues_NoTailerReturnsNil(t *testing.T) {
 	if got := mgr.DrainInternalIssues("turn-1"); got != nil {
 		t.Errorf("DrainInternalIssues with no tailer = %v, want nil", got)
 	}
+}
+
+// drainTimeoutCounterValue reads the gathered value of
+// tatara_wrapper_internal_issue_drain_timeout_total, or 0 if never incremented.
+func drainTimeoutCounterValue(t *testing.T, reg *prometheus.Registry) float64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() == "tatara_wrapper_internal_issue_drain_timeout_total" {
+			return mf.GetMetric()[0].GetCounter().GetValue()
+		}
+	}
+	return 0
+}
+
+// TestManager_DrainInternalIssues_TimeoutIncrementsCounter: a tailer that
+// never advances readPos past a non-empty transcript forces CaughtUpTo to
+// time out (internalIssueCatchUpTimeout), which must be counted so the
+// degraded/best-effort drain path is alertable (review-agent finding on
+// PR #105/#106: this path had no metric).
+func TestManager_DrainInternalIssues_TimeoutIncrementsCounter(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(`{"type":"assistant"}`+"\n"), 0o644))
+
+	// Tailer with Follow never started: readPos stays 0 forever, so
+	// CaughtUpTo(target>0, ...) can never catch up before the timeout.
+	tailer := transcript.NewTailer(slog.New(slog.NewTextHandler(io.Discard, nil)), transcript.NewRedactor(nil), func() string { return "turn-1" })
+
+	reg := prometheus.NewRegistry()
+	mgr := session.New(session.Config{}, turn.NewStore(), metrics.New(reg), slog.New(slog.NewTextHandler(io.Discard, nil)), time.Now, func() string { return "id-1" })
+	mgr.SetTailerForTest(tailer)
+	mgr.SetTranscriptPathForTest(path)
+
+	mgr.DrainInternalIssues("turn-1")
+
+	require.Equal(t, float64(1), drainTimeoutCounterValue(t, reg))
+}
+
+// TestManager_DrainInternalIssues_CaughtUpDoesNotIncrementCounter: an empty
+// transcript means the tailer's zero-value readPos is already >= the target
+// (0 bytes), so CaughtUpTo returns true immediately and the timeout counter
+// must stay at zero.
+func TestManager_DrainInternalIssues_CaughtUpDoesNotIncrementCounter(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	require.NoError(t, os.WriteFile(path, nil, 0o644))
+
+	tailer := transcript.NewTailer(slog.New(slog.NewTextHandler(io.Discard, nil)), transcript.NewRedactor(nil), func() string { return "turn-1" })
+
+	reg := prometheus.NewRegistry()
+	mgr := session.New(session.Config{}, turn.NewStore(), metrics.New(reg), slog.New(slog.NewTextHandler(io.Discard, nil)), time.Now, func() string { return "id-1" })
+	mgr.SetTailerForTest(tailer)
+	mgr.SetTranscriptPathForTest(path)
+
+	mgr.DrainInternalIssues("turn-1")
+
+	require.Equal(t, float64(0), drainTimeoutCounterValue(t, reg))
 }
