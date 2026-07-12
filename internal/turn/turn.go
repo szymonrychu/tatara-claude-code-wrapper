@@ -39,6 +39,29 @@ type Record struct {
 	// which repos were touched in a multi-repo task (Defect A). Empty/absent for
 	// a turn that pushed nothing or a single-repo task with no diff.
 	PushedRepos []string `json:"pushedRepos,omitempty"`
+	// InternalIssues is the set of report_internal_issue calls the agent made
+	// during this turn, drained from the transcript Tailer's per-turn
+	// accumulator by cmd/wrapper/app.go before delivery. Empty/absent when the
+	// turn reported nothing (the common case).
+	InternalIssues []InternalIssueReport `json:"internalIssues,omitempty"`
+}
+
+// InternalIssueReport is one report_internal_issue tool call from the turn's
+// transcript, drained from the transcript Tailer's per-turn accumulator and
+// attached to the Record so the operator's /internal/turn-complete callback
+// receives it (agent pods are not Loki-scraped; the operator's collected
+// stdout is the only place this can become alertable). Category and Severity
+// are the tailer's already-clamped values (see internal/transcript/tailer.go
+// knownIssueCategories/knownIssueSeverities), not the raw agent input, so a
+// missing/unknown severity still resolves to exactly "error" or "warn".
+// JSON tags must match tatara-operator's internal/controller.InternalIssueReport
+// exactly - there is no shared Go module between the two repos.
+type InternalIssueReport struct {
+	Category      string `json:"category"`
+	Severity      string `json:"severity"`
+	Description   string `json:"description"`
+	OffendingTool string `json:"offending_tool"`
+	ResourceID    string `json:"resource_id"`
 }
 
 // Summary is the compact form returned by List.

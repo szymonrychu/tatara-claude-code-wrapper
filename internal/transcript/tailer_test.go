@@ -14,6 +14,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
 )
 
 // captureHandler is a slog.Handler that records all log entries.
@@ -1536,5 +1538,149 @@ func TestTailer_RedactorAppliedToText(t *testing.T) {
 				t.Errorf("expected redacted placeholder in text, got: %q", text)
 			}
 		}
+	}
+}
+
+// TestTailer_DrainInternalIssues_AccumulatesAndDrains verifies a
+// report_internal_issue call during turn "turn-drain-1" is queryable via
+// DrainInternalIssues, and draining clears the accumulator.
+func TestTailer_DrainInternalIssues_AccumulatesAndDrains(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	input := `{"category":"tool_error","severity":"error","description":"the tool blew up","offending_tool":"Bash","resource_id":"res-1"}`
+	writeTranscriptLine(t, path, makeInternalIssueLine(input))
+
+	h := newCaptureHandler()
+	fc := &fakeInternalIssueCounter{}
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "turn-drain-1" }).
+		WithInternalIssueCounter(fc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+	waitForRecords(t, h, 3, 2*time.Second)
+	cancel()
+	<-done
+
+	got := tailer.DrainInternalIssues("turn-drain-1")
+	if len(got) != 1 {
+		t.Fatalf("DrainInternalIssues = %v, want 1 report", got)
+	}
+	want := turn.InternalIssueReport{
+		Category: "tool_error", Severity: "error", Description: "the tool blew up",
+		OffendingTool: "Bash", ResourceID: "res-1",
+	}
+	if got[0] != want {
+		t.Errorf("report = %+v, want %+v", got[0], want)
+	}
+
+	// Draining clears the accumulator: a second drain for the same turn is empty.
+	if again := tailer.DrainInternalIssues("turn-drain-1"); again != nil {
+		t.Errorf("second drain = %v, want nil (already drained)", again)
+	}
+}
+
+// TestTailer_DrainInternalIssues_WrongTurnReturnsNil verifies a drain for a
+// turn id that never reported anything (or a stale/mismatched id) returns nil
+// rather than another turn's reports.
+func TestTailer_DrainInternalIssues_WrongTurnReturnsNil(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	input := `{"category":"auth","severity":"warn","description":"auth flaked"}`
+	writeTranscriptLine(t, path, makeInternalIssueLine(input))
+
+	h := newCaptureHandler()
+	fc := &fakeInternalIssueCounter{}
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "turn-a" }).
+		WithInternalIssueCounter(fc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+	waitForRecords(t, h, 3, 2*time.Second)
+	cancel()
+	<-done
+
+	if got := tailer.DrainInternalIssues("turn-b"); got != nil {
+		t.Errorf("DrainInternalIssues(wrong turn) = %v, want nil", got)
+	}
+	if got := tailer.DrainInternalIssues(""); got != nil {
+		t.Errorf("DrainInternalIssues(\"\") = %v, want nil", got)
+	}
+}
+
+// TestTailer_DrainInternalIssues_MultipleReportsSameTurn verifies two
+// report_internal_issue calls in the same turn both accumulate.
+func TestTailer_DrainInternalIssues_MultipleReportsSameTurn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	line1 := makeInternalIssueLine(`{"category":"tool_error","severity":"error","description":"first"}`)
+	line2 := makeInternalIssueLine(`{"category":"auth","severity":"warn","description":"second"}`)
+	writeTranscriptLine(t, path, line1+"\n"+line2)
+
+	h := newCaptureHandler()
+	fc := &fakeInternalIssueCounter{}
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "turn-multi" }).
+		WithInternalIssueCounter(fc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+	waitForRecords(t, h, 6, 2*time.Second)
+	cancel()
+	<-done
+
+	got := tailer.DrainInternalIssues("turn-multi")
+	if len(got) != 2 {
+		t.Fatalf("DrainInternalIssues = %v, want 2 reports", got)
+	}
+	if got[0].Description != "first" || got[1].Description != "second" {
+		t.Errorf("reports = %+v, want [first, second] in order", got)
+	}
+}
+
+// TestTailer_DrainInternalIssues_ResetsOnNewTurn verifies the accumulator
+// tracks only the current in-flight turn: once turnID() reports a new turn,
+// the previous turn's un-drained reports are dropped (mirrors the toolNames
+// clear-on-turn-change behavior at tailer.go:412-415) rather than leaking
+// into the new turn's drain.
+func TestTailer_DrainInternalIssues_ResetsOnNewTurn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	line1 := makeInternalIssueLine(`{"category":"tool_error","severity":"error","description":"turn one issue"}`)
+	writeTranscriptLine(t, path, line1)
+
+	h := newCaptureHandler()
+	fc := &fakeInternalIssueCounter{}
+	var current string
+	current = "turn-x"
+	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return current }).
+		WithInternalIssueCounter(fc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- tailer.Follow(ctx, path) }()
+	waitForRecords(t, h, 3, 2*time.Second)
+
+	// Turn changes to turn-y WITHOUT turn-x ever being drained (simulates a
+	// turn whose callback never reads InternalIssues, e.g. the reprompt path
+	// in app.go OnTurnDone that returns before delivery).
+	current = "turn-y"
+	line2 := makeInternalIssueLine(`{"category":"auth","severity":"warn","description":"turn two issue"}`)
+	writeTranscriptLine(t, path, line2)
+	waitForRecords(t, h, 6, 2*time.Second)
+	cancel()
+	<-done
+
+	if got := tailer.DrainInternalIssues("turn-x"); got != nil {
+		t.Errorf("stale turn-x drain = %v, want nil (superseded by turn-y)", got)
+	}
+	got := tailer.DrainInternalIssues("turn-y")
+	if len(got) != 1 || got[0].Description != "turn two issue" {
+		t.Errorf("turn-y drain = %v, want [turn two issue]", got)
 	}
 }

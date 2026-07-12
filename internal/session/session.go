@@ -303,6 +303,15 @@ func (mgr *Manager) InjectProcForTest(proc ClaudeProcess) {
 	go mgr.watch(proc)
 }
 
+// SetTailerForTest injects a transcript tailer directly, bypassing StartTailer's
+// production wiring (redactor/counters/activity hook). Test-only: lets tests
+// exercise DrainInternalIssues-dependent wiring without a live PTY session.
+func (mgr *Manager) SetTailerForTest(t *transcript.Tailer) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	mgr.tailer = t
+}
+
 // SetTranscriptPathForTest sets the persisted transcript path the recovery path
 // reads at resume time. Test-only: in production this is set by a prior turn's
 // Stop hook (the session JSONL accumulates across turns).
@@ -1206,6 +1215,19 @@ func (mgr *Manager) TranscriptPath() string {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	return mgr.transcriptPath
+}
+
+// DrainInternalIssues returns and clears the transcript tailer's accumulated
+// internal-issue reports for turnID. Returns nil when no tailer is running
+// (CCW_LOG_TRANSCRIPT=false disables StartTailer) or nothing was reported.
+func (mgr *Manager) DrainInternalIssues(turnID string) []turn.InternalIssueReport {
+	mgr.mu.Lock()
+	tailer := mgr.tailer
+	mgr.mu.Unlock()
+	if tailer == nil {
+		return nil
+	}
+	return tailer.DrainInternalIssues(turnID)
 }
 
 func (mgr *Manager) Shutdown(ctx context.Context) error {

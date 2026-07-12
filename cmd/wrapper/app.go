@@ -122,76 +122,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		a.turnWG.Add(1)
 		go func() {
 			defer a.turnWG.Done()
-			// Push BEFORE the callback: the operator's write-back reads the task
-			// branch on receipt of the callback, so the branch must already carry
-			// the agent's commits. A push failure is logged but must not drop the
-			// callback (the operator still needs to learn the turn finished).
-			if cfg.TaskBranch != "" {
-				pushStart := time.Now()
-				var err error
-				if len(cfg.Repos) > 0 {
-					var pushedRepos []string
-					pushedRepos, err = bootstrap.CommitAndPushAll(cfg.Workspace, cfg.Repos, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
-					rec.PushedRepos = pushedRepos
-				} else {
-					// Single-repo clones into workspace/<owner>/<repo>, not the
-					// workspace root, so commit/push must target that subdir.
-					repoDir := bootstrap.RepoDir(cfg.Workspace, cfg.RepoURL)
-					if repoDir == "" {
-						err = fmt.Errorf("cannot derive repo dir from REPO_URL %q for commit/push", cfg.RepoURL)
-					} else {
-						var pushed bool
-						pushed, err = bootstrap.CommitAndPush(repoDir, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
-						if pushed {
-							rec.PushedRepos = []string{primaryRepoName(cfg)}
-						}
-					}
-				}
-				if err != nil {
-					m.CommitPushTotal.WithLabelValues("fail").Inc()
-					log.Error("commit/push failed", "action", "commit_push", "branch", cfg.TaskBranch, "error", err, "duration_ms", time.Since(pushStart).Milliseconds())
-				} else {
-					m.CommitPushTotal.WithLabelValues("ok").Inc()
-					log.Info("commit/push succeeded", "action", "commit_push", "branch", cfg.TaskBranch,
-						"pushed_repos", rec.PushedRepos, "duration_ms", time.Since(pushStart).Milliseconds())
-				}
-			}
-
-			// Defect C: a critical outcome tool (decline_implementation/already_done)
-			// the operator rejected (e.g. blank reason -> 400) shows up in the turn
-			// transcript as an is_error tool_result. Rather than let the turn finish
-			// silently (which the operator misreads as "refused-no-explanation"),
-			// re-prompt the agent to retry with a non-blank reason, and skip THIS
-			// turn's callback - the re-prompted turn delivers its own. Bounded by
-			// maxOutcomeReprompts so a stuck agent still reaches the operator's cap.
-			if path := a.sess.TranscriptPath(); path != "" {
-				toolName, errText, found, ferr := transcript.FailedCriticalOutcome(path)
-				if ferr != nil {
-					log.Warn("outcome-reprompt scan failed; delivering callback as-is",
-						"action", "outcome_reprompt", "turn_id", rec.ID, "error", ferr)
-				} else if found {
-					if a.reprompt(toolName, errText, rec.CallbackURL) {
-						m.OutcomeRepromptTotal.WithLabelValues(toolName, "reprompted").Inc()
-						log.Info("re-prompted agent after rejected outcome tool; suppressing this turn's callback",
-							"action", "outcome_reprompt", "turn_id", rec.ID, "tool", toolName, "error", errText)
-						return
-					}
-					m.OutcomeRepromptTotal.WithLabelValues(toolName, "budget_exhausted").Inc()
-					log.Warn("outcome re-prompt budget exhausted; delivering callback so the operator cap applies",
-						"action", "outcome_reprompt", "turn_id", rec.ID, "tool", toolName)
-				}
-			}
-
-			url := rec.CallbackURL
-			if url == "" {
-				url = defaultCB
-			}
-			sender.Deliver(url, rec)
-
-			// agentTurnFinished runs last, after the turn's work is committed,
-			// pushed, and the operator callback delivered. Best-effort.
-			fireLifecycleHook(cfg, m, log, "agentTurnFinished", cfg.HookAgentTurnFinished,
-				[]string{"TATARA_TURN_ID=" + rec.ID})
+			a.finalizeTurn(rec, cfg, m, log, sender, defaultCB)
 		}()
 	}
 
@@ -236,6 +167,91 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	}, reg, log, m)
 
 	return a, nil
+}
+
+// finalizeTurn is the OnTurnDone finalisation logic, extracted from the
+// closure that sets sess.OnTurnDone so it is directly testable: commits and
+// pushes the agent's work, checks for a rejected critical-outcome tool call
+// that warrants a re-prompt instead of a callback, drains the turn's
+// report_internal_issue calls onto rec before delivery, delivers the callback,
+// then fires the agentTurnFinished lifecycle hook. Called from a tracked
+// background goroutine (never on the cc-stop-hook HTTP request goroutine).
+func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log *slog.Logger, sender *webhook.Sender, defaultCB string) {
+	// Push BEFORE the callback: the operator's write-back reads the task
+	// branch on receipt of the callback, so the branch must already carry
+	// the agent's commits. A push failure is logged but must not drop the
+	// callback (the operator still needs to learn the turn finished).
+	if cfg.TaskBranch != "" {
+		pushStart := time.Now()
+		var err error
+		if len(cfg.Repos) > 0 {
+			var pushedRepos []string
+			pushedRepos, err = bootstrap.CommitAndPushAll(cfg.Workspace, cfg.Repos, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
+			rec.PushedRepos = pushedRepos
+		} else {
+			// Single-repo clones into workspace/<owner>/<repo>, not the
+			// workspace root, so commit/push must target that subdir.
+			repoDir := bootstrap.RepoDir(cfg.Workspace, cfg.RepoURL)
+			if repoDir == "" {
+				err = fmt.Errorf("cannot derive repo dir from REPO_URL %q for commit/push", cfg.RepoURL)
+			} else {
+				var pushed bool
+				pushed, err = bootstrap.CommitAndPush(repoDir, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
+				if pushed {
+					rec.PushedRepos = []string{primaryRepoName(cfg)}
+				}
+			}
+		}
+		if err != nil {
+			m.CommitPushTotal.WithLabelValues("fail").Inc()
+			log.Error("commit/push failed", "action", "commit_push", "branch", cfg.TaskBranch, "error", err, "duration_ms", time.Since(pushStart).Milliseconds())
+		} else {
+			m.CommitPushTotal.WithLabelValues("ok").Inc()
+			log.Info("commit/push succeeded", "action", "commit_push", "branch", cfg.TaskBranch,
+				"pushed_repos", rec.PushedRepos, "duration_ms", time.Since(pushStart).Milliseconds())
+		}
+	}
+
+	// Defect C: a critical outcome tool (decline_implementation/already_done)
+	// the operator rejected (e.g. blank reason -> 400) shows up in the turn
+	// transcript as an is_error tool_result. Rather than let the turn finish
+	// silently (which the operator misreads as "refused-no-explanation"),
+	// re-prompt the agent to retry with a non-blank reason, and skip THIS
+	// turn's callback - the re-prompted turn delivers its own. Bounded by
+	// maxOutcomeReprompts so a stuck agent still reaches the operator's cap.
+	if path := a.sess.TranscriptPath(); path != "" {
+		toolName, errText, found, ferr := transcript.FailedCriticalOutcome(path)
+		if ferr != nil {
+			log.Warn("outcome-reprompt scan failed; delivering callback as-is",
+				"action", "outcome_reprompt", "turn_id", rec.ID, "error", ferr)
+		} else if found {
+			if a.reprompt(toolName, errText, rec.CallbackURL) {
+				m.OutcomeRepromptTotal.WithLabelValues(toolName, "reprompted").Inc()
+				log.Info("re-prompted agent after rejected outcome tool; suppressing this turn's callback",
+					"action", "outcome_reprompt", "turn_id", rec.ID, "tool", toolName, "error", errText)
+				return
+			}
+			m.OutcomeRepromptTotal.WithLabelValues(toolName, "budget_exhausted").Inc()
+			log.Warn("outcome re-prompt budget exhausted; delivering callback so the operator cap applies",
+				"action", "outcome_reprompt", "turn_id", rec.ID, "tool", toolName)
+		}
+	}
+
+	// Drain any report_internal_issue calls the agent made this turn so the
+	// operator's callback carries them (agent pods are not Loki-scraped; only
+	// the operator's collected stdout is alertable).
+	rec.InternalIssues = a.sess.DrainInternalIssues(rec.ID)
+
+	url := rec.CallbackURL
+	if url == "" {
+		url = defaultCB
+	}
+	sender.Deliver(url, rec)
+
+	// agentTurnFinished runs last, after the turn's work is committed,
+	// pushed, and the operator callback delivered. Best-effort.
+	fireLifecycleHook(cfg, m, log, "agentTurnFinished", cfg.HookAgentTurnFinished,
+		[]string{"TATARA_TURN_ID=" + rec.ID})
 }
 
 func (a *app) run() error {
