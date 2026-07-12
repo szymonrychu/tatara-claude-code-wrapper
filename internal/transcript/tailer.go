@@ -8,9 +8,12 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
 )
 
 const pollInterval = 200 * time.Millisecond
@@ -107,6 +110,14 @@ type Tailer struct {
 	// unbounded. processLine is single-goroutine, so no locking is needed.
 	toolNames map[string]string
 	tcTurnID  string
+
+	// iiMu guards internalIssues/iiTurnID. Unlike toolNames (tailer-goroutine-
+	// only), these are also read by DrainInternalIssues from the OnTurnDone
+	// finalisation goroutine in cmd/wrapper/app.go, which runs concurrently
+	// with Follow processing later transcript lines.
+	iiMu           sync.Mutex
+	internalIssues []turn.InternalIssueReport
+	iiTurnID       string
 }
 
 // NewTailer constructs a Tailer. turnID is called per event to get the current
@@ -177,6 +188,9 @@ func (t *Tailer) emitInternalIssue(turnID string, rawInput json.RawMessage) {
 		if t.internalIssueCounter != nil {
 			t.internalIssueCounter.WithLabelValues("other", "error").Inc() //nolint:errcheck
 		}
+		t.accumulateInternalIssue(turnID, turn.InternalIssueReport{
+			Category: "other", Severity: "error", Description: "internal issue report: unparseable input: " + err.Error(),
+		})
 		return
 	}
 
@@ -223,6 +237,46 @@ func (t *Tailer) emitInternalIssue(turnID string, rawInput json.RawMessage) {
 	if t.internalIssueCounter != nil {
 		t.internalIssueCounter.WithLabelValues(metricCategory, metricSeverity).Inc() //nolint:errcheck
 	}
+
+	// Accumulate the clamped-label report for the operator callback (fix: agent
+	// pods are not Loki-scraped, so this is the only path the description
+	// reaches an alertable, collected log stream). Category/Severity use the
+	// already-clamped values so the operator's severity=="error" gate is exact.
+	t.accumulateInternalIssue(turnID, turn.InternalIssueReport{
+		Category: metricCategory, Severity: metricSeverity, Description: in.Description,
+		OffendingTool: in.OffendingTool, ResourceID: in.ResourceID,
+	})
+}
+
+// accumulateInternalIssue appends report to the per-turn accumulator, resetting
+// it first if turnID differs from the accumulator's current turn (a stale,
+// never-drained turn's reports are dropped rather than leaking into the next
+// turn - mirrors the toolNames clear-on-turn-change behavior above). Safe to
+// call concurrently with DrainInternalIssues.
+func (t *Tailer) accumulateInternalIssue(turnID string, report turn.InternalIssueReport) {
+	t.iiMu.Lock()
+	defer t.iiMu.Unlock()
+	if turnID != t.iiTurnID {
+		t.internalIssues = nil
+		t.iiTurnID = turnID
+	}
+	t.internalIssues = append(t.internalIssues, report)
+}
+
+// DrainInternalIssues returns and clears the accumulated internal-issue
+// reports for turnID, or nil when turnID is empty or does not match the
+// accumulator's current turn (nothing reported this turn, or already
+// drained). Safe to call from a goroutine other than the one running Follow.
+func (t *Tailer) DrainInternalIssues(turnID string) []turn.InternalIssueReport {
+	t.iiMu.Lock()
+	defer t.iiMu.Unlock()
+	if turnID == "" || turnID != t.iiTurnID {
+		return nil
+	}
+	out := t.internalIssues
+	t.internalIssues = nil
+	t.iiTurnID = ""
+	return out
 }
 
 func (t *Tailer) fireActivity(turnID string) {
