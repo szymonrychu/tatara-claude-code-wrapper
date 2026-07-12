@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -118,6 +119,14 @@ type Tailer struct {
 	iiMu           sync.Mutex
 	internalIssues []turn.InternalIssueReport
 	iiTurnID       string
+
+	// readPos is the number of bytes Follow has consumed from the current
+	// transcript file (reset to 0 on open/reopen). Used by CaughtUpTo so a
+	// turn-boundary drain can wait for the tailer to have read everything on
+	// disk as of a stat taken at the drain call, closing the poll-interval
+	// race where DrainInternalIssues runs before Follow's next poll has read
+	// the turn's final line (issue found on PR #105).
+	readPos atomic.Int64
 }
 
 // NewTailer constructs a Tailer. turnID is called per event to get the current
@@ -279,6 +288,33 @@ func (t *Tailer) DrainInternalIssues(turnID string) []turn.InternalIssueReport {
 	return out
 }
 
+// caughtUpPollInterval is how often CaughtUpTo re-checks readPos while
+// waiting. It is short relative to pollInterval so the wait resolves close
+// to whenever Follow actually catches up, rather than adding up to a full
+// extra poll cycle of latency on top.
+const caughtUpPollInterval = 10 * time.Millisecond
+
+// CaughtUpTo blocks until Follow has read at least target bytes from the
+// transcript file, or timeout elapses; it returns whether it caught up.
+// Callers take target from an os.Stat of the transcript at the turn
+// boundary, so "caught up" means Follow has consumed everything that was on
+// disk at that moment - closing the race where a turn-boundary drain runs
+// before Follow's next poll-interval read has processed the turn's final
+// line. A timeout is not an error: the caller proceeds with the drain
+// regardless so a stuck tailer can never hang turn completion.
+func (t *Tailer) CaughtUpTo(target int64, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if t.readPos.Load() >= target {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(caughtUpPollInterval)
+	}
+}
+
 func (t *Tailer) fireActivity(turnID string) {
 	if t.onActivity != nil && turnID != "" {
 		t.onActivity(turnID)
@@ -325,6 +361,7 @@ func (t *Tailer) Follow(ctx context.Context, path string) error {
 		}
 		inodeN = inode(fi)
 		reader = bufio.NewReader(f)
+		t.readPos.Store(0)
 		return nil
 	}
 
@@ -358,6 +395,11 @@ func (t *Tailer) Follow(ctx context.Context, path string) error {
 
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			// Every byte read here has been consumed from the underlying file,
+			// whether it completed a line or is a partial trailing chunk at
+			// EOF; track it so CaughtUpTo can tell a turn-boundary drain
+			// whether Follow has read as far as a given on-disk size.
+			t.readPos.Add(int64(len(line)))
 			// Could be a partial line if err == io.EOF
 			if err == nil {
 				// Complete line: append partial if any

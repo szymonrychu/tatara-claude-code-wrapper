@@ -1217,15 +1217,38 @@ func (mgr *Manager) TranscriptPath() string {
 	return mgr.transcriptPath
 }
 
+// internalIssueCatchUpTimeout bounds how long DrainInternalIssues waits for
+// the transcript tailer to catch up to the on-disk transcript before
+// draining. Generous relative to the tailer's 200ms poll interval so a
+// healthy tailer always catches up well within it; a stuck tailer still lets
+// turn completion proceed (best-effort, not a hard dependency - see
+// CaughtUpTo).
+const internalIssueCatchUpTimeout = 2 * time.Second
+
 // DrainInternalIssues returns and clears the transcript tailer's accumulated
 // internal-issue reports for turnID. Returns nil when no tailer is running
 // (CCW_LOG_TRANSCRIPT=false disables StartTailer) or nothing was reported.
+//
+// Before draining, it waits (bounded by internalIssueCatchUpTimeout) for the
+// tailer to have read as far as the transcript's on-disk size at the moment
+// of this call. Without this, a report_internal_issue call that is the last
+// line of the turn can be flushed to disk an instant before the cc-stop-hook
+// POST arrives; Complete() fires OnTurnDone synchronously off that request,
+// so the drain can race ahead of the tailer's poll-interval catch-up and
+// silently drop the report (found by an in-cluster review agent on PR #105).
 func (mgr *Manager) DrainInternalIssues(turnID string) []turn.InternalIssueReport {
 	mgr.mu.Lock()
 	tailer := mgr.tailer
+	path := mgr.transcriptPath
 	mgr.mu.Unlock()
 	if tailer == nil {
 		return nil
+	}
+	if fi, err := os.Stat(path); err == nil {
+		if !tailer.CaughtUpTo(fi.Size(), internalIssueCatchUpTimeout) {
+			mgr.log.Warn("transcript tailer did not catch up before internal-issue drain; reports may be incomplete",
+				"action", "internal_issue_drain", "turn_id", turnID, "path", path)
+		}
 	}
 	return tailer.DrainInternalIssues(turnID)
 }
