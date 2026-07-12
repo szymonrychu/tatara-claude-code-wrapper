@@ -62,6 +62,26 @@ func TestMetrics_InternalIssueTotal_Registered(t *testing.T) {
 	t.Fatal("tatara_wrapper_internal_issue_total not found")
 }
 
+// TestMetrics_InternalIssueDrainTimeoutTotal_Registered asserts the drain
+// catch-up timeout counter is registered as a plain (unlabeled) counter.
+func TestMetrics_InternalIssueDrainTimeoutTotal_Registered(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	require.NotNil(t, m.InternalIssueDrainTimeoutTotal)
+	m.InternalIssueDrainTimeoutTotal.Inc()
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() == "tatara_wrapper_internal_issue_drain_timeout_total" {
+			require.Len(t, mf.GetMetric(), 1)
+			require.Equal(t, float64(1), mf.GetMetric()[0].GetCounter().GetValue())
+			return
+		}
+	}
+	t.Fatal("tatara_wrapper_internal_issue_drain_timeout_total not found")
+}
+
 func TestMetrics_StreamEventsTotal(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := metrics.New(reg)

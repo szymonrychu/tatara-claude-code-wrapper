@@ -51,6 +51,11 @@ type Metrics struct {
 	// Internal issue reports from agents via the report_internal_issue MCP tool.
 	InternalIssueTotal *prometheus.CounterVec // labels: category, severity
 
+	// Internal-issue drain catch-up timeouts (degraded/best-effort path: the
+	// tailer did not catch up before DrainInternalIssues drained anyway, so a
+	// trailing report may have been dropped).
+	InternalIssueDrainTimeoutTotal prometheus.Counter
+
 	// Agent tool-call outcomes observed in the transcript (issue #51): a
 	// tool_result with is_error=true is a mid-turn tool failure that otherwise
 	// completes the turn "successfully" with zero fleet-visible signal. The tool
@@ -123,6 +128,8 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_turn_cost_usd_total", Help: "Cumulative Claude turn cost in USD (from result.json total_cost_usd when present), by Task kind, repo, and project."}, []string{"kind", "repo", "project"}),
 		InternalIssueTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "tatara_wrapper_internal_issue_total", Help: "Agent-reported internal issues observed by the wrapper tailer, by category and severity."}, []string{"category", "severity"}),
+		InternalIssueDrainTimeoutTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "tatara_wrapper_internal_issue_drain_timeout_total", Help: "Times DrainInternalIssues timed out waiting for the transcript tailer to catch up before draining anyway (degraded path, trailing report may be dropped)."}),
 		ToolCallsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_tool_calls_total", Help: "Agent tool calls observed in the transcript by tool name (clamped) and outcome (success|error)."}, []string{"tool", "outcome"}),
 		SkillsInstalled: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -138,7 +145,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.BootstrapHookInstall, m.LifecycleHookTotal, m.HookOutcome, m.MetricPushTotal,
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.HTTPInFlight, m.HTTPPanicsTotal,
 		m.AuthTotal, m.TurnResumes, m.OutcomeRepromptTotal, m.BootstrapRenderTotal,
-		m.TurnTokensTotal, m.TurnCostUSD, m.InternalIssueTotal,
+		m.TurnTokensTotal, m.TurnCostUSD, m.InternalIssueTotal, m.InternalIssueDrainTimeoutTotal,
 		m.ToolCallsTotal, m.SkillsInstalled, m.SkillsCloneFailures, m.AgentsInstalled)
 	return m
 }

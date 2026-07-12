@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -118,6 +119,20 @@ type Tailer struct {
 	iiMu           sync.Mutex
 	internalIssues []turn.InternalIssueReport
 	iiTurnID       string
+
+	// readPos is the number of bytes Follow has fully processed (handed to
+	// and returned from processLine) from the current transcript file (reset
+	// to 0 on open/reopen) - never bytes merely read into a buffer, since a
+	// trailing line with no newline yet is buffered in `partial` but not
+	// processed. Used by CaughtUpTo so a turn-boundary drain can wait for the
+	// tailer to have processed everything on disk as of a stat taken at the
+	// drain call, closing the poll-interval race where DrainInternalIssues
+	// runs before Follow's next poll has read the turn's final line (issue
+	// found on PR #105), and the worse race where readPos was previously
+	// advanced before processing, letting the drain believe it had caught up
+	// while the turn's last report_internal_issue sat unprocessed in
+	// `partial` (issue found in review of that fix).
+	readPos atomic.Int64
 }
 
 // NewTailer constructs a Tailer. turnID is called per event to get the current
@@ -279,6 +294,33 @@ func (t *Tailer) DrainInternalIssues(turnID string) []turn.InternalIssueReport {
 	return out
 }
 
+// caughtUpPollInterval is how often CaughtUpTo re-checks readPos while
+// waiting. It is short relative to pollInterval so the wait resolves close
+// to whenever Follow actually catches up, rather than adding up to a full
+// extra poll cycle of latency on top.
+const caughtUpPollInterval = 10 * time.Millisecond
+
+// CaughtUpTo blocks until Follow has read at least target bytes from the
+// transcript file, or timeout elapses; it returns whether it caught up.
+// Callers take target from an os.Stat of the transcript at the turn
+// boundary, so "caught up" means Follow has consumed everything that was on
+// disk at that moment - closing the race where a turn-boundary drain runs
+// before Follow's next poll-interval read has processed the turn's final
+// line. A timeout is not an error: the caller proceeds with the drain
+// regardless so a stuck tailer can never hang turn completion.
+func (t *Tailer) CaughtUpTo(target int64, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if t.readPos.Load() >= target {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(caughtUpPollInterval)
+	}
+}
+
 func (t *Tailer) fireActivity(turnID string) {
 	if t.onActivity != nil && turnID != "" {
 		t.onActivity(turnID)
@@ -325,6 +367,7 @@ func (t *Tailer) Follow(ctx context.Context, path string) error {
 		}
 		inodeN = inode(fi)
 		reader = bufio.NewReader(f)
+		t.readPos.Store(0)
 		return nil
 	}
 
@@ -358,17 +401,28 @@ func (t *Tailer) Follow(ctx context.Context, path string) error {
 
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			// readPos must count only bytes that have been fully handed to and
+			// returned from processLine - never bytes merely read into a
+			// buffer. Advancing it earlier would let CaughtUpTo (polled from
+			// the drain goroutine) observe "caught up" for a line that has
+			// been read off disk but not yet accumulated, dropping the
+			// report a turn-boundary drain is waiting on.
 			// Could be a partial line if err == io.EOF
 			if err == nil {
-				// Complete line: append partial if any
+				// Complete line: append partial if any, process it, then
+				// advance readPos by the full processed length (any
+				// previously-buffered partial bytes plus this line).
 				full := append(partial, line...)
 				partial = nil
 				t.processLine(full)
+				t.readPos.Add(int64(len(full)))
 			} else {
-				// Partial line at EOF - accumulate up to cap
+				// Partial line at EOF - accumulate up to cap. Do NOT advance
+				// readPos here: these bytes are buffered but unprocessed.
 				partial = append(partial, line...)
 				if len(partial) >= maxPartialBytes {
 					t.processLine(partial)
+					t.readPos.Add(int64(len(partial)))
 					partial = nil
 				}
 			}
