@@ -303,6 +303,15 @@ func (mgr *Manager) InjectProcForTest(proc ClaudeProcess) {
 	go mgr.watch(proc)
 }
 
+// SetTailerForTest injects a transcript tailer directly, bypassing StartTailer's
+// production wiring (redactor/counters/activity hook). Test-only: lets tests
+// exercise DrainInternalIssues-dependent wiring without a live PTY session.
+func (mgr *Manager) SetTailerForTest(t *transcript.Tailer) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	mgr.tailer = t
+}
+
 // SetTranscriptPathForTest sets the persisted transcript path the recovery path
 // reads at resume time. Test-only: in production this is set by a prior turn's
 // Stop hook (the session JSONL accumulates across turns).
