@@ -1208,6 +1208,19 @@ func (mgr *Manager) TranscriptPath() string {
 	return mgr.transcriptPath
 }
 
+// DrainInternalIssues returns and clears the transcript tailer's accumulated
+// internal-issue reports for turnID. Returns nil when no tailer is running
+// (CCW_LOG_TRANSCRIPT=false disables StartTailer) or nothing was reported.
+func (mgr *Manager) DrainInternalIssues(turnID string) []turn.InternalIssueReport {
+	mgr.mu.Lock()
+	tailer := mgr.tailer
+	mgr.mu.Unlock()
+	if tailer == nil {
+		return nil
+	}
+	return tailer.DrainInternalIssues(turnID)
+}
+
 func (mgr *Manager) Shutdown(ctx context.Context) error {
 	mgr.mu.Lock()
 	w := mgr.w

@@ -1835,3 +1835,11 @@ func TestMeterTokens_EmitsIdentityLabels(t *testing.T) {
 	require.Equal(t, map[string]string{"kind": "implement", "repo": "tatara-operator", "project": "tatara"}, lbl)
 	require.Equal(t, 0.25, cost.GetMetric()[0].GetCounter().GetValue())
 }
+
+func TestManager_DrainInternalIssues_NoTailerReturnsNil(t *testing.T) {
+	mgr := session.New(session.Config{}, turn.NewStore(), metrics.New(prometheus.NewRegistry()), slog.New(slog.NewTextHandler(io.Discard, nil)), time.Now, func() string { return "id-1" })
+	// StartTailer never called (or CCW_LOG_TRANSCRIPT=false): mgr.tailer is nil.
+	if got := mgr.DrainInternalIssues("turn-1"); got != nil {
+		t.Errorf("DrainInternalIssues with no tailer = %v, want nil", got)
+	}
+}
