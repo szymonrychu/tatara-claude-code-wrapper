@@ -35,7 +35,8 @@ FROM harbor.szymonrichert.pl/containers/tatara-cli:${TATARA_CLI_VERSION} AS tata
 # Stage 3: guard -- verify the baked cli still advertises the tools the wrapper relies on.
 # This stage runs `go test ./internal/bootstrap -run TestTataraMCP_AdvertisesScmProjectTools`
 # with /usr/local/bin/tatara from the tatara-cli stage on PATH.  The image build FAILS if
-# the pinned cli dropped propose_issue / review_verdict / pr_outcome / issue_outcome / comment.
+# the pinned cli dropped submit_outcome / scm_read / issue_write / mr_write / task_get /
+# project_get / task_context / task_note / report_internal_issue.
 FROM golang:${GO_VERSION}-alpine AS test-guard
 RUN apk add --no-cache git ca-certificates
 COPY --from=tatara-cli /usr/local/bin/tatara /usr/local/bin/tatara

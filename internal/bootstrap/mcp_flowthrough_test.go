@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -47,10 +48,17 @@ type toolsListResult struct {
 }
 
 // TestTataraMCP_AdvertisesScmProjectTools proves the baked tatara CLI's `mcp`
-// server advertises the SCM-projects tools that the wrapper relies on flowing
-// through automatically (RegisterTataraMCP runs `tatara mcp-config`, which wires
+// server advertises the tool surface the wrapper relies on flowing through
+// automatically (RegisterTataraMCP runs `tatara mcp-config`, which wires
 // `tatara mcp`; the wrapper never enumerates tools, so this is the only guard
 // against a silent regression when the baked cli version is bumped).
+//
+// tools/list is per-profile (cli contract D.6: resolveProfile fails CLOSED to
+// six always-on tools when TATARA_TOOL_PROFILE is unset). In production the
+// operator sets that env var per pod kind; here we set it to "refine", the one
+// profile whose grant set covers both issue_write and mr_write alongside the
+// always-on six and submit_outcome, so a single run exercises the full surface
+// this guard cares about.
 func TestTataraMCP_AdvertisesScmProjectTools(t *testing.T) {
 	bin := tataraBinary()
 	if bin == "" {
@@ -61,6 +69,7 @@ func TestTataraMCP_AdvertisesScmProjectTools(t *testing.T) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, bin, "mcp") //nolint:gosec // bin is resolved via exec.LookPath, not user input
+	cmd.Env = append(os.Environ(), "TATARA_TOOL_PROFILE=refine")
 	stdin, err := cmd.StdinPipe()
 	require.NoError(t, err)
 	stdout, err := cmd.StdoutPipe()
@@ -86,8 +95,17 @@ func TestTataraMCP_AdvertisesScmProjectTools(t *testing.T) {
 	send(rpcReq{JSONRPC: "2.0", ID: 2, Method: "tools/list"})
 
 	names := collectToolNames(t, stdout)
-	for _, want := range []string{"propose_issue", "review_verdict", "pr_outcome", "issue_outcome", "comment", "comment_on_issue", "decline_implementation"} {
+	for _, want := range []string{
+		"submit_outcome", "scm_read", "issue_write", "mr_write",
+		"task_get", "project_get", "task_context", "task_note", "report_internal_issue",
+	} {
 		require.Containsf(t, names, want, "tatara mcp must advertise %q; got %v", want, names)
+	}
+	for _, gone := range []string{
+		"propose_issue", "review_verdict", "pr_outcome", "issue_outcome",
+		"change_summary", "comment", "create_subtask",
+	} {
+		require.NotContainsf(t, names, gone, "tatara mcp must NOT advertise %q (removed in the redesign); got %v", gone, names)
 	}
 }
 
