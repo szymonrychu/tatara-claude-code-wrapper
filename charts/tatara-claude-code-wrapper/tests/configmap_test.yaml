@@ -37,3 +37,10 @@ tests:
       - equal:
           path: data.OIDC_ISSUER
           value: ""
+  - it: renders AGENT_POD_TTL_SECONDS from agentPodTTLSeconds
+    set:
+      agentPodTTLSeconds: 3600
+    asserts:
+      - equal:
+          path: data.AGENT_POD_TTL_SECONDS
+          value: "3600"

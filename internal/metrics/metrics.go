@@ -11,7 +11,6 @@ type Metrics struct {
 	WebhookDelivery   *prometheus.CounterVec
 	HookReceived      prometheus.Counter
 	StreamEventsTotal *prometheus.CounterVec
-	Interjections     prometheus.Counter
 
 	// Bootstrap metrics (rule 13: counters for everything that counts/can fail).
 	BootstrapCloneTotal  *prometheus.CounterVec // label: result=ok|fail
@@ -33,6 +32,11 @@ type Metrics struct {
 
 	// Turn resume counter (rule 13: distinct fallible business action).
 	TurnResumes *prometheus.CounterVec // labels: result=ok|write_fail, resume_mode=nudge|resubmit|complete_from_transcript
+
+	// TurnRefusals counts turns the wrapper refused to start. The operator sees
+	// the 410; this is the fleet-wide view of how often pods are being cut off
+	// mid-work, which is the signal that agentPodTTLSeconds is set too low.
+	TurnRefusals *prometheus.CounterVec // labels: reason
 
 	// Outcome-rejection re-prompt counter (rule 13): a critical outcome tool
 	// (decline_implementation/already_done) the operator rejected, surfaced back
@@ -86,8 +90,6 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_hook_received_total", Help: "Stop-hook callbacks received."}),
 		StreamEventsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_stream_events_total", Help: "Transcript stream events emitted by stream_type."}, []string{"stream_type"}),
-		Interjections: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "ccw_interjections_total", Help: "Mid-turn interjections injected into the live session."}),
 		BootstrapCloneTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_bootstrap_clone_total", Help: "Bootstrap repo clone/resume attempts by result."}, []string{"result"}),
 		BootstrapDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -118,6 +120,8 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_auth_total", Help: "Auth outcomes by result (ok|rejected)."}, []string{"result"}),
 		TurnResumes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_turn_resumes_total", Help: "Turn resume attempts by result (ok|write_fail) and mode (nudge|resubmit|complete_from_transcript)."}, []string{"result", "resume_mode"}),
+		TurnRefusals: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_turn_refusals_total", Help: "Turns the wrapper refused to start, by reason (pod_ttl_expired)."}, []string{"reason"}),
 		OutcomeRepromptTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_outcome_reprompt_total", Help: "Critical-outcome MCP tool rejections re-prompted to the agent, by tool and result."}, []string{"tool", "result"}),
 		BootstrapRenderTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -140,11 +144,11 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "wrapper_agents_installed_total", Help: "Typed subagent .md files installed at boot."}),
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
-		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal, m.Interjections,
+		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal,
 		m.BootstrapCloneTotal, m.BootstrapDuration, m.CommitPushTotal,
 		m.BootstrapHookInstall, m.LifecycleHookTotal, m.HookOutcome, m.MetricPushTotal,
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.HTTPInFlight, m.HTTPPanicsTotal,
-		m.AuthTotal, m.TurnResumes, m.OutcomeRepromptTotal, m.BootstrapRenderTotal,
+		m.AuthTotal, m.TurnResumes, m.TurnRefusals, m.OutcomeRepromptTotal, m.BootstrapRenderTotal,
 		m.TurnTokensTotal, m.TurnCostUSD, m.InternalIssueTotal, m.InternalIssueDrainTimeoutTotal,
 		m.ToolCallsTotal, m.SkillsInstalled, m.SkillsCloneFailures, m.AgentsInstalled)
 	return m

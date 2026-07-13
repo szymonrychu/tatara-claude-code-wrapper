@@ -22,6 +22,7 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/transcript"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/version"
 )
 
 type fakePTY struct {
@@ -71,6 +72,44 @@ func TestSnapshot_ReportsConfiguredRepo(t *testing.T) {
 	require.Equal(t, "claude", snap.Model)
 }
 
+// TestSnapshot_ReportsContractVersion verifies the operator can assert the
+// agent contract version from GET /v1/session before submitting turn-0
+// (contract G.10, D-W3).
+func TestSnapshot_ReportsContractVersion(t *testing.T) {
+	store := turn.NewStore()
+	m := session.New(
+		session.Config{SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return "turn-1" })
+
+	require.Equal(t, version.ContractVersion, m.Snapshot().ContractVersion)
+}
+
+// TestManager_PodDeadline verifies podDeadline() is startedAt+PodTTL, or the
+// zero time when PodTTL is disabled (0). Task 3 admits/refuses turns off this.
+func TestManager_PodDeadline(t *testing.T) {
+	start := time.Now()
+	store := turn.NewStore()
+	m := session.New(
+		session.Config{PodTTL: time.Hour, SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return "turn-1" })
+	m.SetStartedAtForTest(start)
+	require.WithinDuration(t, start.Add(time.Hour), m.PodDeadlineForTest(), time.Second)
+
+	off := session.New(
+		session.Config{PodTTL: 0, SubmitSeq: session.DefaultSubmitSeq},
+		turn.NewStore(), metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return "turn-1" })
+	require.True(t, off.PodDeadlineForTest().IsZero(), "PodTTL=0 means no deadline")
+}
+
 func TestSnapshot_EmptyRepoWhenUnconfigured(t *testing.T) {
 	store := turn.NewStore()
 	m := session.New(
@@ -105,7 +144,7 @@ func TestSnapshot_ExposesLastActivityAt(t *testing.T) {
 
 	require.True(t, m.Snapshot().LastActivityAt.IsZero(), "idle session has no activity timestamp")
 
-	_, err := m.Submit("hi", "")
+	_, err := m.Submit("hi", "", false)
 	require.NoError(t, err)
 	require.Equal(t, time.Unix(100, 0), m.Snapshot().LastActivityAt, "defaults to turn start")
 
@@ -120,7 +159,7 @@ func TestSubmit_WritesPasteAndSubmit_ThenBusy(t *testing.T) {
 	fp := &fakePTY{}
 	m, store := newMgr(t, fp)
 
-	id, err := m.Submit("hello\nworld", "https://cb/x")
+	id, err := m.Submit("hello\nworld", "https://cb/x", false)
 	require.NoError(t, err)
 	require.Equal(t, "turn-1", id)
 
@@ -131,55 +170,8 @@ func TestSubmit_WritesPasteAndSubmit_ThenBusy(t *testing.T) {
 	require.Equal(t, turn.Running, rec.State)
 
 	// second submit while busy -> ErrBusy
-	_, err = m.Submit("again", "")
+	_, err = m.Submit("again", "", false)
 	require.ErrorIs(t, err, session.ErrBusy)
-}
-
-// newMgrLongTimeout builds a READY manager whose turn timeout is long enough
-// that an in-flight turn stays Busy for the duration of a test.
-func newMgrLongTimeout(t *testing.T, fp *fakePTY) *session.Manager {
-	t.Helper()
-	store := turn.NewStore()
-	ids := make(chan string, 8)
-	ids <- "turn-1"
-	ids <- "turn-2"
-	m := session.New(session.Config{TurnTimeout: 10 * time.Second, SubmitSeq: session.DefaultSubmitSeq},
-		store, metrics.New(prometheus.NewRegistry()),
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		func() time.Time { return time.Unix(100, 0) },
-		func() string { return <-ids })
-	m.SetWriterForTest(fp)
-	return m
-}
-
-func TestInterject_WritesToLivePTYWhenBusy(t *testing.T) {
-	fp := &fakePTY{}
-	m := newMgrLongTimeout(t, fp)
-
-	_, err := m.Submit("first", "")
-	require.NoError(t, err)
-
-	require.NoError(t, m.Interject("more context"))
-
-	w := string(fp.bytes())
-	require.Contains(t, w, "\x1b[200~more context\x1b[201~") // bracketed paste of the interjection
-	// A second submit while busy must still be rejected: Interject must not have
-	// cleared the in-flight turn.
-	_, err = m.Submit("again", "")
-	require.ErrorIs(t, err, session.ErrBusy)
-}
-
-func TestInterject_NotBusyReturnsErr(t *testing.T) {
-	fp := &fakePTY{}
-	m := newMgrLongTimeout(t, fp)
-	require.ErrorIs(t, m.Interject("nothing running"), session.ErrNotBusy)
-}
-
-func TestInterject_DeadReturnsErr(t *testing.T) {
-	fp := &fakePTY{}
-	m := newMgrLongTimeout(t, fp)
-	require.NoError(t, m.Shutdown(context.Background()))
-	require.Error(t, m.Interject("x"))
 }
 
 func TestComplete_MarksDoneAndFiresCallback(t *testing.T) {
@@ -188,7 +180,7 @@ func TestComplete_MarksDoneAndFiresCallback(t *testing.T) {
 	var got *turn.Record
 	m.OnTurnDone = func(r *turn.Record) { got = r }
 
-	_, _ = m.Submit("hi", "https://cb/x")
+	_, _ = m.Submit("hi", "https://cb/x", false)
 	require.NoError(t, m.Complete(session.HookResult{FinalText: "PONG", StopReason: "end_turn", TranscriptPath: "/workspace/.claude/projects/-workspace/s.jsonl"}))
 
 	rec, _ := store.Get("turn-1")
@@ -199,7 +191,7 @@ func TestComplete_MarksDoneAndFiresCallback(t *testing.T) {
 	require.Equal(t, "/workspace/.claude/projects/-workspace/s.jsonl", m.TranscriptPath()) // H1: recorded from hook
 
 	// now idle again -> next submit allowed
-	_, err := m.Submit("next", "")
+	_, err := m.Submit("next", "", false)
 	require.NoError(t, err)
 }
 
@@ -209,7 +201,7 @@ func TestTurnTimeout_FailsAndFiresCallback(t *testing.T) {
 	done := make(chan *turn.Record, 1)
 	m.OnTurnDone = func(r *turn.Record) { done <- r }
 
-	_, _ = m.Submit("hi", "https://cb/x")
+	_, _ = m.Submit("hi", "https://cb/x", false)
 	select {
 	case r := <-done:
 		require.Equal(t, turn.Failed, r.State)
@@ -246,7 +238,7 @@ func TestTurnTimeout_ResetsOnActivity(t *testing.T) {
 	done := make(chan *turn.Record, 1)
 	m.OnTurnDone = func(r *turn.Record) { done <- r }
 
-	_, err := m.Submit("hi", "https://cb/x")
+	_, err := m.Submit("hi", "https://cb/x", false)
 	require.NoError(t, err)
 
 	// Signal activity faster than TurnTimeout for longer than TurnTimeout total.
@@ -279,7 +271,7 @@ func TestActivity_StaleTurnDoesNotResetTimer(t *testing.T) {
 	done := make(chan *turn.Record, 1)
 	m.OnTurnDone = func(r *turn.Record) { done <- r }
 
-	_, err := m.Submit("hi", "https://cb/x")
+	_, err := m.Submit("hi", "https://cb/x", false)
 	require.NoError(t, err)
 
 	// Hammer activity for a stale turn id across a window longer than TurnTimeout.
@@ -328,7 +320,7 @@ func TestClaudeExit_FailsInFlightTurnAndFiresCallback(t *testing.T) {
 	}
 	m.InjectProcForTest(proc)
 
-	_, err := m.Submit("hi", "https://cb/x")
+	_, err := m.Submit("hi", "https://cb/x", false)
 	require.NoError(t, err)
 
 	// Kill the proc; watch() fires, relaunch fails (spawn error), so the turn
@@ -407,7 +399,7 @@ func TestTailer_StartedOnCompleteWithTranscriptPath(t *testing.T) {
 	defer cancel()
 	m.StartTailer(ctx)
 
-	_, err = m.Submit("hi", "")
+	_, err = m.Submit("hi", "", false)
 	require.NoError(t, err)
 	require.NoError(t, m.Complete(session.HookResult{
 		FinalText:      "ok",
@@ -465,7 +457,7 @@ func TestTailer_DisabledWhenEnvFalse(t *testing.T) {
 	defer cancel()
 	m.StartTailer(ctx)
 
-	_, err = m.Submit("hi", "")
+	_, err = m.Submit("hi", "", false)
 	require.NoError(t, err)
 	require.NoError(t, m.Complete(session.HookResult{
 		FinalText:      "ok",
@@ -512,7 +504,7 @@ func TestSubmitLog_HasActionField(t *testing.T) {
 	)
 	m.SetWriterForTest(&fakePTY{})
 
-	_, err := m.Submit("hi", "")
+	_, err := m.Submit("hi", "", false)
 	require.NoError(t, err)
 
 	data := buf.Bytes()
@@ -548,7 +540,7 @@ func TestFailTimeout_HasActionAndDurationMs(t *testing.T) {
 	done := make(chan *turn.Record, 1)
 	mgr.OnTurnDone = func(r *turn.Record) { done <- r }
 
-	_, err := mgr.Submit("hi", "")
+	_, err := mgr.Submit("hi", "", false)
 	require.NoError(t, err)
 
 	select {
@@ -601,7 +593,7 @@ func TestComplete_MetersTokensAndCost(t *testing.T) {
 	)
 	mgr.SetWriterForTest(&fakePTY{})
 
-	_, err := mgr.Submit("hi", "")
+	_, err := mgr.Submit("hi", "", false)
 	require.NoError(t, err)
 	require.NoError(t, mgr.Complete(session.HookResult{
 		FinalText:  "ok",
@@ -658,7 +650,7 @@ func TestWritePTYStoreFail_DistinctMessages(t *testing.T) {
 	failPTY := &failingPTY{failOn: 0}
 	m.SetWriterForTest(failPTY)
 
-	_, err := m.Submit("hi", "")
+	_, err := m.Submit("hi", "", false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "paste")
 
@@ -685,7 +677,7 @@ func TestSubmit_WriteFailure_CountsFailedTurn(t *testing.T) {
 	)
 	mgr.SetWriterForTest(&failingPTY{failOn: 0}) // fail the paste write
 
-	_, err := mgr.Submit("hi", "")
+	_, err := mgr.Submit("hi", "", false)
 	require.Error(t, err)
 
 	mfs, err := reg.Gather()
@@ -769,7 +761,7 @@ func TestTailer_RestartedOnTranscriptPathChange(t *testing.T) {
 	m.StartTailer(ctx)
 
 	// Submit and complete first turn - tailer starts on firstPath
-	_, err = m.Submit("hi", "")
+	_, err = m.Submit("hi", "", false)
 	require.NoError(t, err)
 	require.NoError(t, m.Complete(session.HookResult{
 		FinalText:      "ok",
@@ -802,7 +794,7 @@ firstTurnSeen:
 	require.NoError(t, f2.Close())
 
 	// Submit and complete second turn with new transcript path - tailer should switch
-	_, err = m.Submit("hi again", "")
+	_, err = m.Submit("hi again", "", false)
 	require.NoError(t, err)
 	require.NoError(t, m.Complete(session.HookResult{
 		FinalText:      "ok2",
@@ -844,7 +836,7 @@ func TestComplete_StaleSessionIDRejected(t *testing.T) {
 	)
 	m.SetWriterForTest(&fakePTY{})
 
-	_, err := m.Submit("hi", "")
+	_, err := m.Submit("hi", "", false)
 	require.NoError(t, err)
 
 	// First Complete records sess-A as the session id but also completes the turn.
@@ -859,7 +851,7 @@ func TestComplete_StaleSessionIDRejected(t *testing.T) {
 	}))
 
 	// turn-2 in flight; first hook with sess-B establishes session.
-	_, err = m.Submit("hi2", "")
+	_, err = m.Submit("hi2", "", false)
 	require.NoError(t, err)
 
 	// Record sess-B for turn-2.
@@ -875,7 +867,7 @@ func TestComplete_StaleSessionIDRejected(t *testing.T) {
 	}))
 
 	// turn-3 in flight. First hook with sess-C records it.
-	_, err = m.Submit("hi3", "")
+	_, err = m.Submit("hi3", "", false)
 	require.NoError(t, err)
 
 	// Establish sess-C (accepted - no prior session ID for turn-3).
@@ -900,7 +892,7 @@ func TestComplete_StaleSessionIDRejected(t *testing.T) {
 		SessionID:  "sess-C",
 	}))
 
-	_, err = m.Submit("hi4", "")
+	_, err = m.Submit("hi4", "", false)
 	require.NoError(t, err)
 
 	// First hook for turn-4 with sess-D: accepted, records sess-D.
@@ -921,7 +913,7 @@ func TestComplete_StaleSessionIDRejected(t *testing.T) {
 		StopReason: "end_turn",
 		SessionID:  "sess-D",
 	}))
-	_, err = m.Submit("hi5", "")
+	_, err = m.Submit("hi5", "", false)
 	require.NoError(t, err)
 
 	// Two concurrent hooks for turn-5: one with sess-X, one with sess-Y.
@@ -967,7 +959,7 @@ func TestSnapshot_TurnsCompletedVsFinished(t *testing.T) {
 	m.SetWriterForTest(fp)
 
 	// Turn 1: complete successfully.
-	_, err := m.Submit("t1", "")
+	_, err := m.Submit("t1", "", false)
 	require.NoError(t, err)
 	require.NoError(t, m.Complete(session.HookResult{FinalText: "ok", StopReason: "end_turn"}))
 
@@ -978,7 +970,7 @@ func TestSnapshot_TurnsCompletedVsFinished(t *testing.T) {
 	// Turn 2: let it time out (TurnTimeout=50ms).
 	done := make(chan struct{}, 1)
 	m.OnTurnDone = func(*turn.Record) { done <- struct{}{} }
-	_, err = m.Submit("t2", "")
+	_, err = m.Submit("t2", "", false)
 	require.NoError(t, err)
 	select {
 	case <-done:
@@ -989,51 +981,6 @@ func TestSnapshot_TurnsCompletedVsFinished(t *testing.T) {
 	snap = m.Snapshot()
 	require.Equal(t, 1, snap.TurnsCompleted, "TurnsCompleted must not increment on timeout (still 1)")
 	require.Equal(t, 2, snap.TurnsFinished, "TurnsFinished must increment on timeout (now 2)")
-}
-
-// TestInterject_DoesNotBlockComplete verifies that Interject releases the lock
-// before sleeping so that Complete can land concurrently (finding 9).
-func TestInterject_DoesNotBlockComplete(t *testing.T) {
-	store := turn.NewStore()
-	ids := make(chan string, 4)
-	ids <- "turn-1"
-	ids <- "turn-2"
-	// Use a very long SubmitDelay so the race is obvious.
-	m := session.New(
-		session.Config{TurnTimeout: 10 * time.Second, SubmitDelay: 200 * time.Millisecond, SubmitSeq: session.DefaultSubmitSeq},
-		store, metrics.New(prometheus.NewRegistry()),
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		func() time.Time { return time.Unix(100, 0) },
-		func() string { return <-ids },
-	)
-	fp := &fakePTY{}
-	m.SetWriterForTest(fp)
-
-	_, err := m.Submit("task", "")
-	require.NoError(t, err)
-
-	// Start Interject (holds lock across the paste write then releases before sleep).
-	completeErr := make(chan error, 1)
-	go func() {
-		// Give Interject a tiny head-start to enter its lock.
-		time.Sleep(5 * time.Millisecond)
-		completeErr <- m.Complete(session.HookResult{FinalText: "done", StopReason: "end_turn"})
-	}()
-
-	iErr := m.Interject("extra context")
-	require.NoError(t, iErr)
-
-	select {
-	case err := <-completeErr:
-		// Complete may return "no in-flight turn" if it raced and landed first,
-		// or nil if it landed after Interject released the lock. Either is fine
-		// as long as it did not block for the full SubmitDelay.
-		if err != nil {
-			require.Contains(t, err.Error(), "no in-flight turn")
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Complete blocked for too long: Interject is holding the lock across sleep")
-	}
 }
 
 // TestRelaunch_StoppingAbortsFreshProc verifies that if Shutdown() sets
@@ -1115,7 +1062,7 @@ func TestComplete_TurnDurationUsesOriginalStartTime(t *testing.T) {
 	)
 	mgr.SetWriterForTest(&fakePTY{})
 
-	_, err := mgr.Submit("hi", "")
+	_, err := mgr.Submit("hi", "", false)
 	require.NoError(t, err)
 	require.NoError(t, mgr.Complete(session.HookResult{FinalText: "ok", StopReason: "end_turn"}))
 
@@ -1170,7 +1117,7 @@ func TestWatch_ClaudeRestartsMetricOnlyOnActualRelaunch(t *testing.T) {
 	mgr.OnTurnDone = func(r *turn.Record) { done <- r }
 	mgr.InjectProcForTest(first)
 
-	_, err := mgr.Submit("hello", "")
+	_, err := mgr.Submit("hello", "", false)
 	require.NoError(t, err)
 
 	// First death: MaxRestarts=1, attempt=1 <= 1 -> relaunch happens, ClaudeRestarts=1.
@@ -1223,7 +1170,7 @@ func TestComplete_HookOutcomeCounters(t *testing.T) {
 	require.Error(t, err)
 
 	// Case 2: successful complete -> ok
-	_, err = mgr.Submit("hi", "")
+	_, err = mgr.Submit("hi", "", false)
 	require.NoError(t, err)
 	require.NoError(t, mgr.Complete(session.HookResult{FinalText: "ok", StopReason: "end_turn"}))
 
@@ -1275,7 +1222,7 @@ func TestComplete_RejectsHookDuringDeadState(t *testing.T) {
 	)
 	mgr.SetWriterForTest(&fakePTY{})
 
-	_, err := mgr.Submit("hi", "")
+	_, err := mgr.Submit("hi", "", false)
 	require.NoError(t, err)
 
 	// Directly flip to Dead while keeping current set: simulates the crash window
@@ -1313,7 +1260,7 @@ func TestComplete_RejectsHookDuringBootingState(t *testing.T) {
 	)
 	mgr.SetWriterForTest(&fakePTY{})
 
-	_, err := mgr.Submit("hi", "")
+	_, err := mgr.Submit("hi", "", false)
 	require.NoError(t, err)
 
 	// Use SetBootingForTest to flip state to Booting while keeping mgr.current set.
@@ -1352,7 +1299,7 @@ func TestSubmit_DoesNotHoldLockAcrossSleep(t *testing.T) {
 
 	// Submit holds paste write + sleep + submit write; Snapshot should not block
 	// for the full 300ms if the lock is released before the sleep.
-	_, _ = mgr.Submit("hello", "")
+	_, _ = mgr.Submit("hello", "", false)
 
 	select {
 	case d := <-snapshotDone:
@@ -1394,7 +1341,7 @@ func TestFailSubmitWrite_SkipsMetricsOnStoreFail(t *testing.T) {
 	// failTurn / failTimeout pattern (the fix is structural, not exercised by unit test).
 	// Instead verify the nominal path: store.Fail succeeds -> metrics bumped normally.
 	mgr.SetWriterForTest(&failingPTY{failOn: 0}) // fail paste write
-	_, err := mgr.Submit("hi", "")
+	_, err := mgr.Submit("hi", "", false)
 	require.Error(t, err)
 
 	mfs, _ := reg.Gather()
@@ -1429,7 +1376,7 @@ func TestFailSubmitWrite_EmitsWarnLog(t *testing.T) {
 	)
 	mgr.SetWriterForTest(&failingPTY{failOn: 0}) // fail paste write -> failSubmitWrite called
 
-	_, err := mgr.Submit("hi", "")
+	_, err := mgr.Submit("hi", "", false)
 	require.Error(t, err)
 
 	data := buf.Bytes()
@@ -1527,7 +1474,7 @@ func TestFailSubmitWrite_NoopWhenCurrentCleared(t *testing.T) {
 
 	submitErr := make(chan error, 1)
 	go func() {
-		_, err := mgr.Submit("hi", "")
+		_, err := mgr.Submit("hi", "", false)
 		submitErr <- err
 	}()
 
@@ -1630,7 +1577,7 @@ func TestResumeTurn_DoesNotHoldLockDuringWrite(t *testing.T) {
 	})
 	mgr.InjectProcForTest(firstProc)
 
-	_, err := mgr.Submit("hi", "")
+	_, err := mgr.Submit("hi", "", false)
 	require.NoError(t, err)
 
 	// Kill first proc -> watch -> relaunch -> sets mgr.w=secondProc -> resumeTurn
@@ -1740,7 +1687,7 @@ func TestResumeTurn_EmitsTurnResumesMetricAndDurationMs(t *testing.T) {
 	mgr.SetSpawnForTest(st.spawn)
 	mgr.InjectProcForTest(first)
 
-	_, err := mgr.Submit("hi", "")
+	_, err := mgr.Submit("hi", "", false)
 	require.NoError(t, err)
 
 	// Kill first proc; watch() fires, relaunches to second, resumeTurn is called.
@@ -1902,4 +1849,127 @@ func TestManager_DrainInternalIssues_CaughtUpDoesNotIncrementCounter(t *testing.
 	mgr.DrainInternalIssues("turn-1")
 
 	require.Equal(t, float64(0), drainTimeoutCounterValue(t, reg))
+}
+
+// --- Task 3: pod-TTL turn admission (contract G.5/G.7, D-W1/D-W2) ---
+
+// newTTLMgr builds a READY manager whose injected clock is real wall-clock
+// time, so SetStartedAtForTest (which moves the deadline relative to now) and
+// the admission gate (which reads mgr.now()) agree. The fixed-clock newMgr
+// above cannot be reused here: its now() is pinned to time.Unix(100, 0), which
+// sits ~55 years before any deadline the tests set.
+func newTTLMgr(t *testing.T, cfg session.Config) (*session.Manager, *prometheus.Registry) {
+	t.Helper()
+	cfg.SubmitSeq = session.DefaultSubmitSeq
+	ids := make(chan string, 8)
+	for i := 1; i <= 8; i++ {
+		ids <- fmt.Sprintf("turn-%d", i)
+	}
+	reg := prometheus.NewRegistry()
+	m := session.New(cfg, turn.NewStore(), metrics.New(reg),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		time.Now,
+		func() string { return <-ids })
+	m.SetWriterForTest(&fakePTY{})
+	return m, reg
+}
+
+// completeTurn drives the in-flight turn to done so the manager is idle again.
+func completeTurn(t *testing.T, m *session.Manager) {
+	t.Helper()
+	require.NoError(t, m.Complete(session.HookResult{FinalText: "done", StopReason: "end_turn"}))
+}
+
+// refusalCounterValue reads ccw_turn_refusals_total{reason} out of reg.
+func refusalCounterValue(t *testing.T, reg *prometheus.Registry, reason string) float64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() != "ccw_turn_refusals_total" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "reason" && lp.GetValue() == reason {
+					return metric.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func TestSubmit_RefusesAnOrdinaryTurnPastTheTTL(t *testing.T) {
+	mgr, _ := newTTLMgr(t, session.Config{PodTTL: time.Hour, TurnTimeout: time.Minute})
+	mgr.SetStartedAtForTest(time.Now().Add(-2 * time.Hour)) // deadline passed
+	_, err := mgr.Submit("do the thing", "", false)
+	require.ErrorIs(t, err, session.ErrPodTTLExpired,
+		"a pod past its TTL must not start new work; the operator is already stopping it")
+}
+
+func TestSubmit_AdmitsTheHandoffTurnPastTheTTL(t *testing.T) {
+	mgr, _ := newTTLMgr(t, session.Config{PodTTL: time.Hour, TurnTimeout: time.Minute})
+	mgr.SetStartedAtForTest(time.Now().Add(-time.Hour - time.Second)) // just past the deadline, inside the cap
+	_, err := mgr.Submit("Your pod is being stopped. Call task_note(kind=handoff)...", "", true)
+	require.NoError(t, err,
+		"the TTL handoff turn is the ONE turn admitted past the deadline; refusing it is how Task.status.notes ends up empty after every TTL stop")
+}
+
+func TestSubmit_AdmitsExactlyOneHandoffTurn(t *testing.T) {
+	mgr, _ := newTTLMgr(t, session.Config{PodTTL: time.Hour, TurnTimeout: time.Minute})
+	mgr.SetStartedAtForTest(time.Now().Add(-time.Hour - time.Second))
+	_, err := mgr.Submit("handoff", "", true)
+	require.NoError(t, err)
+	completeTurn(t, mgr)
+	_, err = mgr.Submit("handoff again", "", true)
+	require.ErrorIs(t, err, session.ErrPodTTLExpired, "one handoff turn, not a loop")
+}
+
+func TestSubmit_HandoffBeforeTheTTLDoesNotConsumeTheAllowance(t *testing.T) {
+	// Contract G.5, fix V7-11. The single-handoff allowance is SCOPED TO PAST t0.
+	// Before the deadline a handoff:true turn is just an ordinary turn. If it could
+	// burn the slot, an agent (or a buggy operator) setting the flag early would
+	// leave the pod unable to write its handoff when the TTL actually arrives - the
+	// exact failure the handoff carve-out exists to prevent.
+	mgr, _ := newTTLMgr(t, session.Config{PodTTL: time.Hour, TurnTimeout: time.Minute})
+	mgr.SetStartedAtForTest(time.Now()) // well INSIDE the deadline
+
+	_, err := mgr.Submit("an early handoff-flagged turn", "", true)
+	require.NoError(t, err, "before t0, handoff:true is an ordinary turn: admitted")
+	completeTurn(t, mgr)
+
+	// Now cross the deadline. The allowance must be INTACT.
+	mgr.SetStartedAtForTest(time.Now().Add(-time.Hour - time.Second))
+	_, err = mgr.Submit("the real TTL handoff", "", true)
+	require.NoError(t, err,
+		"the pre-t0 handoff turn must NOT have consumed the allowance (fix V7-11); this is the turn that writes Task.status.notes")
+}
+
+func TestSubmit_RefusesEvenTheHandoffTurnPastTheHardCap(t *testing.T) {
+	mgr, _ := newTTLMgr(t, session.Config{PodTTL: time.Hour, TurnTimeout: time.Minute})
+	// hardCap = deadline + 2*TurnTimeout + 60s = +1h +2m +60s
+	mgr.SetStartedAtForTest(time.Now().Add(-2 * time.Hour))
+	_, err := mgr.Submit("handoff", "", true)
+	require.ErrorIs(t, err, session.ErrPodTTLExpired, "contract G.7 step 4: the hard cap binds on everything")
+}
+
+func TestSubmit_TTLZeroAdmitsEverything(t *testing.T) {
+	mgr, _ := newTTLMgr(t, session.Config{PodTTL: 0, TurnTimeout: time.Minute})
+	mgr.SetStartedAtForTest(time.Now().Add(-1000 * time.Hour))
+	_, err := mgr.Submit("do the thing", "", false)
+	require.NoError(t, err, "PodTTL=0 is the workstation case: no bound")
+}
+
+// TestSubmit_TTLRefusalIncrementsTheRefusalMetric: a wrapper log line reaches
+// nobody (agent pods are not Loki-scraped), so the refusal must be visible as a
+// metric as well as the 410 the operator sees.
+func TestSubmit_TTLRefusalIncrementsTheRefusalMetric(t *testing.T) {
+	mgr, reg := newTTLMgr(t, session.Config{PodTTL: time.Hour, TurnTimeout: time.Minute})
+	mgr.SetStartedAtForTest(time.Now().Add(-2 * time.Hour))
+	require.Equal(t, float64(0), refusalCounterValue(t, reg, "pod_ttl_expired"))
+
+	_, err := mgr.Submit("do the thing", "", false)
+	require.ErrorIs(t, err, session.ErrPodTTLExpired)
+	require.Equal(t, float64(1), refusalCounterValue(t, reg, "pod_ttl_expired"))
 }

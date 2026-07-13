@@ -25,6 +25,9 @@ repoUrl: ""
 repoBranch: ""
 defaultCallbackUrl: ""
 turnTimeoutSeconds: 1800
+# Total pod lifetime budget in seconds. The operator sets this per Project; the
+# wrapper refuses to start an ordinary turn past it. 0 disables the bound.
+agentPodTTLSeconds: 3600
 bootTimeoutSeconds: 60
 webhookRetries: 3
 

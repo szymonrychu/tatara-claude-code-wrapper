@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -24,8 +23,7 @@ import (
 
 // SessionController is the slice of session.Manager the API needs.
 type SessionController interface {
-	Submit(text, callbackURL string) (string, error)
-	Interject(text string) error
+	Submit(text, callbackURL string, handoff bool) (string, error)
 	Complete(session.HookResult) error
 	Snapshot() session.Snapshot
 	TranscriptPath() string
@@ -40,31 +38,22 @@ type Deps struct {
 	Log      *slog.Logger
 	Registry *prometheus.Registry
 	Metrics  *metrics.Metrics
-	// HandoffKey is the wrapper's stable-per-issue CONVERSATION_OBJECT_KEY,
-	// reused (component 3 of the handoff-continuation design) as the chat
-	// handoff key. When set, it is surfaced to the agent via a preamble on
-	// this pod's first /v1/messages submission.
-	HandoffKey string
 }
 
 type API struct {
-	ctl        SessionController
-	store      *turn.Store
-	v          *auth.Verifier
-	log        *slog.Logger
-	reg        *prometheus.Registry
-	m          *metrics.Metrics
-	handoffKey string
-	// handoffSent guards the one-time handoff preamble: true once the first
-	// goal submission for this pod has been sent.
-	handoffSent atomic.Bool
+	ctl   SessionController
+	store *turn.Store
+	v     *auth.Verifier
+	log   *slog.Logger
+	reg   *prometheus.Registry
+	m     *metrics.Metrics
 }
 
 func New(d Deps) *API {
 	if d.Log == nil {
 		d.Log = slog.Default()
 	}
-	return &API{ctl: d.Ctl, store: d.Store, v: d.Verifier, log: d.Log, reg: d.Registry, m: d.Metrics, handoffKey: d.HandoffKey}
+	return &API{ctl: d.Ctl, store: d.Store, v: d.Verifier, log: d.Log, reg: d.Registry, m: d.Metrics}
 }
 
 // probeRoutes are the infra-plane endpoints whose access logs are pure noise at
@@ -177,7 +166,6 @@ func (a *API) TestRouter() http.Handler {
 
 func (a *API) mountV1(r chi.Router) {
 	r.Post("/v1/messages", a.postMessage)
-	r.Post("/v1/interject", a.postInterject)
 	r.Get("/v1/messages", a.listMessages)
 	r.Get("/v1/messages/{turnID}", a.getMessage)
 	r.Get("/v1/session", a.getSession)

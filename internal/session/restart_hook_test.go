@@ -24,7 +24,7 @@ func TestOnRestart_FiresOnResumeRelaunch(t *testing.T) {
 	injectAndStart(t, mgr, first)
 
 	// Submit a turn so the conversation exists -> relaunch resumes (--continue).
-	_, err := mgr.Submit("hello", "https://cb/x")
+	_, err := mgr.Submit("hello", "https://cb/x", false)
 	require.NoError(t, err)
 	// A prior turn's hook would have persisted a transcript in production; an
 	// in-flight turn alone (mgr.current set) is not enough to resume.

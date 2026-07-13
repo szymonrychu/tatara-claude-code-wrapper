@@ -2,7 +2,10 @@ package turn
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestRecord_InternalIssuesJSONRoundTrip(t *testing.T) {
@@ -66,4 +69,30 @@ func TestRecord_InternalIssuesOmittedWhenEmpty(t *testing.T) {
 	if _, present := got["internalIssues"]; present {
 		t.Errorf("internalIssues must be omitted when empty, got: %v", got["internalIssues"])
 	}
+}
+
+func TestRecord_HasNoConversationPointers(t *testing.T) {
+	// Contract G.1. Both fields had ZERO writers for their whole life: declared,
+	// JSON-tagged, documented against an operator replay contract that neither
+	// side ever implemented. There is no cross-pod conversation to point at any
+	// more - every pod's turn-0 is a fresh bundle (contract E.2).
+	raw, err := json.Marshal(Record{ID: "t1", State: Complete})
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), "sessionId")
+	require.NotContains(t, string(raw), "conversationObjectKey")
+
+	typ := reflect.TypeOf(Record{})
+	for _, f := range []string{"SessionID", "ConversationObjectKey"} {
+		_, ok := typ.FieldByName(f)
+		require.False(t, ok, "turn.Record.%s must be gone", f)
+	}
+}
+
+func TestRecord_KeepsPushedRepos(t *testing.T) {
+	// Contract G.2: pushedRepos is RETAINED. Without it the operator cannot tell
+	// "no diff" from "forgot to push" on a multi-repo Task, and the TTL synthetic
+	// handoff note (G.7 step 4) is built from it.
+	raw, err := json.Marshal(Record{ID: "t1", PushedRepos: []string{"tatara-cli"}})
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "pushedRepos")
 }

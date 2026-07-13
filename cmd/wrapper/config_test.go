@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -18,7 +19,8 @@ var configEnvKeys = []string{
 	"MODEL", "EFFORT", "PERMISSION_MODE", "REPO_URL", "REPO_BRANCH", "GIT_TOKEN",
 	"GIT_USER_NAME", "GIT_USER_EMAIL", "TASK_BRANCH", "CHECKOUT_BRANCH",
 	"DEFAULT_CALLBACK_URL", "OPERATOR_PUSH_URL", "RUN_ID", "POD_NAME",
-	"TATARA_KIND", "TATARA_REPO", "TATARA_PROJECT", "TURN_TIMEOUT_SECONDS",
+	"TATARA_KIND", "TATARA_REPO", "TATARA_PROJECT", "TATARA_TASK",
+	"CALLBACK_HMAC_SECRET", "TURN_TIMEOUT_SECONDS",
 	"BOOT_TIMEOUT_SECONDS", "PUSH_INTERVAL_SECONDS", "WEBHOOK_RETRIES",
 	"WORKSPACE", "HOME_DIR", "CLAUDE_PATH", "HOOK_PATH", "GLOBAL_CLAUDE_MD_PATH",
 	"PROJECT_CLAUDE_MD_PATH", "MCP_BASE_PATH", "MCP_OVERLAY_DIR",
@@ -28,8 +30,7 @@ var configEnvKeys = []string{
 	"HOOK_PRE_CLONE", "HOOK_POST_CLONE", "HOOK_CONVERSATION_START",
 	"HOOK_CONVERSATION_RESTART", "HOOK_AGENT_TURN_FINISHED",
 	"HOOK_CONVERSATION_FINISHED", "TATARA_WORKSPACE_FULL_CLONE",
-	"CONVERSATION_OBJECT_KEY", "OTEL_ENABLED", "OTEL_EXPORTER_OTLP_ENDPOINT",
-	"TATARA_REPOS",
+	"TATARA_REPOS", "AGENT_POD_TTL_SECONDS",
 }
 
 func TestMain(m *testing.M) {
@@ -59,6 +60,22 @@ func TestLoadConfig_EnvOverride(t *testing.T) {
 	require.Equal(t, 42, cfg.TurnTimeoutSeconds)
 }
 
+func TestConfig_OtelIsGone(t *testing.T) {
+	// No producer, not in the chart, not in the operator's BuildPod. It was config
+	// wired for an override nobody performs. Claude Code's own telemetry, if it is
+	// ever wanted, comes back as a chart value, not as a hidden env.
+	t.Setenv("OTEL_ENABLED", "true")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel:4317")
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+
+	typ := reflect.TypeOf(cfg)
+	for _, f := range []string{"OtelEnabled", "OtelEndpoint"} {
+		_, ok := typ.FieldByName(f)
+		require.False(t, ok, "config.%s must be gone", f)
+	}
+}
+
 func TestLoadConfig_ParsesTataraRepos(t *testing.T) {
 	t.Setenv("TATARA_REPOS", `[{"name":"a","url":"https://h/a","branch":"main"},{"name":"b","url":"https://h/b","branch":"dev"}]`)
 	cfg, err := loadConfig(nil)
@@ -80,20 +97,6 @@ func TestLoadConfig_EffortFromEnv(t *testing.T) {
 	cfg, err := loadConfig(nil)
 	require.NoError(t, err)
 	require.Equal(t, "xhigh", cfg.Effort)
-}
-
-// TestLoadConfig_ConversationObjectKeyIsHandoffKey verifies CONVERSATION_
-// OBJECT_KEY (kept unchanged as the operator env name; repurposed as the
-// handoff-continuation key, spec component 3) still loads correctly.
-func TestLoadConfig_ConversationObjectKeyIsHandoffKey(t *testing.T) {
-	cfg, err := loadConfig(nil)
-	require.NoError(t, err)
-	require.Equal(t, "", cfg.ConversationObjectKey)
-
-	t.Setenv("CONVERSATION_OBJECT_KEY", "issue-42")
-	cfg, err = loadConfig(nil)
-	require.NoError(t, err)
-	require.Equal(t, "issue-42", cfg.ConversationObjectKey)
 }
 
 func TestLoadConfig_SkillsDefaults(t *testing.T) {
@@ -161,4 +164,24 @@ func TestLoadConfig_MetricLabelEnv_DefaultsEmpty(t *testing.T) {
 	require.Equal(t, "", cfg.Kind)
 	require.Equal(t, "", cfg.RepoName)
 	require.Equal(t, "", cfg.Project)
+}
+
+func TestConfig_PodTTLSeconds(t *testing.T) {
+	t.Setenv("AGENT_POD_TTL_SECONDS", "3600")
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, 3600, cfg.PodTTLSeconds)
+}
+
+func TestConfig_PodTTLSecondsDefaultsToDisabled(t *testing.T) {
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, 0, cfg.PodTTLSeconds,
+		"0 = no TTL. A workstation has no operator to stop it; the operator always sets this in-cluster (contract G.9)")
+}
+
+func TestConfig_PodTTLSecondsRejectsGarbage(t *testing.T) {
+	t.Setenv("AGENT_POD_TTL_SECONDS", "an hour")
+	_, err := loadConfig(nil)
+	require.Error(t, err, "a malformed TTL must crash the pod at boot, not silently disable the bound")
 }

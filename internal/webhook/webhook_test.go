@@ -2,11 +2,15 @@ package webhook_test
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -199,4 +203,87 @@ func TestDeliver_MarshalFailureCountedAsDropped(t *testing.T) {
 		}
 		return false
 	}, time.Second, 5*time.Millisecond, "ccw_webhook_delivery_total{result=dropped} not incremented on marshal error")
+}
+
+// operatorValidHMACSignature is an INDEPENDENT, inline re-implementation of
+// tatara-operator's internal/controller.validHMACSignature (turncallback.go),
+// copied by hand from the operator source (no shared Go module between the two
+// repos). It exists only to prove, in this test, that the wrapper's signer and
+// the operator's verifier agree byte-for-byte: sig must be
+// "sha256=" + hex(HMAC-SHA256(body, secret)).
+func operatorValidHMACSignature(body []byte, sig, secret string) bool {
+	const prefix = "sha256="
+	if !strings.HasPrefix(sig, prefix) {
+		return false
+	}
+	got, err := hex.DecodeString(sig[len(prefix):])
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	expected := mac.Sum(nil)
+	return hmac.Equal(got, expected)
+}
+
+// TestPost_SignsBodyWithHMACWhenSecretConfigured is the F7 regression test:
+// the wrapper must sign every callback POST with X-Tatara-Signature when a
+// secret is configured, in the exact format tatara-operator's
+// validHMACSignature verifies. It proves agreement by running the operator's
+// verification algorithm (replicated above) against what the wrapper actually
+// sent, rather than just asserting a header is present.
+func TestPost_SignsBodyWithHMACWhenSecretConfigured(t *testing.T) {
+	const secret = "test-callback-hmac-secret" //nolint:gosec // test fixture, not a real credential
+
+	var (
+		gotSig  string
+		gotBody []byte
+	)
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSig = r.Header.Get("X-Tatara-Signature")
+		gotBody, _ = io.ReadAll(r.Body)
+		close(done)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	s := webhook.New(webhook.Config{Retries: 0, Backoff: time.Millisecond, Secret: secret},
+		metrics.New(prometheus.NewRegistry()), discardLogger())
+	s.Deliver(srv.URL, &turn.Record{ID: "hmac-1", State: turn.Complete, FinalText: "ok"})
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback never delivered")
+	}
+
+	require.NotEmpty(t, gotSig, "X-Tatara-Signature must be set when a secret is configured")
+	require.True(t, operatorValidHMACSignature(gotBody, gotSig, secret),
+		"signature %q over body %s must verify against the operator's algorithm with secret %q", gotSig, gotBody, secret)
+}
+
+// TestPost_NoSignatureHeaderWhenSecretEmpty verifies the backward-compatible
+// no-op: deployments that have not configured CALLBACK_HMAC_SECRET must not
+// suddenly start sending a (bogus) signature header.
+func TestPost_NoSignatureHeaderWhenSecretEmpty(t *testing.T) {
+	var gotSig string
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSig = r.Header.Get("X-Tatara-Signature")
+		close(done)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	s := webhook.New(webhook.Config{Retries: 0, Backoff: time.Millisecond},
+		metrics.New(prometheus.NewRegistry()), discardLogger())
+	s.Deliver(srv.URL, &turn.Record{ID: "no-hmac-1", State: turn.Complete})
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback never delivered")
+	}
+	require.Empty(t, gotSig)
 }

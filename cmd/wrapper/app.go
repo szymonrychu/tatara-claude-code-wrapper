@@ -92,11 +92,12 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		RepoName:    cfg.RepoName,
 		Project:     cfg.Project,
 		TurnTimeout: time.Duration(cfg.TurnTimeoutSeconds) * time.Second,
+		PodTTL:      time.Duration(cfg.PodTTLSeconds) * time.Second,
 		BootTimeout: time.Duration(cfg.BootTimeoutSeconds) * time.Second,
 		SubmitSeq:   session.DefaultSubmitSeq,
 	}, store, m, log, time.Now, newTurnID)
 
-	sender := webhook.New(webhook.Config{Retries: cfg.WebhookRetries}, m, log)
+	sender := webhook.New(webhook.Config{Retries: cfg.WebhookRetries, Secret: cfg.CallbackHMACSecret}, m, log)
 	defaultCB := cfg.DefaultCallbackURL
 
 	a := &app{
@@ -110,7 +111,13 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 				cfg.HookConversationFinished, 5*time.Second)
 		},
 	}
-	a.submitFn = a.sess.Submit
+	// An outcome re-prompt is an ORDINARY turn (handoff=false): it is the pod
+	// correcting its own tool call, not the operator's TTL handoff turn, so past
+	// the pod deadline it is refused (ErrPodTTLExpired) and reprompt() falls back
+	// to delivering the callback. It must never spend the one handoff slot.
+	a.submitFn = func(text, callbackURL string) (string, error) {
+		return a.sess.Submit(text, callbackURL, false)
+	}
 
 	sess.OnTurnDone = func(rec *turn.Record) {
 		// Run the whole finalisation off the cc-stop-hook HTTP request goroutine:
@@ -152,7 +159,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		verifier = v
 	}
 
-	api := httpapi.New(httpapi.Deps{Ctl: sess, Store: store, Verifier: verifier, Log: log, Registry: reg, Metrics: m, HandoffKey: cfg.ConversationObjectKey})
+	api := httpapi.New(httpapi.Deps{Ctl: sess, Store: store, Verifier: verifier, Log: log, Registry: reg, Metrics: m})
 	a.pub.Handler = api.Router()
 	a.internal.Handler = api.InternalRouter()
 
@@ -246,7 +253,7 @@ func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log
 	if url == "" {
 		url = defaultCB
 	}
-	sender.Deliver(url, rec)
+	sender.DeliverPayload(url, rec.ID, newCallbackPayload(rec, cfg.TaskName))
 
 	// agentTurnFinished runs last, after the turn's work is committed,
 	// pushed, and the operator callback delivered. Best-effort.
@@ -407,20 +414,6 @@ func claudeEnv(cfg config) []string {
 	}
 	if cfg.HomeDir != "" {
 		env = append(env, "HOME="+cfg.HomeDir)
-	}
-	// Native Claude Code OTel (cost/token/429 backstop): only enable when both
-	// the flag is set AND an endpoint is configured, so a set-but-empty
-	// OTEL_EXPORTER_OTLP_ENDPOINT can never turn on telemetry with nowhere to
-	// send it (the envboolor-empty-bootcrash pitfall, applied here to endpoint).
-	if cfg.OtelEnabled && cfg.OtelEndpoint != "" {
-		env = append(env,
-			"CLAUDE_CODE_ENABLE_TELEMETRY=1",
-			"OTEL_METRICS_EXPORTER=otlp",
-			"OTEL_LOGS_EXPORTER=otlp",
-			"OTEL_EXPORTER_OTLP_PROTOCOL=grpc",
-			"OTEL_EXPORTER_OTLP_ENDPOINT="+cfg.OtelEndpoint,
-			"OTEL_METRIC_EXPORT_INTERVAL=60000",
-		)
 	}
 	return env
 }

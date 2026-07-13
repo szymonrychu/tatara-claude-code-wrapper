@@ -66,14 +66,16 @@ func validateCallbackURL(raw string) error {
 type postMessageReq struct {
 	Text        string `json:"text"`
 	CallbackURL string `json:"callbackUrl"`
+	// Handoff marks the operator's TTL stop turn (contract G.7 step 3). It is
+	// the only turn admitted past the pod deadline. Tag matches contract G.5
+	// exactly (fix V6-6): omitempty so an ordinary turn's request body need not
+	// carry the key at all.
+	//
+	// The allowance is SCOPED TO PAST t0 (fix V7-11): before the deadline this
+	// flag is inert - the turn is admitted as an ordinary turn and does not
+	// consume the one post-deadline handoff slot.
+	Handoff bool `json:"handoff,omitempty"`
 }
-
-// handoffPreambleFmt is the continuation preamble (handoff-continuation design,
-// component 3) prepended to this pod's FIRST goal submission when a handoff
-// key is configured. The `/handoff` skill drives get_handoff/write_handoff;
-// the wrapper itself never calls chat.
-const handoffPreambleFmt = "Continuation key: %s. If you have prior context, call get_handoff " +
-	"with this key before starting, and write_handoff an updated summary before you finish.\n\n%s"
 
 func (a *API) postMessage(w http.ResponseWriter, r *http.Request) {
 	var req postMessageReq
@@ -85,52 +87,21 @@ func (a *API) postMessage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	text := req.Text
-	claimedPreamble := a.handoffKey != "" && a.handoffSent.CompareAndSwap(false, true)
-	if claimedPreamble {
-		text = fmt.Sprintf(handoffPreambleFmt, a.handoffKey, req.Text)
-	}
-	id, err := a.ctl.Submit(text, req.CallbackURL)
-	if err != nil {
-		// Submit failed - this pod's first goal never actually went out, so
-		// release the one-shot claim: the retry (or a concurrent caller)
-		// must still get the handoff preamble, otherwise cross-pod
-		// continuity is silently lost.
-		if claimedPreamble {
-			a.handoffSent.Store(false)
-		}
-		if errors.Is(err, session.ErrBusy) {
-			http.Error(w, "session busy", http.StatusConflict)
-			return
-		}
+	id, err := a.ctl.Submit(req.Text, req.CallbackURL, req.Handoff)
+	switch {
+	case errors.Is(err, session.ErrPodTTLExpired):
+		// 410 Gone, never 409 (a turn is in flight) and never 503 (retry
+		// shortly): this pod will not take another turn (contract G.5, D-W1).
+		writeJSON(w, http.StatusGone, map[string]string{"error": "pod ttl expired"})
+		return
+	case errors.Is(err, session.ErrBusy):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "a turn is in flight"})
+		return
+	case err != nil:
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"turnId": id})
-}
-
-type postInterjectReq struct {
-	Text string `json:"text"`
-}
-
-// postInterject injects new user input into the turn currently in flight. It
-// returns 409 when no turn is running (the operator should Submit instead).
-func (a *API) postInterject(w http.ResponseWriter, r *http.Request) {
-	var req postInterjectReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Text == "" {
-		http.Error(w, "text is required", http.StatusBadRequest)
-		return
-	}
-	err := a.ctl.Interject(req.Text)
-	if errors.Is(err, session.ErrNotBusy) {
-		http.Error(w, "no in-flight turn", http.StatusConflict)
-		return
-	}
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]string{})
 }
 
 func (a *API) listMessages(w http.ResponseWriter, _ *http.Request) {

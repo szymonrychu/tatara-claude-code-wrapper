@@ -97,12 +97,11 @@ func TestTurnComplete_Rejected_Logs409(t *testing.T) {
 // fakeCtlErr is a SessionController whose Complete always returns the given error.
 type fakeCtlErr struct{ err error }
 
-func (f *fakeCtlErr) Submit(text, cb string) (string, error) { return "", nil }
-func (f *fakeCtlErr) Interject(text string) error            { return nil }
-func (f *fakeCtlErr) Complete(r session.HookResult) error    { return f.err }
-func (f *fakeCtlErr) Snapshot() session.Snapshot             { return session.Snapshot{} }
-func (f *fakeCtlErr) TranscriptPath() string                 { return "" }
-func (f *fakeCtlErr) Alive() bool                            { return true }
-func (f *fakeCtlErr) Shutdown(context.Context) error         { return nil }
+func (f *fakeCtlErr) Submit(text, cb string, handoff bool) (string, error) { return "", nil }
+func (f *fakeCtlErr) Complete(r session.HookResult) error                  { return f.err }
+func (f *fakeCtlErr) Snapshot() session.Snapshot                           { return session.Snapshot{} }
+func (f *fakeCtlErr) TranscriptPath() string                               { return "" }
+func (f *fakeCtlErr) Alive() bool                                          { return true }
+func (f *fakeCtlErr) Shutdown(context.Context) error                       { return nil }
 
 var _ httpapi.SessionController = (*fakeCtl)(nil)

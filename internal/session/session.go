@@ -12,12 +12,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/convstore"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/transcript"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/version"
 )
 
 // goroutineJoinTimeout is the maximum time Shutdown waits for lifecycle
@@ -32,9 +34,10 @@ type SubmitSequence struct{ PasteStart, PasteEnd, Submit string }
 
 var ErrBusy = errors.New("session busy")
 
-// ErrNotBusy is returned by Interject when there is no in-flight turn to
-// inject into: an interjection only makes sense while a turn is running.
-var ErrNotBusy = errors.New("no in-flight turn to interject")
+// ErrPodTTLExpired is returned by Submit once this pod is past its TTL. It maps
+// to 410 Gone (never 409, which means "a turn is in flight", and never 503,
+// which implies retry): this pod will not accept another ordinary turn, ever.
+var ErrPodTTLExpired = errors.New("pod ttl expired")
 
 type Config struct {
 	ClaudePath string
@@ -49,6 +52,10 @@ type Config struct {
 	Effort      string
 	Repo        string // primary repository URL the pod is bound to ("" if none)
 	TurnTimeout time.Duration
+	// PodTTL is this pod's total lifetime budget (contract G.9). Past
+	// startedAt+PodTTL the wrapper refuses to start an ordinary turn. 0
+	// disables the bound (podDeadline returns the zero time).
+	PodTTL      time.Duration
 	BootTimeout time.Duration
 	SubmitDelay time.Duration // pause between the paste and the submit keystroke
 	SubmitSeq   SubmitSequence
@@ -99,6 +106,8 @@ type Snapshot struct {
 	Model          string    `json:"model"`
 	Repo           string    `json:"repo"`
 	LastActivityAt time.Time `json:"lastActivityAt"` // last agent_stream event of the in-flight turn; zero when idle
+	// ContractVersion is asserted by the operator before turn-0 (contract G.10).
+	ContractVersion int `json:"contractVersion"`
 }
 
 type Manager struct {
@@ -119,6 +128,15 @@ type Manager struct {
 	OnRestart func()
 
 	spawn func(cfg Config, resume bool) (claudeProcess, error)
+
+	// startedAt is this pod's process start (the best available proxy for the
+	// operator's podStartedAt), used with cfg.PodTTL to compute podDeadline.
+	startedAt time.Time
+
+	// handoffAdmitted records that the ONE handoff turn allowed PAST the pod
+	// deadline has been admitted (contract G.7 step 3). Never set before the
+	// deadline: see admit.
+	handoffAdmitted atomic.Bool
 
 	mu               sync.Mutex
 	w                ptyWriter
@@ -157,7 +175,11 @@ func New(cfg Config, store *turn.Store, m *metrics.Metrics, log *slog.Logger, no
 	if cfg.MaxRestarts <= 0 {
 		cfg.MaxRestarts = 3
 	}
-	mgr := &Manager{cfg: cfg, store: store, m: m, log: log, now: now, newID: newID, state: Booting, ring: newRing()}
+	// startedAt anchors podDeadline to the pod's actual process start, not the
+	// injected clock: consuming a now() call here would shift every other
+	// call's fixed-clock sequencing in tests (e.g. Submit/Complete duration
+	// assertions), and in production now() is time.Now anyway.
+	mgr := &Manager{cfg: cfg, store: store, m: m, log: log, now: now, newID: newID, state: Booting, ring: newRing(), startedAt: time.Now()}
 	mgr.spawn = func(cfg Config, resume bool) (claudeProcess, error) {
 		p, err := spawnClaude(cfg, resume)
 		if err != nil {
@@ -324,6 +346,30 @@ func (mgr *Manager) SetTranscriptPathForTest(path string) {
 // ShouldResumeForTest exposes shouldResume to the external session_test
 // package so the boot-crash resume invariant can be asserted directly. Test-only.
 func (mgr *Manager) ShouldResumeForTest() bool { return mgr.shouldResume() }
+
+// SetStartedAtForTest overrides the pod-start instant podDeadline is computed
+// from. Test-only: production sets it once from the injected clock at
+// construction.
+func (mgr *Manager) SetStartedAtForTest(t time.Time) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	mgr.startedAt = t
+}
+
+// PodDeadlineForTest exposes podDeadline to the external session_test
+// package. Test-only.
+func (mgr *Manager) PodDeadlineForTest() time.Time { return mgr.podDeadline() }
+
+// podDeadline is the wall-clock instant past which this pod stops admitting
+// ordinary turns. Zero when PodTTL is 0 (no bound).
+func (mgr *Manager) podDeadline() time.Time {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	if mgr.cfg.PodTTL <= 0 {
+		return time.Time{}
+	}
+	return mgr.startedAt.Add(mgr.cfg.PodTTL)
+}
 
 // RingContainsForTest reports whether the ring buffer currently holds needle.
 // Test-only; lets relaunch tests assert the ring was reset.
@@ -701,7 +747,7 @@ func (mgr *Manager) resumeTurn(id string, resumed bool) {
 		return
 	}
 	// Capture w and seq under the lock, then release before the write.
-	// This mirrors the Submit/Interject lock discipline: PTY writes happen
+	// This mirrors Submit's lock discipline: PTY writes happen
 	// outside the lock so a slow/wedged PTY during crash recovery cannot block
 	// Snapshot, Alive, or Complete (finding 3).
 	w := mgr.w
@@ -888,7 +934,42 @@ func (mgr *Manager) failTurn(id, reason string) {
 	mgr.fireDone(rec)
 }
 
-func (mgr *Manager) Submit(text, callbackURL string) (string, error) {
+// admit is contract G.7's stop sequence, wrapper side. Past the pod deadline the
+// operator has already stopped routing work here and is waiting for a handoff
+// note; a pod that starts fresh work now is a pod doing work nobody will read.
+// The ONE exception is the operator's handoff turn ("Your pod is being stopped.
+// Call task_note(kind=handoff) ... then stop."). Refusing THAT is how
+// Task.status.notes ends up empty after a TTL stop - the exact continuity loss
+// the notes mechanism exists to prevent. Exactly one is admitted PAST THE
+// DEADLINE; the operator's synthetic note (G.7 step 4) covers the case where it
+// fails.
+//
+// THE ALLOWANCE IS SCOPED TO PAST THE DEADLINE (contract G.5, fix V7-11): the
+// pre-deadline path below returns BEFORE the CompareAndSwap, so a handoff:true
+// turn submitted early is admitted as an ordinary turn and does NOT burn the
+// slot. Reorder these two blocks and the pod loses its ability to hand off.
+func (mgr *Manager) admit(handoff bool) error {
+	deadline := mgr.podDeadline()
+	if deadline.IsZero() {
+		return nil // PodTTL=0: no bound (the workstation case).
+	}
+	now := mgr.now()
+	if now.Before(deadline) {
+		return nil // NOT a CompareAndSwap: the allowance is untouched before t0.
+	}
+	hardCap := deadline.Add(2*mgr.cfg.TurnTimeout + 60*time.Second)
+	if handoff && now.Before(hardCap) && mgr.handoffAdmitted.CompareAndSwap(false, true) {
+		return nil
+	}
+	return ErrPodTTLExpired
+}
+
+func (mgr *Manager) Submit(text, callbackURL string, handoff bool) (string, error) {
+	if err := mgr.admit(handoff); err != nil {
+		mgr.m.TurnRefusals.WithLabelValues("pod_ttl_expired").Inc()
+		mgr.log.Warn("turn refused", "action", "turn_refuse", "reason", "pod_ttl_expired", "handoff", handoff)
+		return "", err
+	}
 	mgr.mu.Lock()
 	if mgr.state == Dead {
 		mgr.mu.Unlock()
@@ -914,8 +995,8 @@ func (mgr *Manager) Submit(text, callbackURL string) (string, error) {
 	mgr.mu.Unlock()
 
 	// Paste and submit happen outside the lock so that Snapshot/Alive/Complete
-	// are not blocked for the full SubmitDelay (mirrors the Interject fix,
-	// finding 2). Both writes are to the same logical PTY, ordered by the fact
+	// are not blocked for the full SubmitDelay (finding 2). Both writes are to
+	// the same logical PTY, ordered by the fact
 	// that only one goroutine (this one) drives the paste+submit sequence at a time
 	// (the turn slot above guarantees no concurrent Submit).
 	if _, err := w.Write([]byte(seq.PasteStart + text + seq.PasteEnd)); err != nil {
@@ -934,48 +1015,6 @@ func (mgr *Manager) Submit(text, callbackURL string) (string, error) {
 	mgr.mu.Unlock()
 	mgr.log.Info("turn submitted", "action", "turn_submit", "turn_id", id)
 	return id, nil
-}
-
-// Interject types `text` into the live claude session while a turn is already
-// in flight, exactly as a user adding new context mid-session would. It reuses
-// the paste+submit keystroke sequence but creates NO turn record and does not
-// touch the current turn id, state, or timeout: the running turn absorbs the
-// input and still completes with a single Stop hook. Returns ErrNotBusy when no
-// turn is in flight (callers should Submit a fresh turn instead).
-//
-// The lock is released before the SubmitDelay sleep so that concurrent callers
-// (Complete, Snapshot, failTimeout) are not blocked during the deliberate
-// keystroke pause (finding 9).
-func (mgr *Manager) Interject(text string) error {
-	mgr.mu.Lock()
-	switch mgr.state {
-	case Dead:
-		mgr.mu.Unlock()
-		return fmt.Errorf("session dead")
-	case Booting:
-		mgr.mu.Unlock()
-		return fmt.Errorf("session not ready")
-	}
-	if mgr.current == "" {
-		mgr.mu.Unlock()
-		return ErrNotBusy
-	}
-	turnID := mgr.current
-	w := mgr.w
-	seq := mgr.cfg.SubmitSeq
-	mgr.mu.Unlock()
-
-	// Writes and sleep happen outside the lock (finding 9).
-	if _, err := w.Write([]byte(seq.PasteStart + text + seq.PasteEnd)); err != nil {
-		return fmt.Errorf("write pty paste: %w", err)
-	}
-	time.Sleep(mgr.cfg.SubmitDelay)
-	if _, err := w.Write([]byte(seq.Submit)); err != nil {
-		return fmt.Errorf("write pty submit: %w", err)
-	}
-	mgr.m.Interjections.Inc()
-	mgr.log.Info("turn interjection", "action", "interject", "turn_id", turnID)
-	return nil
 }
 
 // Complete is invoked from the internal endpoint when a Stop hook fires.
@@ -1196,12 +1235,13 @@ func (mgr *Manager) Snapshot() Snapshot {
 		}
 	}
 	return Snapshot{
-		State:          mgr.state,
-		TurnsCompleted: mgr.turnsSucceeded, // successful turns only (finding 11)
-		TurnsFinished:  mgr.turnsCompleted, // all terminal turns
-		Model:          mgr.cfg.Model,
-		Repo:           mgr.cfg.Repo,
-		LastActivityAt: lastActivity,
+		State:           mgr.state,
+		TurnsCompleted:  mgr.turnsSucceeded, // successful turns only (finding 11)
+		TurnsFinished:   mgr.turnsCompleted, // all terminal turns
+		Model:           mgr.cfg.Model,
+		Repo:            mgr.cfg.Repo,
+		LastActivityAt:  lastActivity,
+		ContractVersion: version.ContractVersion,
 	}
 }
 
