@@ -420,8 +420,8 @@ func claudeEnv(cfg config) []string {
 
 // tataraLookAndRegister checks tatara is on PATH and wires its MCP server.
 // Both the LookPath miss and the mcp-config failure are fatal: the agent cannot
-// fulfil the operator contract (propose_issue, review_verdict,
-// decline_implementation) without this registration.
+// fulfil the operator contract (submit_outcome, scm_read, issue_write,
+// mr_write) without this registration.
 func tataraLookAndRegister(workspace string, run bootstrap.CmdRunner) error {
 	if _, err := exec.LookPath("tatara"); err != nil {
 		return fmt.Errorf("tatara not found on PATH; MCP tools unavailable: %w", err)
