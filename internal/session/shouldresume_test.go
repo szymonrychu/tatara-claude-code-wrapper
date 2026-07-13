@@ -66,7 +66,7 @@ func TestShouldResume_InFlightTurnAloneIsNotEnough(t *testing.T) {
 	mgr := newBareMgr(t)
 	mgr.SetWriterForTest(nopWriter{})
 
-	_, err := mgr.Submit("hello", "")
+	_, err := mgr.Submit("hello", "", false)
 	require.NoError(t, err)
 
 	require.False(t, mgr.ShouldResumeForTest(),
@@ -80,7 +80,7 @@ func TestShouldResume_TurnsCompletedIsEnough(t *testing.T) {
 	mgr := newBareMgr(t)
 	mgr.SetWriterForTest(nopWriter{})
 
-	_, err := mgr.Submit("hello", "")
+	_, err := mgr.Submit("hello", "", false)
 	require.NoError(t, err)
 	require.NoError(t, mgr.Complete(session.HookResult{FinalText: "done", StopReason: "end_turn"}))
 
@@ -130,7 +130,7 @@ func TestShouldResume_NoOnDiskTranscript_StillFreshBootCrashSafe(t *testing.T) {
 	mgr := newBareMgrWithConfig(t, session.Config{HomeDir: home, Workspace: workspace})
 	mgr.SetWriterForTest(nopWriter{})
 
-	_, err := mgr.Submit("hello", "")
+	_, err := mgr.Submit("hello", "", false)
 	require.NoError(t, err)
 
 	require.False(t, mgr.ShouldResumeForTest(),

@@ -29,20 +29,28 @@ All `/v1/*` require an OIDC bearer token (Keycloak master realm, audience
 `tatara-claude-code-wrapper`). Operator endpoints are open and not exposed via
 ingress.
 
-| Method | Path | Description |
+| Method + path | Request | Response |
 |---|---|---|
-| POST | `/v1/messages` | Submit a turn `{text, callbackUrl?}` -> `202 {turnId}` (or `409` if a turn is in flight). |
-| POST | `/v1/interject` | Inject `{text}` into the turn in flight (mid-session input) -> `202` (or `409` if no turn is running, `400` if no text). |
-| GET | `/v1/messages` | Turn history `[{turnId, state, startedAt, completedAt}]`. |
-| GET | `/v1/messages/{turnId}` | Full turn result `{state, finalText, resultJson?, usage, stopReason, error?}` (poll / missed-callback path). |
-| GET | `/v1/session` | `{state, turnsCompleted, model, repo}`. |
-| GET | `/v1/transcript` | Full JSONL session transcript (debug). |
-| DELETE | `/v1/session` | Graceful shutdown, pod exits. |
-| GET | `/healthz` `/readyz` `/metrics` | Operator endpoints. |
+| `POST /v1/messages` | `{"text":"...","callbackUrl":"...","handoff":false}` | 202 `{"turnId":"..."}`; 409 turn in flight; **410 pod TTL expired** |
+| `GET /v1/messages/{turnID}` | - | 200 `turn.Record` |
+| `GET /v1/messages` | - | 200 `[turn.Summary]` |
+| `GET /v1/session` | - | 200 `{... ,"contractVersion":2}` |
+| `DELETE /v1/session` | - | 202, graceful shutdown, pod exits |
+| `GET /v1/transcript` | - | 200, full JSONL session transcript (debug) |
+| `GET /healthz` `/readyz` `/metrics` | - | Operator endpoints |
 
-Turns are strictly sequential. Result delivery: if `callbackUrl` is set, the
-wrapper POSTs the turn result there on completion (retrying); the result is
-always also retrievable by polling `GET /v1/messages/{turnId}`.
+`POST /v1/interject` is gone (404) - mid-flight events now ride in at the
+next turn boundary as the `<events>` block of the next bundle, not as
+mid-turn PTY injection.
+
+Turns are strictly sequential. `handoff:true` marks the operator's TTL stop
+turn: it is the only turn admitted past `AGENT_POD_TTL_SECONDS` (exactly
+once, bounded by `deadline + 2*turnTimeout + 60s`); before the deadline it
+is inert and the turn is ordinary. `GET /v1/session`'s `contractVersion`
+lets the operator assert the agent image and operator came from the same
+release train before submitting turn 0. Result delivery: if `callbackUrl`
+is set, the wrapper POSTs the turn result there on completion (retrying);
+the result is always also retrievable by polling `GET /v1/messages/{turnId}`.
 
 ## How a turn flows
 
@@ -59,7 +67,9 @@ Scalars come in as env (UPPER_SNAKE, via the chart's ConfigMap `envFrom`):
 `HTTP_ADDR`, `INTERNAL_ADDR`, `OIDC_ISSUER`, `OIDC_AUDIENCE`, `LOG_LEVEL`,
 `MODEL`, `PERMISSION_MODE` (default `bypassPermissions`), `REPO_URL`,
 `REPO_BRANCH`, `DEFAULT_CALLBACK_URL`, `TURN_TIMEOUT_SECONDS` (1800),
-`BOOT_TIMEOUT_SECONDS` (60), `WEBHOOK_RETRIES` (3).
+`AGENT_POD_TTL_SECONDS` (0, disabled - the operator sets this from
+`Project.spec.agentPodTTLSeconds`), `BOOT_TIMEOUT_SECONDS` (60),
+`WEBHOOK_RETRIES` (3).
 
 File/list/multiline config is mounted under `/etc/wrapper` (chart values
 `globalClaudeMd`, `projectClaudeMd`, `baseMcp`, `extraMcpServers`,
@@ -99,24 +109,32 @@ suppresses onboarding, folder-trust, and custom-API-key prompts by seeding
 appears on every boot; the wrapper detects it in the PTY ring buffer and
 accepts it before accepting turns. See `docs/spike-findings.md`.
 
-## Handoff continuation (replaces issue #114 S3 conversation persistence)
+## Pod TTL and the handoff turn (replaces issue #114 S3 conversation persistence)
 
-Every pod now boots fresh: `internal/storage` (the S3 client) and the S3
-restore/fork/upload path in `internal/convstore` were removed. Continuity
-across pods is carried by a compact, chat-backed **handoff** instead of a
-replayed transcript (see `docs/superpowers/specs/2026-07-04-handoff-
-continuation-design.md` in the parent `tatara` repo, component 3).
+Every pod boots fresh: `internal/storage` (the S3 client) and the S3
+restore/fork/upload path in `internal/convstore` were removed, along with the
+chat-backed continuation preamble that used to prime a pod's first turn.
+There is no cross-pod resume any more - every pod's turn-0 is the same
+freshly rendered bundle.
 
-- `CONVERSATION_OBJECT_KEY` (env name unchanged so the operator needs no
-  change) is now the **handoff key**: on this pod's first `/v1/messages`
-  submission, the wrapper prepends a preamble telling the agent to call
-  `get_handoff` with this key before starting and `write_handoff` an updated
-  summary before finishing. The wrapper itself never calls chat - the agent
-  does, via the `/handoff` skill and the tatara-cli MCP tools.
+Continuity across pods is instead a task-centric handoff bounded by the
+pod's own lifetime:
+
+- `AGENT_POD_TTL_SECONDS` (0 = disabled) is this pod's total lifetime
+  budget, set by the operator from `Project.spec.agentPodTTLSeconds`. Past
+  the deadline the wrapper refuses to start an ordinary turn (`410 pod ttl
+  expired`) so a stale pod cannot silently keep working.
+- Exactly one turn is admitted past the deadline: the operator's
+  `"handoff": true` turn (bounded by `deadline + 2*turnTimeout + 60s`), used
+  to have the agent write its continuation notes before the pod is torn
+  down. `handoff:true` sent before the deadline is an ordinary turn and does
+  not consume that allowance.
 - REVIEW: an MR review pod sets `CHECKOUT_BRANCH` (the PR head) and no
   `TASK_BRANCH`, so it works on the PR code read-only and never pushes.
 - `internal/convstore.TranscriptDir` is kept: it backs the boot-crash fix's
-  on-disk transcript check (`session.shouldResume`), unrelated to S3.
+  on-disk transcript check (`session.shouldResume`), unrelated to S3 and
+  unrelated to cross-pod continuity - this is intra-pod claude-process
+  crash recovery only.
 
 ## Build
 

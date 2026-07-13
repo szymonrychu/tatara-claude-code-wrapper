@@ -4,6 +4,9 @@ package webhook
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -22,6 +25,14 @@ const maxBackoff = 60 * time.Second
 type Config struct {
 	Retries int
 	Backoff time.Duration
+	// Secret, when non-empty, HMAC-SHA256-signs every callback POST body and
+	// sets the result on the X-Tatara-Signature header as
+	// "sha256=<hex(HMAC-SHA256(body, Secret))>", matching tatara-operator's
+	// internal/controller.validHMACSignature verification exactly (bug F7).
+	// Sourced from the CALLBACK_HMAC_SECRET env var the operator injects via
+	// SecretKeyRef; used as the raw string's bytes, not base64-decoded, to
+	// match the operator's own reading of the same secret.
+	Secret string
 }
 
 type Sender struct {
@@ -52,28 +63,42 @@ func New(cfg Config, m *metrics.Metrics, log *slog.Logger) *Sender {
 // Calls received after Shutdown has begun are silently dropped so that wg.Add
 // cannot race with wg.Wait.
 func (s *Sender) Deliver(url string, rec *turn.Record) {
+	if rec == nil {
+		return
+	}
+	s.DeliverPayload(url, rec.ID, rec)
+}
+
+// DeliverPayload posts an arbitrary JSON-marshalable payload to url
+// asynchronously, under the same retry/backoff/shutdown/HMAC-signing
+// semantics as Deliver. turnID is used only for logging and metrics
+// correlation, not for the wire body. Introduced for bug F8: the operator's
+// turn-complete contract expects taskName and durationSeconds, which
+// turn.Record does not carry, so the caller builds a callback-specific
+// payload and posts that instead of a raw *turn.Record.
+func (s *Sender) DeliverPayload(url, turnID string, payload any) {
 	if url == "" {
 		return
 	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		s.log.Warn("webhook: deliver after shutdown, dropping", "turn_id", rec.ID, "url", url)
+		s.log.Warn("webhook: deliver after shutdown, dropping", "turn_id", turnID, "url", url)
 		return
 	}
 	s.wg.Add(1)
 	s.mu.Unlock()
 
-	body, err := json.Marshal(rec)
+	body, err := json.Marshal(payload)
 	if err != nil {
 		s.m.WebhookDelivery.WithLabelValues("dropped").Inc()
 		s.wg.Done()
-		s.log.Error("webhook: marshal", "err", err, "turn_id", rec.ID)
+		s.log.Error("webhook: marshal", "err", err, "turn_id", turnID)
 		return
 	}
 	go func() {
 		defer s.wg.Done()
-		s.deliver(s.ctx, url, rec.ID, body)
+		s.deliver(s.ctx, url, turnID, body)
 	}()
 }
 
@@ -133,6 +158,11 @@ func (s *Sender) post(ctx context.Context, url string, body []byte) error {
 		return fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if s.cfg.Secret != "" {
+		mac := hmac.New(sha256.New, []byte(s.cfg.Secret))
+		mac.Write(body)
+		req.Header.Set("X-Tatara-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("do: %w", err)

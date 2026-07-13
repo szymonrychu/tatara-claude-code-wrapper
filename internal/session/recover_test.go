@@ -254,7 +254,7 @@ func TestWatch_MidTurnDeath_RelaunchesAndResumes(t *testing.T) {
 	injectAndStart(t, mgr, first)
 
 	// Submit a turn before killing
-	id, err := mgr.Submit("hello world", "https://cb/x")
+	id, err := mgr.Submit("hello world", "https://cb/x", false)
 	require.NoError(t, err)
 	require.Equal(t, "turn-1", id)
 
@@ -312,7 +312,7 @@ func TestWatch_BootCrashFreshRelaunch_ResubmitsOriginalPrompt(t *testing.T) {
 	mgr, store := newRecoverMgrWithRegistry(t, []string{"turn-1"}, 3, st, reg)
 	injectAndStart(t, mgr, first)
 
-	id, err := mgr.Submit("do the important thing", "https://cb/x")
+	id, err := mgr.Submit("do the important thing", "https://cb/x", false)
 	require.NoError(t, err)
 	require.Equal(t, "turn-1", id)
 
@@ -362,7 +362,7 @@ func TestWatch_DeathAtCap_FailsFastAndStaysDead(t *testing.T) {
 	mgr.OnTurnDone = func(r *turn.Record) { done <- r }
 	injectAndStart(t, mgr, first)
 
-	id, err := mgr.Submit("work", "https://cb/")
+	id, err := mgr.Submit("work", "https://cb/", false)
 	require.NoError(t, err)
 	require.Equal(t, "turn-1", id)
 
@@ -436,7 +436,7 @@ func TestComplete_ResetsRestartCounter(t *testing.T) {
 	injectAndStart(t, mgr, first)
 
 	// Submit turn-1
-	_, err := mgr.Submit("first turn", "")
+	_, err := mgr.Submit("first turn", "", false)
 	require.NoError(t, err)
 
 	// Kill -> relaunch #1 (restarts=1, at cap for MaxRestarts=1)
@@ -451,7 +451,7 @@ func TestComplete_ResetsRestartCounter(t *testing.T) {
 	require.NoError(t, err)
 
 	// Now submit turn-2 and kill second proc -> should relaunch (restarts=1 again, not 2)
-	_, err = mgr.Submit("second turn", "")
+	_, err = mgr.Submit("second turn", "", false)
 	require.NoError(t, err)
 
 	second.kill()
@@ -575,7 +575,7 @@ func TestResumeTurn_CompletesFromTranscript_NoNudge(t *testing.T) {
 	mgr.OnTurnDone = func(r *turn.Record) { done <- r }
 	mgr.InjectProcForTest(first)
 
-	_, err := mgr.Submit("do the thing", "")
+	_, err := mgr.Submit("do the thing", "", false)
 	require.NoError(t, err)
 	// A prior turn's hook would have set this in production; the session JSONL
 	// accumulates across turns and now contains this turn's completed answer.
@@ -623,7 +623,7 @@ func TestResumeTurn_NudgesWhenTranscriptPending(t *testing.T) {
 	mgr, store := newResumeMgr(t, reg, st)
 	mgr.InjectProcForTest(first)
 
-	_, err := mgr.Submit("keep going", "")
+	_, err := mgr.Submit("keep going", "", false)
 	require.NoError(t, err)
 	mgr.SetTranscriptPathForTest(tp)
 

@@ -78,6 +78,7 @@ REPO_URL: {{ .Values.repoUrl | quote }}
 REPO_BRANCH: {{ .Values.repoBranch | quote }}
 DEFAULT_CALLBACK_URL: {{ .Values.defaultCallbackUrl | quote }}
 TURN_TIMEOUT_SECONDS: {{ .Values.turnTimeoutSeconds | quote }}
+AGENT_POD_TTL_SECONDS: {{ .Values.agentPodTTLSeconds | quote }}
 BOOT_TIMEOUT_SECONDS: {{ .Values.bootTimeoutSeconds | quote }}
 WEBHOOK_RETRIES: {{ .Values.webhookRetries | quote }}
 GLOBAL_CLAUDE_MD_PATH: "/etc/wrapper/global-claude.md"

@@ -7,21 +7,31 @@ import (
 	"testing"
 )
 
-// TestNoS3ConversationCodeRemains is a grep-guard (spec component 3): the S3
-// conversation restore/fork/upload machinery must be fully removed from the
-// module, leaving only the compact handoff preamble. This file is itself
-// excluded from the scan.
-func TestNoS3ConversationCodeRemains(t *testing.T) {
+// TestNoReapedAPIsRemain is the regression guard for two reaps: the 2026-07-04
+// S3 conversation-restore removal, and the 2026-07-12 task-centric removal of
+// cross-pod continuity (/v1/interject, the handoff preamble, the conversation
+// pointers) and the dead OTEL path. Every entry below is an identifier that was
+// deliberately deleted and must not come back by copy-paste, by a revert, or by
+// a well-meaning "restore the resume path" change.
+//
+// It does NOT ban the intra-pod crash-recovery machinery - convstore.TranscriptDir,
+// claudeArgs, --continue, shouldResume, relaunch, TurnResumes - which is a
+// DIFFERENT mechanism (one pod, one crashed claude process) and is load-bearing.
+//
+// The walk skips every file ending in _test.go (which subsumes skipping this
+// file itself): the ban protects PRODUCTION code. A Go symbol reintroduced in a
+// test cannot compile unless the production symbol also came back, so the
+// compiler already guards those; and a string literal in a test is how absence
+// of the reaped surface is ASSERTED (e.g. a test that checks a route 404s must
+// name that route).
+func TestNoReapedAPIsRemain(t *testing.T) {
 	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatalf("resolve repo root: %v", err)
 	}
-	selfPath, err := filepath.Abs("guard_no_s3_test.go")
-	if err != nil {
-		t.Fatalf("resolve self path: %v", err)
-	}
 
 	banned := []string{
+		// --- 2026-07-04: S3 conversation restore ---
 		"internal/storage",
 		"convstore.Restore",
 		"convstore.Fork(",
@@ -44,6 +54,29 @@ func TestNoS3ConversationCodeRemains(t *testing.T) {
 		"storage.New(",
 		"storage.Config",
 		"storage.NewMemStore",
+
+		// --- 2026-07-12: cross-pod continuity (contract G.1, G.5, G.9) ---
+		"handoffPreambleFmt",
+		"Continuation key",
+		"HandoffKey",
+		"handoffSent",
+		"CONVERSATION_OBJECT_KEY",
+		"CONVERSATION_SESSION_ID",
+		"ConversationObjectKey",
+		"postInterject",
+		"ErrNotBusy",
+		"Interjections",
+		"ccw_interjections_total",
+		"/v1/interject",
+		"TATARA_CHAT_URL",
+		"get_handoff",
+		"write_handoff",
+
+		// --- 2026-07-12: the dead OTEL path ---
+		"OtelEnabled",
+		"OtelEndpoint",
+		"OTEL_ENABLED",
+		"OTEL_EXPORTER_OTLP_ENDPOINT",
 	}
 
 	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -59,11 +92,7 @@ func TestNoS3ConversationCodeRemains(t *testing.T) {
 		if !strings.HasSuffix(path, ".go") {
 			return nil
 		}
-		abs, aerr := filepath.Abs(path)
-		if aerr != nil {
-			return aerr
-		}
-		if abs == selfPath {
+		if strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		b, rerr := os.ReadFile(path) //nolint:gosec // path is from WalkDir over the repo's own tree, not user input
@@ -73,7 +102,7 @@ func TestNoS3ConversationCodeRemains(t *testing.T) {
 		content := string(b)
 		for _, needle := range banned {
 			if strings.Contains(content, needle) {
-				t.Errorf("%s: found banned S3/conversation-restore reference %q", path, needle)
+				t.Errorf("%s: found banned reaped-API reference %q", path, needle)
 			}
 		}
 		return nil

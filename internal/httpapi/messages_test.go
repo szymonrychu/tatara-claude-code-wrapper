@@ -20,21 +20,22 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/httpapi"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/version"
 )
 
 type fakeCtl struct {
 	submitID       string
 	submitErr      error
 	submitErrs     []error // if set, consumed in order per call; falls back to submitErr once exhausted
-	interjectErr   error
-	interjected    string
 	completed      session.HookResult
 	transcriptPath string
 	submittedTexts []string
+	lastHandoff    bool // the handoff flag of the most recent Submit
 }
 
-func (f *fakeCtl) Submit(text, cb string) (string, error) {
+func (f *fakeCtl) Submit(text, cb string, handoff bool) (string, error) {
 	f.submittedTexts = append(f.submittedTexts, text)
+	f.lastHandoff = handoff
 	if len(f.submitErrs) > 0 {
 		err := f.submitErrs[0]
 		f.submitErrs = f.submitErrs[1:]
@@ -42,12 +43,13 @@ func (f *fakeCtl) Submit(text, cb string) (string, error) {
 	}
 	return f.submitID, f.submitErr
 }
-func (f *fakeCtl) Interject(text string) error         { f.interjected = text; return f.interjectErr }
 func (f *fakeCtl) Complete(r session.HookResult) error { f.completed = r; return nil }
-func (f *fakeCtl) Snapshot() session.Snapshot          { return session.Snapshot{State: session.Ready} }
-func (f *fakeCtl) TranscriptPath() string              { return f.transcriptPath }
-func (f *fakeCtl) Alive() bool                         { return true }
-func (f *fakeCtl) Shutdown(context.Context) error      { return nil }
+func (f *fakeCtl) Snapshot() session.Snapshot {
+	return session.Snapshot{State: session.Ready, ContractVersion: version.ContractVersion}
+}
+func (f *fakeCtl) TranscriptPath() string         { return f.transcriptPath }
+func (f *fakeCtl) Alive() bool                    { return true }
+func (f *fakeCtl) Shutdown(context.Context) error { return nil }
 
 func newAPI(ctl httpapi.SessionController, store *turn.Store) *httpapi.API {
 	return httpapi.New(httpapi.Deps{Ctl: ctl, Store: store}) // Verifier nil -> public router skips OIDC in test mode
@@ -72,30 +74,17 @@ func TestPostMessage_409WhenBusy(t *testing.T) {
 	require.Equal(t, http.StatusConflict, rec.Code)
 }
 
-func TestPostInterject_202(t *testing.T) {
+// TestPostInterject_IsGone: contract G.5. Mid-turn PTY injection races the
+// Stop hook and the tailer. Mid-flight events now ride in at the TURN
+// BOUNDARY, as the <events> block of the next turn's bundle (contract E.3).
+// Leaving the endpoint alive leaves the race reachable.
+func TestPostInterject_IsGone(t *testing.T) {
 	ctl := &fakeCtl{}
 	api := newAPI(ctl, turn.NewStore())
-	req := httptest.NewRequest(http.MethodPost, "/v1/interject", bytes.NewReader([]byte(`{"text":"new info"}`)))
+	req := httptest.NewRequest(http.MethodPost, "/v1/interject", strings.NewReader(`{"text":"also handle gitlab"}`))
 	rec := httptest.NewRecorder()
 	api.TestRouter().ServeHTTP(rec, req)
-	require.Equal(t, http.StatusAccepted, rec.Code)
-	require.Equal(t, "new info", ctl.interjected)
-}
-
-func TestPostInterject_400WhenEmpty(t *testing.T) {
-	api := newAPI(&fakeCtl{}, turn.NewStore())
-	req := httptest.NewRequest(http.MethodPost, "/v1/interject", bytes.NewReader([]byte(`{"text":""}`)))
-	rec := httptest.NewRecorder()
-	api.TestRouter().ServeHTTP(rec, req)
-	require.Equal(t, http.StatusBadRequest, rec.Code)
-}
-
-func TestPostInterject_409WhenNotBusy(t *testing.T) {
-	api := newAPI(&fakeCtl{interjectErr: session.ErrNotBusy}, turn.NewStore())
-	req := httptest.NewRequest(http.MethodPost, "/v1/interject", bytes.NewReader([]byte(`{"text":"x"}`)))
-	rec := httptest.NewRecorder()
-	api.TestRouter().ServeHTTP(rec, req)
-	require.Equal(t, http.StatusConflict, rec.Code)
+	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
 func TestGetMessage_404Then200(t *testing.T) {
@@ -191,13 +180,12 @@ func TestPostMessage_HTTPClusterCallbackAccepted(t *testing.T) {
 	require.Equal(t, http.StatusAccepted, rec.Code)
 }
 
-// TestPostMessage_HandoffPreamble_FirstSubmissionOnly verifies the handoff
-// continuation preamble (spec component 3) is prepended to the goal text on
-// this pod's FIRST /v1/messages submission only, and carries the configured
-// handoff key.
-func TestPostMessage_HandoffPreamble_FirstSubmissionOnly(t *testing.T) {
+// TestPostMessage_SubmitsTheGoalTextVerbatim: every pod's turn-0 gets the same
+// render from the operator (contract E.2) - there is no continuation preamble
+// left to prepend, so the goal text reaches Submit unmodified.
+func TestPostMessage_SubmitsTheGoalTextVerbatim(t *testing.T) {
 	ctl := &fakeCtl{submitID: "t"}
-	api := httpapi.New(httpapi.Deps{Ctl: ctl, Store: turn.NewStore(), HandoffKey: "issue-42"})
+	api := httpapi.New(httpapi.Deps{Ctl: ctl, Store: turn.NewStore()})
 
 	body1, _ := json.Marshal(map[string]string{"text": "do the thing"})
 	req1 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body1))
@@ -211,53 +199,43 @@ func TestPostMessage_HandoffPreamble_FirstSubmissionOnly(t *testing.T) {
 	api.TestRouter().ServeHTTP(rec2, req2)
 	require.Equal(t, http.StatusAccepted, rec2.Code)
 
-	require.Len(t, ctl.submittedTexts, 2)
-	want := "Continuation key: issue-42. If you have prior context, call get_handoff " +
-		"with this key before starting, and write_handoff an updated summary before " +
-		"you finish.\n\ndo the thing"
-	require.Equal(t, want, ctl.submittedTexts[0], "first submission must carry the handoff preamble")
-	require.Equal(t, "second goal", ctl.submittedTexts[1], "second submission must NOT carry the preamble")
+	require.Equal(t, []string{"do the thing", "second goal"}, ctl.submittedTexts)
 }
 
-// TestPostMessage_NoHandoffKey_NoPreamble verifies the preamble is absent
-// entirely when CONVERSATION_OBJECT_KEY (HandoffKey) is unset.
-func TestPostMessage_NoHandoffKey_NoPreamble(t *testing.T) {
-	ctl := &fakeCtl{submitID: "t"}
-	api := httpapi.New(httpapi.Deps{Ctl: ctl, Store: turn.NewStore()})
+// TestPostMessage_NoContinuationPreambleOnTheFirstSubmit is the regression
+// guard for the continuation/handoff preamble deletion (task-centric plan
+// Task 4). Contract E.2: every pod's turn-0 gets the SAME render from the
+// operator - there is no resume mode. A preamble that tells the agent to call
+// get_handoff names a tool that no longer exists, against a chat service that
+// no longer exists. CONVERSATION_OBJECT_KEY must have NO effect: it is no
+// longer read anywhere in the wrapper.
+func TestPostMessage_NoContinuationPreambleOnTheFirstSubmit(t *testing.T) {
+	t.Setenv("CONVERSATION_OBJECT_KEY", "some-key") // must have NO effect
+	ctl := &fakeCtl{}
+	api := newAPI(ctl, turn.NewStore())
+	body := `{"text":"<task_context task=\"t1\">...</task_context>","callbackUrl":"http://cb"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	require.Equal(t, []string{`<task_context task="t1">...</task_context>`}, ctl.submittedTexts,
+		"the submitted text is the operator's bundle, verbatim - nothing is prepended")
+	require.NotContains(t, ctl.submittedTexts[0], "Continuation key")
+}
+
+// TestPostMessage_503WhenSessionNotReady: a still-booting session is the one
+// submit failure that IS worth retrying, so it keeps its 503 (unlike the TTL
+// refusal, which is a permanent 410).
+func TestPostMessage_503WhenSessionNotReady(t *testing.T) {
+	ctl := &fakeCtl{submitID: "t", submitErrs: []error{errors.New("session not ready")}}
+	api := newAPI(ctl, turn.NewStore())
 
 	body, _ := json.Marshal(map[string]string{"text": "do the thing"})
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
 	rec := httptest.NewRecorder()
 	api.TestRouter().ServeHTTP(rec, req)
-	require.Equal(t, http.StatusAccepted, rec.Code)
-
-	require.Equal(t, []string{"do the thing"}, ctl.submittedTexts)
-}
-
-// TestPostMessage_HandoffPreamble_SurvivesFailedFirstSubmit verifies that a
-// failed first Submit (e.g. pod still Booting) does not permanently consume
-// the one-shot handoff preamble: the retry must still carry it.
-func TestPostMessage_HandoffPreamble_SurvivesFailedFirstSubmit(t *testing.T) {
-	ctl := &fakeCtl{submitID: "t", submitErrs: []error{errors.New("session not ready")}}
-	api := httpapi.New(httpapi.Deps{Ctl: ctl, Store: turn.NewStore(), HandoffKey: "issue-42"})
-
-	body, _ := json.Marshal(map[string]string{"text": "do the thing"})
-	req1 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
-	rec1 := httptest.NewRecorder()
-	api.TestRouter().ServeHTTP(rec1, req1)
-	require.Equal(t, http.StatusServiceUnavailable, rec1.Code)
-
-	req2 := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
-	rec2 := httptest.NewRecorder()
-	api.TestRouter().ServeHTTP(rec2, req2)
-	require.Equal(t, http.StatusAccepted, rec2.Code)
-
-	require.Len(t, ctl.submittedTexts, 2)
-	want := "Continuation key: issue-42. If you have prior context, call get_handoff " +
-		"with this key before starting, and write_handoff an updated summary before " +
-		"you finish.\n\ndo the thing"
-	require.Equal(t, want, ctl.submittedTexts[0], "failed first submission must still carry the preamble")
-	require.Equal(t, want, ctl.submittedTexts[1], "retry must carry the preamble since the first submit never succeeded")
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
 }
 
 // newAPIWithLog builds an API that writes structured logs to logBuf.
@@ -395,6 +373,27 @@ func TestGetTranscript_Streams(t *testing.T) {
 	require.Equal(t, content, rec.Body.String())
 }
 
+// TestGetSession_ReportsContractVersion verifies GET /v1/session serves
+// contractVersion so the operator can assert it before submitting turn-0
+// (contract G.10), and that no existing Snapshot field was dropped (D-W3).
+func TestGetSession_ReportsContractVersion(t *testing.T) {
+	api := newAPI(&fakeCtl{}, turn.NewStore())
+	req := httptest.NewRequest(http.MethodGet, "/v1/session", nil)
+	rec := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Equal(t, float64(2), got["contractVersion"],
+		"the operator asserts this BEFORE turn-0; an absent field means an old wrapper (contract G.10)")
+
+	// D-W3: the existing fields survive. The operator reads them.
+	for _, k := range []string{"state", "turnsCompleted", "turnsFinished", "model", "repo", "lastActivityAt"} {
+		require.Contains(t, got, k, "GET /v1/session must not lose %q", k)
+	}
+}
+
 // TestInternalRouter_EmitsRequestHandledLog verifies access-log middleware on
 // the internal router (finding 5).
 func TestInternalRouter_EmitsRequestHandledLog(t *testing.T) {
@@ -418,4 +417,47 @@ func TestInternalRouter_EmitsRequestHandledLog(t *testing.T) {
 		}
 	}
 	require.True(t, found, "expected 'request handled' log line from InternalRouter middleware")
+}
+
+// TestPostMessage_410WhenPodTTLExpired: the TTL refusal must be a status the
+// operator can branch on. 410, NOT 409 (which means "a turn is in flight") and
+// NOT 503 (which means "try again shortly"). This pod will never accept another
+// ordinary turn (contract G.5, D-W1).
+func TestPostMessage_410WhenPodTTLExpired(t *testing.T) {
+	api := newAPI(&fakeCtl{submitErr: session.ErrPodTTLExpired}, turn.NewStore())
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"text":"go","callbackUrl":"https://cb/x"}`))
+	rec := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusGone, rec.Code,
+		"a wrapper log line reaches nobody - agent pods are not Loki-scraped. The refusal MUST be a non-2xx the operator can see.")
+	require.Contains(t, rec.Body.String(), "pod ttl expired")
+}
+
+// TestPostMessage_PassesTheHandoffFlagThrough: the operator marks its TTL
+// handoff turn with "handoff":true (contract G.5, wire tag handoff,omitempty);
+// the wrapper admits exactly that one turn past the deadline.
+func TestPostMessage_PassesTheHandoffFlagThrough(t *testing.T) {
+	ctl := &fakeCtl{submitID: "turn-h"}
+	api := newAPI(ctl, turn.NewStore())
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"text":"stop","callbackUrl":"https://cb/x","handoff":true}`))
+	rec := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	require.True(t, ctl.lastHandoff, "the operator marks its TTL handoff turn; the wrapper admits it past the deadline")
+}
+
+// TestPostMessage_OrdinaryTurnCarriesNoHandoffFlag: an ordinary turn's body
+// omits the key entirely (omitempty), and must reach Submit as handoff=false.
+func TestPostMessage_OrdinaryTurnCarriesNoHandoffFlag(t *testing.T) {
+	ctl := &fakeCtl{submitID: "turn-o"}
+	api := newAPI(ctl, turn.NewStore())
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"text":"work","callbackUrl":"https://cb/x"}`))
+	rec := httptest.NewRecorder()
+	api.TestRouter().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	require.False(t, ctl.lastHandoff)
 }

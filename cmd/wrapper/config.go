@@ -37,10 +37,27 @@ type config struct {
 	// env so the wrapper's per-turn token/cost metrics attribute spend to a
 	// Task kind, repo, and project. Empty for values the operator does not set
 	// (e.g. RepoName is empty for project-scoped kinds).
-	Kind                string
-	RepoName            string
-	Project             string
-	TurnTimeoutSeconds  int
+	Kind     string
+	RepoName string
+	Project  string
+	// TaskName is the operator's Task resource name (TATARA_TASK env, contract
+	// G.9), reported back on the turn-complete callback so the operator can
+	// resolve the Task by direct Get instead of a full-namespace List (bug F8).
+	TaskName string
+	// CallbackHMACSecret, when non-empty (CALLBACK_HMAC_SECRET env), is used to
+	// HMAC-SHA256-sign every turn-complete callback POST (bug F7). Delivered via
+	// SecretKeyRef by the operator; empty for deployments that have not
+	// configured the shared secret (signing is then skipped, matching the
+	// operator's verification which is also skipped when its own secret is
+	// unset).
+	CallbackHMACSecret string
+	TurnTimeoutSeconds int
+	// PodTTLSeconds is this pod's total lifetime budget, injected by the operator
+	// from Project.spec.agentPodTTLSeconds (contract G.9). Past the deadline the
+	// wrapper refuses to START an ordinary turn (410 Gone) and admits only the
+	// operator's one handoff turn. 0 disables the bound: a workstation has no
+	// operator to stop it.
+	PodTTLSeconds       int
 	BootTimeoutSeconds  int
 	PushIntervalSeconds int
 	WebhookRetries      int
@@ -75,24 +92,14 @@ type config struct {
 	// project-scoped pods (brainstorm/incident/refine/healthCheck) that need
 	// cross-branch context.
 	FullClone bool
-
-	// ConversationObjectKey is the wrapper's stable-per-issue handoff key
-	// (handoff-continuation design, component 3). Formerly also the S3
-	// conversation-transcript object key (issue #114); the S3 restore/upload
-	// path was removed, but the env name is kept unchanged (CONVERSATION_
-	// OBJECT_KEY) so the operator needs no change. Surfaced to the agent via
-	// the httpapi handoff preamble on this pod's first goal submission.
-	ConversationObjectKey string
-
-	// Native Claude Code OpenTelemetry (cost/token/429 backstop). Both must be
-	// set for the wrapper to enable it: OtelEnabled alone with an empty endpoint
-	// must not turn on telemetry with nowhere to send it.
-	OtelEnabled  bool
-	OtelEndpoint string
 }
 
 func loadConfig(args []string) (config, error) {
 	ti, err := envIntOr("TURN_TIMEOUT_SECONDS", 1800)
+	if err != nil {
+		return config{}, err
+	}
+	pttl, err := envIntOr("AGENT_POD_TTL_SECONDS", 0)
 	if err != nil {
 		return config{}, err
 	}
@@ -109,10 +116,6 @@ func loadConfig(args []string) (config, error) {
 		return config{}, err
 	}
 	fc, err := envBoolOr("TATARA_WORKSPACE_FULL_CLONE", false)
-	if err != nil {
-		return config{}, err
-	}
-	oe, err := envBoolOr("OTEL_ENABLED", false)
 	if err != nil {
 		return config{}, err
 	}
@@ -139,7 +142,10 @@ func loadConfig(args []string) (config, error) {
 		Kind:                envOr("TATARA_KIND", ""),
 		RepoName:            envOr("TATARA_REPO", ""),
 		Project:             envOr("TATARA_PROJECT", ""),
+		TaskName:            envOr("TATARA_TASK", ""),
+		CallbackHMACSecret:  envOr("CALLBACK_HMAC_SECRET", ""),
 		TurnTimeoutSeconds:  ti,
+		PodTTLSeconds:       pttl,
 		BootTimeoutSeconds:  bt,
 		PushIntervalSeconds: pi,
 		WebhookRetries:      wr,
@@ -167,11 +173,6 @@ func loadConfig(args []string) (config, error) {
 		HookConversationFinished: envOr("HOOK_CONVERSATION_FINISHED", ""),
 
 		FullClone: fc,
-
-		ConversationObjectKey: envOr("CONVERSATION_OBJECT_KEY", ""),
-
-		OtelEnabled:  oe,
-		OtelEndpoint: envOr("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 	}
 	if raw := os.Getenv("TATARA_REPOS"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.Repos); err != nil {

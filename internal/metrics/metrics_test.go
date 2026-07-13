@@ -156,3 +156,30 @@ func TestMetrics_TokenCostLabels(t *testing.T) {
 		})
 	}
 }
+
+// TestMetrics_TurnRefusals_Registered asserts the pod-TTL refusal counter is
+// registered and carries a {reason} label: the fleet-wide view of how often
+// pods are cut off mid-work, which is the signal that agentPodTTLSeconds is set
+// too low (the per-refusal signal to the operator is the 410).
+func TestMetrics_TurnRefusals_Registered(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	require.NotNil(t, m.TurnRefusals)
+	m.TurnRefusals.WithLabelValues("pod_ttl_expired").Inc()
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() == "ccw_turn_refusals_total" {
+			require.Len(t, mf.GetMetric(), 1)
+			lbls := map[string]string{}
+			for _, lp := range mf.GetMetric()[0].GetLabel() {
+				lbls[lp.GetName()] = lp.GetValue()
+			}
+			require.Equal(t, "pod_ttl_expired", lbls["reason"])
+			require.Equal(t, float64(1), mf.GetMetric()[0].GetCounter().GetValue())
+			return
+		}
+	}
+	t.Fatal("ccw_turn_refusals_total not found")
+}
