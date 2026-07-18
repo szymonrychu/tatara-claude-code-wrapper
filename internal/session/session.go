@@ -138,13 +138,23 @@ type Manager struct {
 	// deadline: see admit.
 	handoffAdmitted atomic.Bool
 
-	mu               sync.Mutex
-	w                ptyWriter
-	proc             claudeProcess
-	ring             *ringBuffer
-	stopping         bool
-	state            State
-	current          string    // in-flight turn id, "" when idle
+	mu       sync.Mutex
+	w        ptyWriter
+	proc     claudeProcess
+	ring     *ringBuffer
+	stopping bool
+	state    State
+	current  string // in-flight turn id, "" when idle
+	// lastCompleted is the turn id most recently cleared by
+	// clearCurrentLocked. currentTurnID() falls back to it while current is
+	// "" so a transcript line the tailer processes in the brief window
+	// between a turn clearing and the tailer catching up (poll-interval
+	// race, tatara-operator#381 W1) is still attributed to the turn that
+	// produced it, instead of being silently stamped with turnID="" and
+	// dropped by accumulateInternalIssue's turn-change reset. Overwritten by
+	// the NEXT clearCurrentLocked call; never read once a new turn sets
+	// current again (currentTurnID prefers current unconditionally).
+	lastCompleted    string
 	currentStarted   time.Time // original Submit time; basis for TurnDuration metric
 	currentSessionID string    // claude's sessionId for the current turn (from hook); used for correlation
 	timer            *time.Timer
@@ -216,7 +226,10 @@ func (mgr *Manager) StartTailer(ctx context.Context) {
 func (mgr *Manager) currentTurnID() string {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
-	return mgr.current
+	if mgr.current != "" {
+		return mgr.current
+	}
+	return mgr.lastCompleted
 }
 
 // onTailerActivity is the transcript Tailer's per-turn liveness hook. For each
@@ -1183,6 +1196,7 @@ func (mgr *Manager) failTimeout(id string) {
 }
 
 func (mgr *Manager) clearCurrentLocked(next State) {
+	mgr.lastCompleted = mgr.current
 	mgr.current = ""
 	mgr.turnsCompleted++ // all terminal turns (success + failed + timed-out)
 	mgr.state = next
