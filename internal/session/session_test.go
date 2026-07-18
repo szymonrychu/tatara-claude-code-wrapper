@@ -1973,3 +1973,114 @@ func TestSubmit_TTLRefusalIncrementsTheRefusalMetric(t *testing.T) {
 	require.ErrorIs(t, err, session.ErrPodTTLExpired)
 	require.Equal(t, float64(1), refusalCounterValue(t, reg, "pod_ttl_expired"))
 }
+
+// TestDrainInternalIssues_TrailingReportSurvivesTurnClear reproduces
+// tatara-operator#381 (W1): a report_internal_issue call that is the LAST
+// line of a turn's transcript is written to disk before/around the Stop
+// hook POST, but the tailer's Follow goroutine (200ms poll) has not
+// necessarily read it by the time Complete() runs. Complete() clears
+// mgr.current synchronously before returning; DrainInternalIssues is then
+// called (mirroring app.go's finalizeTurn) with the real, non-empty turn id
+// while the tailer is still catching up. Pre-fix, the tailer processes the
+// trailing line with turnID()="" (mgr.current already cleared) and
+// DrainInternalIssues(realID) never matches - the report is silently
+// dropped. Post-fix, currentTurnID's lastCompleted fallback keeps the
+// trailing line attributed to the turn that produced it.
+func TestDrainInternalIssues_TrailingReportSurvivesTurnClear(t *testing.T) {
+	fp := &fakePTY{}
+	m, _ := newMgr(t, fp)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.StartTailer(ctx)
+
+	id, err := m.Submit("hi", "https://cb/x", false)
+	require.NoError(t, err)
+	require.Equal(t, "turn-1", id)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	// The trailing line is ALREADY on disk at the moment Complete() is
+	// called, exactly as it would be in production: claude writes the
+	// report_internal_issue tool_use, then the Stop hook fires. The tailer's
+	// Follow goroutine only starts inside Complete() (first-hook launch,
+	// session.go:1064-1076) so it has read nothing yet.
+	line := `{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-07-19T00:00:00.000Z",` +
+		`"message":{"role":"assistant","content":[{"type":"tool_use","id":"t1",` +
+		`"name":"mcp__tatara__report_internal_issue","input":` +
+		`{"category":"workspace_broken","severity":"error","description":"stuck mid-review"}}],` +
+		`"stop_reason":"tool_use"}}` + "\n"
+	require.NoError(t, os.WriteFile(path, []byte(line), 0o644))
+
+	require.NoError(t, m.Complete(session.HookResult{
+		FinalText: "done", StopReason: "end_turn", TranscriptPath: path,
+	}))
+
+	got := m.DrainInternalIssues(id)
+	require.Len(t, got, 1, "trailing report_internal_issue must survive the turn clearing before the tailer caught up")
+	require.Equal(t, turn.InternalIssueReport{
+		Category: "workspace_broken", Severity: "error", Description: "stuck mid-review",
+	}, got[0])
+}
+
+// TestDrainInternalIssues_MidTurnAttributionUnaffectedByFallback is a
+// regression guard: both a mid-turn report and an end-of-turn report must
+// drain under the correct turn IDs across two sequential turns. The test
+// does not distinguish which tailer read path attributed them (mid-turn vs
+// fallback/CaughtUpTo); it relies on CaughtUpTo to pin attribution.
+func TestDrainInternalIssues_MidTurnAttributionUnaffectedByFallback(t *testing.T) {
+	fp := &fakePTY{}
+	store := turn.NewStore()
+	ids := make(chan string, 2)
+	ids <- "turn-1"
+	ids <- "turn-2"
+	// Set a longer TurnTimeout to avoid timeout races during the test.
+	m := session.New(session.Config{TurnTimeout: 10 * time.Second, SubmitSeq: session.DefaultSubmitSeq},
+		store, metrics.New(prometheus.NewRegistry()),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func() time.Time { return time.Unix(100, 0) },
+		func() string { return <-ids })
+	m.SetWriterForTest(fp)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.StartTailer(ctx)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	require.NoError(t, os.WriteFile(path, nil, 0o644))
+
+	id1, err := m.Submit("hi", "https://cb/x", false)
+	require.NoError(t, err)
+	require.Equal(t, "turn-1", id1)
+	require.NoError(t, m.Complete(session.HookResult{
+		FinalText: "done", StopReason: "end_turn", TranscriptPath: path,
+	})) // starts the real tailer Follow goroutine on the (empty) file
+
+	id2, err := m.Submit("hi again", "https://cb/x", false)
+	require.NoError(t, err)
+	require.Equal(t, "turn-2", id2)
+
+	line := `{"type":"assistant","uuid":"u2","sessionId":"s1","timestamp":"2026-07-19T00:01:00.000Z",` +
+		`"message":{"role":"assistant","content":[{"type":"tool_use","id":"t2",` +
+		`"name":"mcp__tatara__report_internal_issue","input":` +
+		`{"category":"auth","severity":"warn","description":"turn two issue"}}],` +
+		`"stop_reason":"tool_use"}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	_, err = f.WriteString(line)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	require.NoError(t, m.Complete(session.HookResult{
+		FinalText: "done2", StopReason: "end_turn", TranscriptPath: path,
+	}))
+
+	got := m.DrainInternalIssues(id2)
+	require.Len(t, got, 1)
+	require.Equal(t, "turn two issue", got[0].Description)
+
+	// turn-1 reported nothing and must still drain empty (no leakage from
+	// the fallback or from turn-2's report).
+	require.Nil(t, m.DrainInternalIssues(id1))
+}
