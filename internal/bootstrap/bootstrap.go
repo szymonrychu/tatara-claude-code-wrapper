@@ -315,6 +315,10 @@ func Render(p Params, git GitRunner) error {
 		}
 		return err
 	}
+	// Extra project skill sources (fail-open, per-source isolation): installed
+	// after the baked skills so a project source can override a same-named
+	// baked skill. Never errors Render.
+	_ = installExtraSkillSources(p, git)
 	if err := installAgents(p); err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()

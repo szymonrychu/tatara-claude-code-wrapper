@@ -1,6 +1,8 @@
 package bootstrap
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -148,6 +150,121 @@ func cloneSkillsRepo(p Params, git GitRunner) error {
 	}
 	if p.M != nil {
 		p.M.SkillsCloneFailures.Inc()
+	}
+	return nil
+}
+
+// extraSkillSource is one entry of TATARA_EXTRA_SKILL_SOURCES: a Project-scoped
+// extra skill repository the wrapper clones and installs skills from.
+type extraSkillSource struct {
+	Name   string `json:"name"`
+	URL    string `json:"url"`
+	Ref    string `json:"ref"`
+	Subdir string `json:"subdir"`
+}
+
+// parseExtraSkillSources parses the TATARA_EXTRA_SKILL_SOURCES JSON array.
+// Fail-open: returns nil on empty, whitespace-only, or malformed input (never
+// errors the boot).
+func parseExtraSkillSources(raw []byte) []extraSkillSource {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	var out []extraSkillSource
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// cloneExtraSkillSource shallow-clones one extra skill source into dir, using
+// the same SHA-ref-safe init/remote/fetch/checkout sequence as cloneSkillsRepo
+// (so branches, tags, and reachable commit SHAs all work uniformly). Auth
+// reuses the global GIT_TOKEN credential helper already configured by
+// configureGit/cloneSkillsRepo before this runs; no separate credential setup
+// is needed here.
+func cloneExtraSkillSource(git GitRunner, s extraSkillSource, dir string) error {
+	ref := s.Ref
+	if ref == "" {
+		ref = "main"
+	}
+	// Skip when already cloned (pod restart with persistent workspace).
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		return nil
+	}
+	_ = os.RemoveAll(dir)
+	for _, step := range []func() error{
+		func() error { return git("", "init", "-q", dir) },
+		func() error { return git(dir, "remote", "add", "origin", s.URL) },
+		func() error { return git(dir, "fetch", "--depth", "1", "origin", ref) },
+		func() error { return git(dir, "checkout", "-q", "--detach", "FETCH_HEAD") },
+	} {
+		if err := step(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// installExtraSkillSources clones each TATARA_EXTRA_SKILL_SOURCES entry and
+// installs skills from <clone>/<subdir> via installSkillsFromSrc (profiles:
+// gating unchanged). Runs AFTER the baked skills (installSkills) so a project
+// source can override a same-named baked skill. One failing source (bad
+// name/url, clone failure, or install failure) logs WARN, increments the
+// clone-failure counter on a clone failure, and the rest proceed: per-source
+// failure isolation, never fatal. Always returns nil (fail-open).
+func installExtraSkillSources(p Params, git GitRunner) error {
+	sources := parseExtraSkillSources(p.ExtraSkillSources)
+	if len(sources) == 0 {
+		return nil
+	}
+	dst := filepath.Join(p.Workspace, ".claude", "skills")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		if p.Log != nil {
+			p.Log.Warn("extra skill sources: mkdir skills failed", "action", "extra_skills", "error", err)
+		}
+		return nil
+	}
+	base := filepath.Join(p.Workspace, ".extra-skills")
+	total := 0
+	for _, s := range sources {
+		if s.Name == "" || s.URL == "" {
+			if p.Log != nil {
+				p.Log.Warn("extra skill source missing name/url; skipping", "action", "extra_skills")
+			}
+			continue
+		}
+		cloneDir := filepath.Join(base, s.Name)
+		if err := cloneExtraSkillSource(git, s, cloneDir); err != nil {
+			if p.Log != nil {
+				p.Log.Warn("extra skill source clone failed; skipping",
+					"action", "extra_skills", "source", s.Name, "error", err)
+			}
+			if p.M != nil {
+				p.M.SkillsCloneFailures.Inc()
+			}
+			continue
+		}
+		src := cloneDir
+		if s.Subdir != "" {
+			src = filepath.Join(cloneDir, s.Subdir)
+		}
+		n, err := installSkillsFromSrc(src, dst, p)
+		if err != nil {
+			if p.Log != nil {
+				p.Log.Warn("extra skill source install failed; skipping",
+					"action", "extra_skills", "source", s.Name, "error", err)
+			}
+			continue
+		}
+		if p.Log != nil {
+			p.Log.Info("extra skill source installed",
+				"action", "extra_skills", "source", s.Name, "count", n)
+		}
+		total += n
+	}
+	if p.M != nil {
+		p.M.SkillsInstalled.WithLabelValues(p.SkillProfile).Add(float64(total))
 	}
 	return nil
 }
