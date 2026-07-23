@@ -336,6 +336,7 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		MCPOverlayDir:   cfg.MCPOverlayDir,
 		GrafanaMCPURL:   cfg.GrafanaMCPURL,
 		SerenaMCPURL:    cfg.SerenaMCPURL,
+		ExtraMCPServers: cfg.ExtraMCPServers,
 		SkillsSrc:       strings.Split(cfg.SkillsSrcDirs, ":"),
 		SkillProfile:    cfg.SkillProfile,
 		SkillsRepo:      cfg.SkillsRepo,

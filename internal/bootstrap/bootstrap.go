@@ -25,11 +25,16 @@ type Params struct {
 	MCPOverlayDir                   string
 	GrafanaMCPURL                   string
 	SerenaMCPURL                    string
-	SkillsSrc                       []string
-	SkillProfile                    string // TATARA_SKILL_PROFILE; empty = install all
-	SkillsRepo                      string // TATARA_SKILLS_REPO; URL to clone at boot
-	SkillsRef                       string // TATARA_SKILLS_REF; git ref for the clone
-	SkillsCloneDir                  string // directory where the skills repo is cloned
+	// ExtraMCPServers carries TATARA_EXTRA_MCP_SERVERS (Phase 2 contract): a
+	// compact JSON array [{"name","url","type"}] of Project-scoped MCP servers
+	// merged into .mcp.json after the overlay dir and before the platform
+	// servers below, so grafana/serena/tatara always win on a name collision.
+	ExtraMCPServers []byte
+	SkillsSrc       []string
+	SkillProfile    string // TATARA_SKILL_PROFILE; empty = install all
+	SkillsRepo      string // TATARA_SKILLS_REPO; URL to clone at boot
+	SkillsRef       string // TATARA_SKILLS_REF; git ref for the clone
+	SkillsCloneDir  string // directory where the skills repo is cloned
 	// AgentsSrc lists directories whose top-level *.md files are installed
 	// into <workspace>/.claude/agents: the typed subagent definitions shipped
 	// by tatara-agent-skills (explorer/tester/builder/architect, model
