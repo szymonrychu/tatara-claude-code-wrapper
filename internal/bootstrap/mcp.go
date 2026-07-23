@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 )
@@ -43,6 +44,34 @@ func mergeMCP(p Params) error {
 			}
 			for k, v := range frag.MCPServers {
 				merged.MCPServers[k] = v
+			}
+		}
+	}
+	if len(p.ExtraMCPServers) > 0 {
+		reserved := map[string]bool{"tatara": true, "grafana": true, "serena": true}
+		var extras []struct {
+			Name string `json:"name"`
+			URL  string `json:"url"`
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(p.ExtraMCPServers, &extras); err != nil {
+			slog.Warn("mergeMCP: TATARA_EXTRA_MCP_SERVERS is not valid JSON, ignoring", "error", err)
+		} else {
+			for _, e := range extras {
+				if e.Name == "" || e.URL == "" {
+					slog.Warn("mergeMCP: skipping extra MCP server with empty name or url", "name", e.Name)
+					continue
+				}
+				if reserved[e.Name] {
+					slog.Warn("mergeMCP: skipping extra MCP server with reserved name", "name", e.Name)
+					continue
+				}
+				typ := e.Type
+				if typ == "" {
+					typ = "http"
+				}
+				entry, _ := json.Marshal(map[string]string{"type": typ, "url": e.URL})
+				merged.MCPServers[e.Name] = entry
 			}
 		}
 	}
