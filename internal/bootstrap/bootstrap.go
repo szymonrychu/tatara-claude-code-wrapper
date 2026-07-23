@@ -30,11 +30,17 @@ type Params struct {
 	// merged into .mcp.json after the overlay dir and before the platform
 	// servers below, so grafana/serena/tatara always win on a name collision.
 	ExtraMCPServers []byte
-	SkillsSrc       []string
-	SkillProfile    string // TATARA_SKILL_PROFILE; empty = install all
-	SkillsRepo      string // TATARA_SKILLS_REPO; URL to clone at boot
-	SkillsRef       string // TATARA_SKILLS_REF; git ref for the clone
-	SkillsCloneDir  string // directory where the skills repo is cloned
+	// ExtraSkillSources carries TATARA_EXTRA_SKILL_SOURCES: a compact JSON
+	// array [{"name","url","ref","subdir"}] of Project-scoped extra skill
+	// repositories, cloned and installed (per-source failure isolation) after
+	// the baked skills so a project source can override a same-named baked
+	// skill.
+	ExtraSkillSources []byte
+	SkillsSrc         []string
+	SkillProfile      string // TATARA_SKILL_PROFILE; empty = install all
+	SkillsRepo        string // TATARA_SKILLS_REPO; URL to clone at boot
+	SkillsRef         string // TATARA_SKILLS_REF; git ref for the clone
+	SkillsCloneDir    string // directory where the skills repo is cloned
 	// AgentsSrc lists directories whose top-level *.md files are installed
 	// into <workspace>/.claude/agents: the typed subagent definitions shipped
 	// by tatara-agent-skills (explorer/tester/builder/architect, model
@@ -309,6 +315,10 @@ func Render(p Params, git GitRunner) error {
 		}
 		return err
 	}
+	// Extra project skill sources (fail-open, per-source isolation): installed
+	// after the baked skills so a project source can override a same-named
+	// baked skill. Never errors Render.
+	_ = installExtraSkillSources(p, git)
 	if err := installAgents(p); err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()

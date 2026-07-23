@@ -74,13 +74,17 @@ type config struct {
 	// ExtraMCPServers carries TATARA_EXTRA_MCP_SERVERS (Phase 2 contract): a
 	// compact JSON array [{"name","url","type"}] of Project-scoped MCP
 	// servers, passed through opaque to bootstrap.mergeMCP.
-	ExtraMCPServers  []byte
-	SkillsSrcDirs    string // colon-separated source directories
-	SkillProfile     string // TATARA_SKILL_PROFILE; empty = install all (fail-open)
-	SkillsRepo       string // TATARA_SKILLS_REPO; boot-clone URL
-	SkillsRef        string // TATARA_SKILLS_REF; git ref to clone
-	AllowedToolsPath string
-	Repos            []bootstrap.RepoSpec
+	ExtraMCPServers []byte
+	// ExtraSkillSources carries TATARA_EXTRA_SKILL_SOURCES: a compact JSON
+	// array [{"name","url","ref","subdir"}] of Project-scoped extra skill
+	// repositories, passed through opaque to bootstrap.installExtraSkillSources.
+	ExtraSkillSources []byte
+	SkillsSrcDirs     string // colon-separated source directories
+	SkillProfile      string // TATARA_SKILL_PROFILE; empty = install all (fail-open)
+	SkillsRepo        string // TATARA_SKILLS_REPO; boot-clone URL
+	SkillsRef         string // TATARA_SKILLS_REF; git ref to clone
+	AllowedToolsPath  string
+	Repos             []bootstrap.RepoSpec
 
 	// Lifecycle hook commands (set by the operator via HOOK_* env vars). Empty
 	// means the hook is disabled.
@@ -164,6 +168,7 @@ func loadConfig(args []string) (config, error) {
 		GrafanaMCPURL:       os.Getenv("TATARA_GRAFANA_MCP_URL"),
 		SerenaMCPURL:        os.Getenv("TATARA_SERENA_URL"),
 		ExtraMCPServers:     []byte(os.Getenv("TATARA_EXTRA_MCP_SERVERS")),
+		ExtraSkillSources:   []byte(os.Getenv("TATARA_EXTRA_SKILL_SOURCES")),
 		SkillsSrcDirs:       envOr("SKILLS_SRC_DIRS", "/etc/wrapper/skills/skills"),
 		SkillProfile:        os.Getenv("TATARA_SKILL_PROFILE"),
 		SkillsRepo:          envOr("TATARA_SKILLS_REPO", "https://github.com/szymonrychu/tatara-agent-skills"),
