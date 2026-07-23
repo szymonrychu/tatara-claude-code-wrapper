@@ -7,11 +7,18 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+// extraSkillSourceNameRE constrains extraSkillSource.Name before it is ever
+// used to build a filesystem path (filepath.Join(base, Name)). Anything
+// outside [a-z0-9-]+ - in particular "..", "/", and leading "-" - is rejected
+// so os.RemoveAll/clone can never touch a path outside base.
+var extraSkillSourceNameRE = regexp.MustCompile(`^[a-z0-9-]+$`)
 
 // SkillsCloneRetryDelay controls the sleep between clone retry attempts.
 // Override in tests to keep the suite fast.
@@ -209,10 +216,14 @@ func cloneExtraSkillSource(git GitRunner, s extraSkillSource, dir string) error 
 // installExtraSkillSources clones each TATARA_EXTRA_SKILL_SOURCES entry and
 // installs skills from <clone>/<subdir> via installSkillsFromSrc (profiles:
 // gating unchanged). Runs AFTER the baked skills (installSkills) so a project
-// source can override a same-named baked skill. One failing source (bad
-// name/url, clone failure, or install failure) logs WARN, increments the
-// clone-failure counter on a clone failure, and the rest proceed: per-source
-// failure isolation, never fatal. Always returns nil (fail-open).
+// source can override a same-named baked skill. Each source is validated
+// before any filesystem or network use: Name against extraSkillSourceNameRE,
+// Name uniqueness, URL scheme (http/https only), and Subdir containment
+// (rejects absolute paths and "../" escapes). One failing source (bad
+// name/url/subdir, duplicate name, clone failure, or install failure) logs
+// WARN, increments the clone-failure counter on a clone failure, and the
+// rest proceed: per-source failure isolation, never fatal. Always returns
+// nil (fail-open).
 func installExtraSkillSources(p Params, git GitRunner) error {
 	sources := parseExtraSkillSources(p.ExtraSkillSources)
 	if len(sources) == 0 {
@@ -227,10 +238,44 @@ func installExtraSkillSources(p Params, git GitRunner) error {
 	}
 	base := filepath.Join(p.Workspace, ".extra-skills")
 	total := 0
+	seen := make(map[string]bool, len(sources))
 	for _, s := range sources {
 		if s.Name == "" || s.URL == "" {
 			if p.Log != nil {
 				p.Log.Warn("extra skill source missing name/url; skipping", "action", "extra_skills")
+			}
+			continue
+		}
+		// Name gates every filesystem use below (filepath.Join, os.RemoveAll via
+		// cloneExtraSkillSource): reject before any path is built from it.
+		if !extraSkillSourceNameRE.MatchString(s.Name) {
+			if p.Log != nil {
+				p.Log.Warn("extra skill source invalid name; skipping",
+					"action", "extra_skills", "source", s.Name)
+			}
+			continue
+		}
+		if seen[s.Name] {
+			if p.Log != nil {
+				p.Log.Warn("duplicate extra skill source name; skipping",
+					"action", "extra_skills", "source", s.Name)
+			}
+			continue
+		}
+		seen[s.Name] = true
+		if !strings.HasPrefix(s.URL, "https://") && !strings.HasPrefix(s.URL, "http://") {
+			if p.Log != nil {
+				p.Log.Warn("extra skill source invalid url; skipping",
+					"action", "extra_skills", "source", s.Name)
+			}
+			continue
+		}
+		// Subdir must stay inside cloneDir: reject absolute paths and any
+		// cleaned form that escapes via "..", before it is ever joined in.
+		if s.Subdir != "" && (filepath.IsAbs(s.Subdir) || strings.HasPrefix(filepath.Clean(s.Subdir), "..")) {
+			if p.Log != nil {
+				p.Log.Warn("extra skill source invalid subdir; skipping",
+					"action", "extra_skills", "source", s.Name)
 			}
 			continue
 		}

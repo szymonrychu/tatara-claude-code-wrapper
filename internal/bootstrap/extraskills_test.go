@@ -25,9 +25,9 @@ func TestParseExtraSkillSources(t *testing.T) {
 	}{
 		{
 			name:  "valid JSON array",
-			input: []byte(`[{"name":"mtg-decks","url":"https://github.com/example/mtg-decks","ref":"main","subdir":".claude/skills"}]`),
+			input: []byte(`[{"name":"example-skills","url":"https://x/example-skills","ref":"main","subdir":".claude/skills"}]`),
 			want: []extraSkillSource{
-				{Name: "mtg-decks", URL: "https://github.com/example/mtg-decks", Ref: "main", Subdir: ".claude/skills"},
+				{Name: "example-skills", URL: "https://x/example-skills", Ref: "main", Subdir: ".claude/skills"},
 			},
 		},
 		{name: "nil input", input: nil, want: nil},
@@ -52,7 +52,7 @@ func TestParseExtraSkillSources(t *testing.T) {
 func TestInstallExtraSkillSources_InstallsFromSubdir(t *testing.T) {
 	ws := t.TempDir()
 	sources := []extraSkillSource{
-		{Name: "mtg-decks", URL: "https://github.com/example/mtg-decks", Ref: "main", Subdir: ".claude/skills"},
+		{Name: "example-skills", URL: "https://x/example-skills", Ref: "main", Subdir: ".claude/skills"},
 	}
 	raw, err := json.Marshal(sources)
 	require.NoError(t, err)
@@ -62,10 +62,10 @@ func TestInstallExtraSkillSources_InstallsFromSubdir(t *testing.T) {
 	// installSkillsFromSrc has something real to walk.
 	stubGit := func(dir string, args ...string) error {
 		if len(args) > 0 && args[0] == "checkout" {
-			skillDir := filepath.Join(dir, ".claude", "skills", "build-deck")
+			skillDir := filepath.Join(dir, ".claude", "skills", "build-thing")
 			require.NoError(t, os.MkdirAll(skillDir, 0o755))
 			require.NoError(t, os.WriteFile(filepath.Join(skillDir, "SKILL.md"),
-				[]byte("---\nname: build-deck\n---\n# body"), 0o644))
+				[]byte("---\nname: build-thing\n---\n# body"), 0o644))
 		}
 		return nil
 	}
@@ -76,7 +76,7 @@ func TestInstallExtraSkillSources_InstallsFromSubdir(t *testing.T) {
 	}
 	require.NoError(t, installExtraSkillSources(p, stubGit))
 
-	require.FileExists(t, filepath.Join(ws, ".claude", "skills", "build-deck", "SKILL.md"))
+	require.FileExists(t, filepath.Join(ws, ".claude", "skills", "build-thing", "SKILL.md"))
 }
 
 // TestInstallExtraSkillSources_PerSourceFailureIsolation asserts that one
@@ -133,4 +133,151 @@ func TestInstallExtraSkillSources_PerSourceFailureIsolation(t *testing.T) {
 		}
 	}
 	require.Equal(t, float64(1), failCount, "bad-source clone failure must be counted once")
+}
+
+// TestInstallExtraSkillSources_RejectsTraversalName asserts that a Name
+// containing path-traversal segments is rejected by the ^[a-z0-9-]+$ check
+// before any filesystem path is built from it or git is invoked - so
+// os.RemoveAll/clone can never touch a path outside the extra-skills base.
+func TestInstallExtraSkillSources_RejectsTraversalName(t *testing.T) {
+	ws := t.TempDir()
+	sources := []extraSkillSource{
+		{Name: "../escape", URL: "https://x/escape", Ref: "main"},
+	}
+	raw, err := json.Marshal(sources)
+	require.NoError(t, err)
+
+	gitCalls := 0
+	stubGit := func(dir string, args ...string) error {
+		gitCalls++
+		return nil
+	}
+
+	var logBuf strings.Builder
+	log := slog.New(slog.NewTextHandler(&logBuf, nil))
+	p := Params{
+		Workspace:         ws,
+		ExtraSkillSources: raw,
+		Log:               log,
+	}
+	require.NoError(t, installExtraSkillSources(p, stubGit))
+
+	require.Equal(t, 0, gitCalls, "invalid name must be rejected before any git invocation")
+	require.NoDirExists(t, filepath.Join(ws, "escape"))
+	require.Contains(t, logBuf.String(), "extra skill source invalid name; skipping")
+}
+
+// TestInstallExtraSkillSources_RejectsUnsafeSubdir asserts that a Subdir
+// which is absolute, or whose filepath.Clean form starts with "..", is
+// rejected before it is joined onto cloneDir (which would let it escape the
+// clone).
+func TestInstallExtraSkillSources_RejectsUnsafeSubdir(t *testing.T) {
+	cases := []struct {
+		name   string
+		subdir string
+	}{
+		{"absolute", "/etc"},
+		{"traversal", "../../etc"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			ws := t.TempDir()
+			sources := []extraSkillSource{
+				{Name: "example-skills", URL: "https://x/example-skills", Ref: "main", Subdir: tc.subdir},
+			}
+			raw, err := json.Marshal(sources)
+			require.NoError(t, err)
+
+			gitCalls := 0
+			stubGit := func(dir string, args ...string) error {
+				gitCalls++
+				return nil
+			}
+
+			var logBuf strings.Builder
+			log := slog.New(slog.NewTextHandler(&logBuf, nil))
+			p := Params{
+				Workspace:         ws,
+				ExtraSkillSources: raw,
+				Log:               log,
+			}
+			require.NoError(t, installExtraSkillSources(p, stubGit))
+
+			require.Equal(t, 0, gitCalls, "unsafe subdir must be rejected before cloning")
+			require.Contains(t, logBuf.String(), "extra skill source invalid subdir; skipping")
+		})
+	}
+}
+
+// TestInstallExtraSkillSources_RejectsNonHTTPURL asserts that only http(s)
+// URLs are accepted, blocking ext:: transports, file:// URLs, and
+// leading-dash strings that git could otherwise interpret as flags.
+func TestInstallExtraSkillSources_RejectsNonHTTPURL(t *testing.T) {
+	cases := []string{"ext::sh -c 'true'", "file:///etc/passwd", "-oProxyCommand=x"}
+	for _, url := range cases {
+		t.Run(url, func(t *testing.T) {
+			ws := t.TempDir()
+			sources := []extraSkillSource{
+				{Name: "example-skills", URL: url, Ref: "main"},
+			}
+			raw, err := json.Marshal(sources)
+			require.NoError(t, err)
+
+			gitCalls := 0
+			stubGit := func(dir string, args ...string) error {
+				gitCalls++
+				return nil
+			}
+
+			var logBuf strings.Builder
+			log := slog.New(slog.NewTextHandler(&logBuf, nil))
+			p := Params{
+				Workspace:         ws,
+				ExtraSkillSources: raw,
+				Log:               log,
+			}
+			require.NoError(t, installExtraSkillSources(p, stubGit))
+
+			require.Equal(t, 0, gitCalls, "non-http(s) URL must be rejected before any git invocation")
+			require.Contains(t, logBuf.String(), "extra skill source invalid url; skipping")
+		})
+	}
+}
+
+// TestInstallExtraSkillSources_SkipsDuplicateName asserts that a second
+// source entry reusing an earlier Name is skipped (and never cloned) while
+// the first occurrence still installs normally.
+func TestInstallExtraSkillSources_SkipsDuplicateName(t *testing.T) {
+	ws := t.TempDir()
+	sources := []extraSkillSource{
+		{Name: "example-skills", URL: "https://x/example-skills", Ref: "main", Subdir: "skills"},
+		{Name: "example-skills", URL: "https://x/example-skills-2", Ref: "main", Subdir: "skills"},
+	}
+	raw, err := json.Marshal(sources)
+	require.NoError(t, err)
+
+	clones := 0
+	stubGit := func(dir string, args ...string) error {
+		if len(args) > 0 && args[0] == "checkout" {
+			clones++
+			skillDir := filepath.Join(dir, "skills", fmt.Sprintf("skill-%d", clones))
+			require.NoError(t, os.MkdirAll(skillDir, 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(skillDir, "SKILL.md"),
+				[]byte("---\nname: skill\n---\n# body"), 0o644))
+		}
+		return nil
+	}
+
+	var logBuf strings.Builder
+	log := slog.New(slog.NewTextHandler(&logBuf, nil))
+	p := Params{
+		Workspace:         ws,
+		ExtraSkillSources: raw,
+		Log:               log,
+	}
+	require.NoError(t, installExtraSkillSources(p, stubGit))
+
+	require.Equal(t, 1, clones, "duplicate-named entry must be skipped before cloning")
+	require.Contains(t, logBuf.String(), "duplicate extra skill source name; skipping")
 }
