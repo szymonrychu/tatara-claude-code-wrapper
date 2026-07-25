@@ -10,7 +10,11 @@ import (
 
 // InstallHooks runs `mise install` and `pre-commit install` in each cloned
 // repo directory. It is best-effort: failures are logged but never abort
-// the wrapper startup (a repo may lack .pre-commit-config.yaml or mise tasks).
+// the wrapper startup (a repo may lack mise tasks). pre-commit is installed
+// with --allow-missing-config so the installed hook is a no-op at commit
+// time in repos that lack .pre-commit-config.yaml, instead of failing every
+// commit; a repo that later gains a config starts being checked without any
+// re-bootstrap.
 //
 // Directory resolution mirrors Render:
 //   - When repos is non-empty: workspace/<namespacePath(r.URL)> for each entry.
@@ -20,7 +24,7 @@ func InstallHooks(workspace string, repos []RepoSpec, repoURL string, cmd CmdRun
 	dirs := repoDirs(workspace, repos, repoURL)
 	for _, dir := range dirs {
 		runHookInstall(dir, "mise", "mise", []string{"install"}, cmd, log, m)
-		runHookInstall(dir, "mise", "pre-commit", []string{"exec", "--", "pre-commit", "install", "--hook-type", "pre-commit", "--hook-type", "pre-push"}, cmd, log, m)
+		runHookInstall(dir, "mise", "pre-commit", []string{"exec", "--", "pre-commit", "install", "--hook-type", "pre-commit", "--hook-type", "pre-push", "--allow-missing-config"}, cmd, log, m)
 	}
 }
 

@@ -19,6 +19,8 @@ import (
 // mise exec -- pre-commit install ... in the repo's namespace subdir
 // (workspace/<owner>/<repo>) when repos is empty and repoURL is set.
 // pre-commit is invoked via mise exec so mise's shim path is not required.
+// --allow-missing-config makes the installed hook a no-op at commit time in
+// repos without .pre-commit-config.yaml, instead of failing every commit.
 func TestInstallHooks_SingleRepo(t *testing.T) {
 	type call struct {
 		dir  string
@@ -46,7 +48,7 @@ func TestInstallHooks_SingleRepo(t *testing.T) {
 	pcCall := calls[1]
 	require.Equal(t, repoDir, pcCall.dir, "hooks must install in the repo namespace subdir, not the workspace root")
 	require.Equal(t, "mise", pcCall.name, "pre-commit must be invoked via mise exec")
-	require.Equal(t, []string{"exec", "--", "pre-commit", "install", "--hook-type", "pre-commit", "--hook-type", "pre-push"}, pcCall.args)
+	require.Equal(t, []string{"exec", "--", "pre-commit", "install", "--hook-type", "pre-commit", "--hook-type", "pre-push", "--allow-missing-config"}, pcCall.args)
 }
 
 // TestInstallHooks_MultiRepo asserts that InstallHooks calls mise+pre-commit
