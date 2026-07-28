@@ -1,7 +1,7 @@
 min_version = "2026.6.3"
 
 [tools]
-go = "1.25.0"
+go = "1.26.3"
 node = "22"
 golangci-lint = "2.12.2"
 helm = "4.2.1"
