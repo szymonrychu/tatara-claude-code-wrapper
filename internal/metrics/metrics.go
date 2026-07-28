@@ -39,8 +39,8 @@ type Metrics struct {
 	TurnRefusals *prometheus.CounterVec // labels: reason
 
 	// Outcome-rejection re-prompt counter (rule 13): a critical outcome tool
-	// (decline_implementation/already_done) the operator rejected, surfaced back
-	// to the agent for correction instead of finishing the turn silently.
+	// (submit_outcome) the operator rejected, surfaced back to the agent for
+	// correction instead of finishing the turn silently.
 	OutcomeRepromptTotal *prometheus.CounterVec // labels: tool, result=reprompted|budget_exhausted
 
 	// Bootstrap render counter (rule 13: per-step observability).

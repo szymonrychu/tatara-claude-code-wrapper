@@ -45,10 +45,10 @@ type app struct {
 	// bounded so a slow hook cannot stall teardown. Nil is a safe no-op.
 	finishHook func(context.Context)
 	// repromptMu guards outcomeReprompts, the per-pod count of times a rejected
-	// critical-outcome MCP tool call (decline_implementation/already_done) was
-	// surfaced back to the agent via a re-prompt instead of finishing the turn
-	// silently (Defect C). Capped at maxOutcomeReprompts so a perpetually-failing
-	// agent still reaches the operator's empty-retry cap rather than looping here.
+	// critical-outcome MCP tool call (submit_outcome) was surfaced back to the
+	// agent via a re-prompt instead of finishing the turn silently (Defect C).
+	// Capped at maxOutcomeReprompts so a perpetually-failing agent still reaches
+	// the operator's empty-retry cap rather than looping here.
 	repromptMu       sync.Mutex
 	outcomeReprompts int
 	// submitFn is the turn-submit primitive reprompt() uses; production wires it
@@ -219,9 +219,9 @@ func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log
 		}
 	}
 
-	// Defect C: a critical outcome tool (decline_implementation/already_done)
-	// the operator rejected (e.g. blank reason -> 400) shows up in the turn
-	// transcript as an is_error tool_result. Rather than let the turn finish
+	// Defect C: a critical outcome tool (submit_outcome) the operator rejected
+	// (e.g. blank reason -> 400) shows up in the turn transcript as an
+	// is_error tool_result. Rather than let the turn finish
 	// silently (which the operator misreads as "refused-no-explanation"),
 	// re-prompt the agent to retry with a non-blank reason, and skip THIS
 	// turn's callback - the re-prompted turn delivers its own. Bounded by

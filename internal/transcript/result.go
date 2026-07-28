@@ -198,9 +198,14 @@ func isJSONString(raw json.RawMessage) bool {
 // operator must be propagated back to the agent (a silently dropped decline is
 // what produced the false "refused-no-explanation" park). Matched on the bare
 // tool name after stripping any MCP namespace prefix (mcp__<server>__<name>).
+//
+// It named decline_implementation and already_done until 2026-07-28. Both were
+// retired from tatara-cli (asserted gone at
+// tatara-cli/internal/mcp/tools_test.go:155-156), so the whole re-prompt path
+// was dead. submit_outcome is the tool that actually terminates a Task and the
+// only one whose rejection the agent must see.
 var criticalOutcomeTools = map[string]bool{
-	"decline_implementation": true,
-	"already_done":           true,
+	"submit_outcome": true,
 }
 
 // bareToolName strips an MCP namespace prefix ("mcp__tatara__decline_implementation"
@@ -231,10 +236,10 @@ type outcomeLine struct {
 }
 
 // FailedCriticalOutcome scans the JSONL transcript at path for a critical-outcome
-// MCP tool call (decline_implementation / already_done, under any MCP namespace
-// prefix) whose tool_result came back is_error:true. It returns the bare tool
-// name, the operator's error text, and found=true on a hit. found=false (nil
-// error) is the common no-failure case. A later non-error result for the same
+// MCP tool call (submit_outcome, under any MCP namespace prefix) whose
+// tool_result came back is_error:true. It returns the bare tool name, the
+// operator's error text, and found=true on a hit. found=false (nil error) is
+// the common no-failure case. A later non-error result for the same
 // tool_use_id supersedes an earlier failure (the agent already corrected).
 func FailedCriticalOutcome(path string) (tool, errText string, found bool, err error) {
 	f, oerr := os.Open(path)
