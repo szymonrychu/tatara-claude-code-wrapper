@@ -7,8 +7,26 @@ on:
     branches: [main]
 
 jobs:
+  # Fails FIRST, before any slower job spends compute: a PENDING- pin means
+  # tatara-cli (Task 11) or tatara-agent-skills (Task 14) has not published
+  # the real tag yet. release.yml cuts the semver git tag BEFORE it builds and
+  # pushes the image, so merging with a sentinel still in place would produce
+  # a published tag with no image and no chart behind it - a dangling release
+  # someone has to clean up by hand.
+  pin-guard:
+    runs-on: tatara-claude-code-wrapper
+    steps:
+      - uses: actions/checkout@v4
+      - name: guard against unresolved placeholder pins
+        run: |
+          if grep -n "PENDING-" Dockerfile Makefile .github/ci/build.sh; then
+            echo "unresolved PENDING- placeholder pin(s) found above (TATARA_CLI_VERSION / TATARA_SKILLS_REF) - replace with the real published tag before merging"
+            exit 1
+          fi
+
   secscan:
     runs-on: tatara-claude-code-wrapper
+    needs: [pin-guard]
     steps:
       - uses: actions/checkout@v4
       - name: gitleaks
@@ -19,6 +37,7 @@ jobs:
 
   lint:
     runs-on: tatara-claude-code-wrapper
+    needs: [pin-guard]
     steps:
       - uses: actions/checkout@v4
       - name: build tools
@@ -30,6 +49,7 @@ jobs:
 
   test:
     runs-on: tatara-claude-code-wrapper
+    needs: [pin-guard]
     steps:
       - uses: actions/checkout@v4
       - name: build tools
