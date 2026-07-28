@@ -24,11 +24,18 @@ BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # TATARA_CLI_VERSION pins the cli SHA baked into the image; keep in sync with
 # Dockerfile ARG default and Makefile default.  Use the short SHA published by
 # tatara-cli CI (both SHORT_SHA and VERSION tags are pushed on every main merge).
-TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-v1.6.0}"
+# PENDING-TASK-11-CONTRACT-V3-TAG is a placeholder, not a real tag: it must be
+# replaced with the tatara-cli tag that ships ContractVersion=3 (Task 11)
+# before this pin is ever used to build/push an image. A stale real-looking
+# tag here would silently bake the old cli and ship ContractVersion=2.
+TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-PENDING-TASK-11-CONTRACT-V3-TAG}"
 # TATARA_SKILLS_REF pins the skills plugin ref baked as the runtime ENV default;
 # keep in sync with the Dockerfile ARG default and Makefile default. Rewritten by
 # the skills->wrapper cd-release bump.
-TATARA_SKILLS_REF="${TATARA_SKILLS_REF:-v0.1.0}"
+# PENDING-TASK-14-CONTRACT-V3-TAG is a placeholder, not a real tag: it must be
+# replaced with the tatara-agent-skills tag that ships the ContractVersion=3
+# skill changes (Task 14) before this pin is ever used to build/push an image.
+TATARA_SKILLS_REF="${TATARA_SKILLS_REF:-PENDING-TASK-14-CONTRACT-V3-TAG}"
 DEST="harbor.szymonrichert.pl/containers/${REPO}"
 
 : "${GITHUB_TOKEN:?GITHUB_TOKEN required}"
