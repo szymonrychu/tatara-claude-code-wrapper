@@ -62,7 +62,7 @@ func TestCommitAndPush_UsesNoVerify(t *testing.T) {
 		return nil
 	}
 
-	pushed, err := bootstrap.CommitAndPush("/tmp/dir", "feat/x", "tatara agent: feat/x", fakeGit)
+	pushed, err := bootstrap.CommitAndPush("/tmp/dir", "feat/x", "tatara agent: feat/x", fakeGit, nil, nil)
 	require.NoError(t, err)
 	require.True(t, pushed, "dirty tree must report pushed=true")
 
@@ -95,7 +95,7 @@ func TestCommitAndPushAll_SkipsEmptyNamespace(t *testing.T) {
 		{Name: "bad-empty", URL: ""},                   // namespacePath returns ""
 		{Name: "bad-host", URL: "https://github.com/"}, // single-segment -> ""
 	}
-	pushedRepos, err := bootstrap.CommitAndPushAll("/tmp/ws", repos, "feat/x", "msg", fakeGit)
+	pushedRepos, err := bootstrap.CommitAndPushAll("/tmp/ws", repos, "feat/x", "msg", fakeGit, nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, []string{"good"}, pushedRepos, "only the valid-namespace repo must be reported pushed")
 
@@ -150,7 +150,7 @@ func TestCommitAndPush_CleanTree_NoPush(t *testing.T) {
 		return nil // all succeed, including diff -> clean
 	}
 
-	pushed, err := bootstrap.CommitAndPush("/tmp/dir", "feat/x", "msg", fakeGit)
+	pushed, err := bootstrap.CommitAndPush("/tmp/dir", "feat/x", "msg", fakeGit, nil, nil)
 	require.NoError(t, err)
 	require.False(t, pushed, "clean tree must report pushed=false")
 
@@ -182,7 +182,7 @@ func TestCommitAndPushAll_ReturnsOnlyDirtyRepos(t *testing.T) {
 		{Name: "dirty", URL: "https://github.com/owner/dirtyrepo"},
 		{Name: "clean", URL: "https://github.com/owner/cleanrepo"},
 	}
-	pushed, err := bootstrap.CommitAndPushAll("/tmp/ws", repos, "feat/x", "msg", fakeGit)
+	pushed, err := bootstrap.CommitAndPushAll("/tmp/ws", repos, "feat/x", "msg", fakeGit, nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, []string{"dirty"}, pushed)
 }
