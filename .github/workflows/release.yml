@@ -124,5 +124,10 @@ jobs:
                 "file": "values/project-infrastructure/common.yaml",
                 "pattern": "^(\\s*image: )harbor\\.szymonrichert\\.pl/containers/tatara-claude-code-wrapper:.*$",
                 "value_template": "\\1harbor.szymonrichert.pl/containers/tatara-claude-code-wrapper:{{version}}"
+              },
+              {
+                "file": "values/project-mtg/common.yaml",
+                "pattern": "^(\\s*image: )harbor\\.szymonrichert\\.pl/containers/tatara-claude-code-wrapper:.*$",
+                "value_template": "\\1harbor.szymonrichert.pl/containers/tatara-claude-code-wrapper:{{version}}"
               }
             ]
