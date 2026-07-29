@@ -13,6 +13,13 @@ jobs:
   # pushes the image, so merging with a sentinel still in place would produce
   # a published tag with no image and no chart behind it - a dangling release
   # someone has to clean up by hand.
+  #
+  # This stays a separate local job (not a ci-shared.yml input) because the
+  # reusable workflow's job graph is opaque to the caller: there is no way to
+  # inject a `needs: [pin-guard]` into ci-shared's own secscan/lint/test jobs.
+  # Gating the whole `ci:` call job below on pin-guard is the equivalent: it
+  # already blocks secscan/lint/test (and transitively build/smoke) exactly
+  # as the pre-adoption per-job needs did.
   pin-guard:
     runs-on: tatara-claude-code-wrapper
     steps:
@@ -24,67 +31,20 @@ jobs:
             exit 1
           fi
 
-  secscan:
-    runs-on: tatara-claude-code-wrapper
+  ci:
     needs: [pin-guard]
-    steps:
-      - uses: actions/checkout@v4
-      - name: gitleaks
-        run: |
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz" \
-            | tar -xzf - gitleaks
-          ./gitleaks detect --source . --no-git --redact --verbose
-
-  lint:
-    runs-on: tatara-claude-code-wrapper
-    needs: [pin-guard]
-    steps:
-      - uses: actions/checkout@v4
-      - name: build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
-      - uses: jdx/mise-action@v2
-        with:
-          cache: true
-      - run: pre-commit run --all-files
-
-  test:
-    runs-on: tatara-claude-code-wrapper
-    needs: [pin-guard]
-    steps:
-      - uses: actions/checkout@v4
-      - name: build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
-      - uses: jdx/mise-action@v2
-        with:
-          cache: true
-      - run: mise run test
-
-  build:
-    runs-on: tatara-claude-code-wrapper
-    needs: [secscan, lint, test]
-    steps:
-      - uses: actions/checkout@v4
-      - name: build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
-      - uses: jdx/mise-action@v2
-        with:
-          cache: true
-      - run: mise run build
-
-  smoke:
-    runs-on: tatara-claude-code-wrapper
-    needs: [build]
-    steps:
-      - uses: actions/checkout@v4
-      - name: build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
-      - uses: jdx/mise-action@v2
-        with:
-          cache: true
-      - name: smoke
-        run: |
-          mise run build
-          ./bin/wrapper --help || true
+    uses: szymonrychu/tatara-operator/.github/workflows/ci-shared.yml@v1.36.1
+    with:
+      runner-label: tatara-claude-code-wrapper
+      smoke-binary: ./bin/wrapper
+      build-needs-cgo: true
+      # enable-image MUST stay false: this repo deliberately dropped its
+      # per-push image job (see NOTE below) so it is never double-built. The
+      # shared `image` job has no gate to opt out of on push, so leaving this
+      # true would silently reintroduce the double-publish this repo already
+      # fixed once.
+      enable-image: false
+    secrets: inherit
 
 # NOTE: image + chart publish is NOT here. On a green push-to-main run, the
 # `release` workflow (workflow_run gated on this `ci` run) cuts the semver tag,
