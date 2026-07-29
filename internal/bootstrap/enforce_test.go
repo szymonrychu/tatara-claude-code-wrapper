@@ -121,7 +121,7 @@ func TestCommitAndPushAll_PushesEachRepoOnItsNamespaceDir(t *testing.T) {
 		{Name: "tatara-cli", URL: "https://github.com/szymonrychu/tatara-cli.git"},
 		{Name: "helmfile", URL: "https://gitlab.com/szymonrychu/infra/helmfile.git"},
 	}
-	_, err := bootstrap.CommitAndPushAll("/ws", repos, "tatara/task-x", "msg", git)
+	_, err := bootstrap.CommitAndPushAll("/ws", repos, "tatara/task-x", "msg", git, nil, nil)
 	require.NoError(t, err)
 	var s []string
 	for _, c := range calls {
@@ -142,7 +142,7 @@ func TestCommitAndPush_CommitsWhenDirtyThenPushes(t *testing.T) {
 		}
 		return nil
 	}
-	_, cerr := bootstrap.CommitAndPush("/repo", "tatara/task-abc", "agent work", git)
+	_, cerr := bootstrap.CommitAndPush("/repo", "tatara/task-abc", "agent work", git, nil, nil)
 	require.NoError(t, cerr)
 
 	var all []string
@@ -166,7 +166,7 @@ func TestCommitAndPush_SkipsCommitWhenClean(t *testing.T) {
 		}
 		return nil // diff --cached --quiet returns nil -> nothing staged
 	}
-	_, serr := bootstrap.CommitAndPush("/repo", "b", "m", git)
+	_, serr := bootstrap.CommitAndPush("/repo", "b", "m", git, nil, nil)
 	require.NoError(t, serr)
 	require.False(t, committed, "must not commit when nothing is staged")
 	require.False(t, pushed, "must not push on a clean tree (no empty branch created)")
