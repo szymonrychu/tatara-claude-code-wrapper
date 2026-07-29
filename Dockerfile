@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1.7
 
-ARG GO_VERSION=1.25
+# Must satisfy go.mod's `go` directive (and match .mise.toml's go pin): the
+# builder sets GOTOOLCHAIN=local, so a builder older than go.mod fails
+# `go mod download` outright rather than fetching a newer toolchain.
+ARG GO_VERSION=1.26.3
 ARG NODE_VERSION=22
 # Pinned for reproducible builds. Bumped by .github/workflows/refresh-claude-code.yml
 # (daily npm check -> semver:patch auto-merge PR -> release rebuilds this layer).
