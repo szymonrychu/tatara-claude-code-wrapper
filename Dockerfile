@@ -5,20 +5,17 @@ ARG NODE_VERSION=22
 # Pinned for reproducible builds. Bumped by .github/workflows/refresh-claude-code.yml
 # (daily npm check -> semver:patch auto-merge PR -> release rebuilds this layer).
 ARG CLAUDE_CODE_VERSION=2.1.201
-# PLACEHOLDER - not a real tag. This pin must move to the tatara-cli tag that
-# ships ContractVersion=3 (Task 11) before this PR merges; that tag does not
-# exist yet. The controller fills this in at merge time. Do not build the
-# image against this placeholder.
-ARG TATARA_CLI_VERSION=PENDING-TASK-11-CONTRACT-V3-TAG
+# v1.7.0 is the tatara-cli tag that ships ContractVersion=3. Anything older
+# reports ContractVersion=2 and the operator refuses the pod at pod-ready,
+# before turn 0.
+ARG TATARA_CLI_VERSION=v1.7.0
 # Skills plugin ref the wrapper boot-clones at runtime. Pinned to a semver tag so
 # the skills->wrapper cd-release bump can rewrite this line (mirrors
 # TATARA_CLI_VERSION). The Go default (cmd/wrapper/config.go) stays "main" for
 # local dev; in the image this ENV pins it.
-# PLACEHOLDER - not a real tag. This pin must move to the tatara-agent-skills
-# tag that ships the ContractVersion=3 skill changes (Task 14) before this PR
-# merges; that tag does not exist yet. The controller fills this in at merge
-# time. Do not build the image against this placeholder.
-ARG TATARA_SKILLS_REF=PENDING-TASK-14-CONTRACT-V3-TAG
+# v1.8.0 is the tatara-agent-skills tag that ships the agent-judged approval
+# gate instructions. An older ref teaches the deleted wordlist contract.
+ARG TATARA_SKILLS_REF=v1.8.0
 # renovate: repository=jdx/mise
 ARG MISE_VERSION=v2026.6.3
 

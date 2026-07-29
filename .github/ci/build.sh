@@ -24,18 +24,16 @@ BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # TATARA_CLI_VERSION pins the cli SHA baked into the image; keep in sync with
 # Dockerfile ARG default and Makefile default.  Use the short SHA published by
 # tatara-cli CI (both SHORT_SHA and VERSION tags are pushed on every main merge).
-# PENDING-TASK-11-CONTRACT-V3-TAG is a placeholder, not a real tag: it must be
-# replaced with the tatara-cli tag that ships ContractVersion=3 (Task 11)
-# before this pin is ever used to build/push an image. A stale real-looking
-# tag here would silently bake the old cli and ship ContractVersion=2.
-TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-PENDING-TASK-11-CONTRACT-V3-TAG}"
+# v1.7.0 is the tatara-cli tag that ships ContractVersion=3. Keep this in step
+# with the operator: a cli older than v1.7.0 reports ContractVersion=2 and the
+# operator refuses the pod at pod-ready.
+TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-v1.7.0}"
 # TATARA_SKILLS_REF pins the skills plugin ref baked as the runtime ENV default;
 # keep in sync with the Dockerfile ARG default and Makefile default. Rewritten by
 # the skills->wrapper cd-release bump.
-# PENDING-TASK-14-CONTRACT-V3-TAG is a placeholder, not a real tag: it must be
-# replaced with the tatara-agent-skills tag that ships the ContractVersion=3
-# skill changes (Task 14) before this pin is ever used to build/push an image.
-TATARA_SKILLS_REF="${TATARA_SKILLS_REF:-PENDING-TASK-14-CONTRACT-V3-TAG}"
+# v1.8.0 is the tatara-agent-skills tag that ships the agent-judged approval
+# gate instructions. An older ref teaches the deleted wordlist contract.
+TATARA_SKILLS_REF="${TATARA_SKILLS_REF:-v1.8.0}"
 DEST="harbor.szymonrichert.pl/containers/${REPO}"
 
 : "${GITHUB_TOKEN:?GITHUB_TOKEN required}"
