@@ -167,7 +167,7 @@ func TestLastAssistant_FromRealTranscript(t *testing.T) {
 	_ = usage
 }
 
-// TestFailedCriticalOutcome covers the rejected-decline detection that the
+// TestFailedCriticalOutcome covers the rejected-outcome detection that the
 // wrapper uses to re-prompt the agent instead of finishing a turn silently.
 func TestFailedCriticalOutcome(t *testing.T) {
 	tests := []struct {
@@ -178,29 +178,19 @@ func TestFailedCriticalOutcome(t *testing.T) {
 		wantFound  bool
 	}{
 		{
-			name: "rejected decline_implementation",
+			name: "rejected submit_outcome",
 			lines: []string{
-				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__tatara__decline_implementation","input":{"reason":"   "}}]}}`,
-				`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"400: reason must not be blank"}]}}`,
+				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__tatara__submit_outcome","input":{"decision":"clarify"}}]}}`,
+				`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"400: reason is required on every clarify decision"}]}}`,
 			},
-			wantTool:   "decline_implementation",
-			wantErrSub: "reason must not be blank",
+			wantTool:   "submit_outcome",
+			wantErrSub: "reason is required",
 			wantFound:  true,
 		},
 		{
-			name: "rejected already_done",
+			name: "successful submit_outcome is not a hit",
 			lines: []string{
-				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"a9","name":"mcp__tatara__already_done","input":{}}]}}`,
-				`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"a9","is_error":true,"content":"400: reason required"}]}}`,
-			},
-			wantTool:   "already_done",
-			wantErrSub: "reason required",
-			wantFound:  true,
-		},
-		{
-			name: "successful decline is not a hit",
-			lines: []string{
-				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__tatara__decline_implementation","input":{"reason":"blocked on creds"}}]}}`,
+				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__tatara__submit_outcome","input":{"decision":"implement","reason":"ready"}}]}}`,
 				`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"ok"}]}}`,
 			},
 			wantFound: false,
@@ -216,9 +206,9 @@ func TestFailedCriticalOutcome(t *testing.T) {
 		{
 			name: "later successful retry supersedes earlier failure",
 			lines: []string{
-				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__tatara__decline_implementation","input":{"reason":""}}]}}`,
+				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__tatara__submit_outcome","input":{"decision":"clarify"}}]}}`,
 				`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"400"}]}}`,
-				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"mcp__tatara__decline_implementation","input":{"reason":"real"}}]}}`,
+				`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"mcp__tatara__submit_outcome","input":{"decision":"clarify","reason":"real"}}]}}`,
 				`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","is_error":false,"content":"ok"}]}}`,
 			},
 			wantFound: false,
@@ -244,4 +234,55 @@ func TestFailedCriticalOutcome(t *testing.T) {
 func TestFailedCriticalOutcome_MissingFileErrors(t *testing.T) {
 	_, _, _, err := FailedCriticalOutcome(filepath.Join(t.TempDir(), "nope.jsonl"))
 	require.Error(t, err)
+}
+
+// writeTranscript writes content (one or more JSONL lines) to a fresh temp
+// file and returns its path.
+func writeTranscript(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "t.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(content+"\n"), 0o644))
+	return path
+}
+
+// TestCriticalOutcomeTools_CoversSubmitOutcome. The set named
+// decline_implementation and already_done, both retired from tatara-cli and
+// asserted gone at tatara-cli/internal/mcp/tools_test.go:155-156. So the whole
+// re-prompt path (cmd/wrapper/app.go:229-245, cap maxOutcomeReprompts=2) has
+// been dead code: a rejected submit_outcome finishes the turn silently, which
+// the operator misreads as "refused-no-explanation" - the exact defect the
+// path was built to fix. This matters more now: a citation refusal is a 200,
+// but a MALFORMED submit_outcome still 400s, and that is precisely when the
+// agent must be told to retry.
+func TestCriticalOutcomeTools_CoversSubmitOutcome(t *testing.T) {
+	if !criticalOutcomeTools["submit_outcome"] {
+		t.Fatal("submit_outcome is not in criticalOutcomeTools; the re-prompt path is dead")
+	}
+	for _, retired := range []string{"decline_implementation", "already_done"} {
+		if criticalOutcomeTools[retired] {
+			t.Errorf("%q is retired from tatara-cli and must not be in criticalOutcomeTools", retired)
+		}
+	}
+}
+
+// TestFailedCriticalOutcome_DetectsRejectedSubmitOutcome is the end-to-end
+// shape: a transcript carrying an is_error tool_result for a namespaced
+// submit_outcome must be found.
+func TestFailedCriticalOutcome_DetectsRejectedSubmitOutcome(t *testing.T) {
+	path := writeTranscript(t, `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu-1","name":"mcp__tatara__submit_outcome","input":{}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu-1","is_error":true,"content":"400: reason is required on every clarify decision"}]}}`)
+
+	tool, errText, found, err := FailedCriticalOutcome(path)
+	if err != nil {
+		t.Fatalf("FailedCriticalOutcome: %v", err)
+	}
+	if !found {
+		t.Fatal("found = false; a rejected submit_outcome must trigger the re-prompt")
+	}
+	if tool != "submit_outcome" {
+		t.Fatalf("tool = %q, want submit_outcome", tool)
+	}
+	if !strings.Contains(errText, "reason is required") {
+		t.Fatalf("errText = %q, want the operator's 400 text", errText)
+	}
 }
