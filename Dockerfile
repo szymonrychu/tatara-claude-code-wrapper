@@ -5,16 +5,13 @@ ARG NODE_VERSION=22
 # Pinned for reproducible builds. Bumped by .github/workflows/refresh-claude-code.yml
 # (daily npm check -> semver:patch auto-merge PR -> release rebuilds this layer).
 ARG CLAUDE_CODE_VERSION=2.1.201
-# v1.7.0 is the tatara-cli tag that ships ContractVersion=3. Anything older
-# reports ContractVersion=2 and the operator refuses the pod at pod-ready,
-# before turn 0.
+# v1.7.0 is the first cli tag reporting ContractVersion=3; an older one is
+# refused by the operator at pod-ready. Bumped by the cli->wrapper cd-release.
 ARG TATARA_CLI_VERSION=v1.7.0
 # Skills plugin ref the wrapper boot-clones at runtime. Pinned to a semver tag so
 # the skills->wrapper cd-release bump can rewrite this line (mirrors
 # TATARA_CLI_VERSION). The Go default (cmd/wrapper/config.go) stays "main" for
 # local dev; in the image this ENV pins it.
-# v1.8.0 is the tatara-agent-skills tag that ships the agent-judged approval
-# gate instructions. An older ref teaches the deleted wordlist contract.
 ARG TATARA_SKILLS_REF=v1.8.0
 # renovate: repository=jdx/mise
 ARG MISE_VERSION=v2026.6.3
