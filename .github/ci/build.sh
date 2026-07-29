@@ -27,8 +27,10 @@ BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-v1.7.0}"
 # TATARA_SKILLS_REF pins the skills plugin ref baked as the runtime ENV default;
 # keep in sync with the Dockerfile ARG default and Makefile default. Rewritten by
-# the skills->wrapper cd-release bump.
-TATARA_SKILLS_REF="${TATARA_SKILLS_REF:-v0.1.0}"
+# the skills->wrapper cd-release bump - which rewrites the DOCKERFILE only, so
+# this default drifts unless moved by hand (it sat at v0.1.0 while the
+# Dockerfile was on v1.7.0). v1.8.0 ships the agent-judged approval gate.
+TATARA_SKILLS_REF="${TATARA_SKILLS_REF:-v1.8.0}"
 DEST="harbor.szymonrichert.pl/containers/${REPO}"
 
 : "${GITHUB_TOKEN:?GITHUB_TOKEN required}"
