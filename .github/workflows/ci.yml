@@ -33,7 +33,7 @@ jobs:
 
   ci:
     needs: [pin-guard]
-    uses: szymonrychu/tatara-operator/.github/workflows/ci-shared.yml@v1.35.1
+    uses: szymonrychu/tatara-operator/.github/workflows/ci-shared.yml@v1.36.1
     with:
       runner-label: tatara-claude-code-wrapper
       smoke-binary: ./bin/wrapper
