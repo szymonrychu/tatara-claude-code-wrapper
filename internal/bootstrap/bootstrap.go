@@ -93,32 +93,136 @@ type Params struct {
 // GitRunner runs a git subcommand in dir; injected for testability.
 type GitRunner func(dir string, args ...string) error
 
+// Reconcile results, reported on ccw_bootstrap_reconcile_total{result} and in
+// the bootstrap_reconcile log line.
+const (
+	reconcileUpToDate       = "up_to_date"
+	reconcileMerged         = "merged"
+	reconcileConflict       = "conflict"
+	reconcileFetchFail      = "fetch_fail"
+	reconcileBaseUnresolved = "base_unresolved"
+)
+
 // checkoutTaskBranch checks out taskBranch in dir. If the branch already
 // exists on the remote (ls-remote --exit-code returns nil), it resumes:
 // unshallows the clone (best-effort), fetches the remote branch, then checks
 // out with -B <branch> FETCH_HEAD so the agent has its prior commits and a
-// full history to rebase against. If the branch does not exist, it falls back
-// to the fresh-task path: plain "checkout -b <branch>".
-// Returns (resumed=true, nil) on the resume path, (false, nil) on the fresh
-// path, so callers can set action="resume" without a second ls-remote call.
-func checkoutTaskBranch(dir, taskBranch string, fullClone bool, git GitRunner) (resumed bool, err error) {
+// full history to reconcile against. A resumed branch that the agent OWNS
+// (reconcile=true, i.e. TaskBranch is set) is then reconciled with the repo's
+// base branch - see reconcileWithBase for why that is mandatory and why it is
+// a merge. If the branch does not exist, it falls back to the fresh-task path:
+// plain "checkout -b <branch>" off the just-cloned base branch, which is
+// current by construction and needs no reconcile.
+// Returns (resumed=true, <reconcile result>, nil) on the resume path and
+// (false, "", nil) on the fresh path, so callers can set action="resume" and
+// report the reconcile outcome without a second ls-remote call.
+func checkoutTaskBranch(dir, taskBranch, baseBranch string, fullClone, reconcile bool, git GitRunner) (resumed bool, result string, err error) {
 	branchExists := git(dir, "ls-remote", "--exit-code", "--heads", "origin", taskBranch) == nil
-	if branchExists {
-		// Unshallow so the rebase against origin/<default> has a merge base. Only
-		// when the clone was shallow (FullClone=false): `git fetch --unshallow` on
-		// an already-complete repo fatals ("does not make sense"), so skip it for a
-		// full clone, which already has the full history.
-		if !fullClone {
-			if err := git(dir, "fetch", "--unshallow", "origin"); err != nil {
-				return false, fmt.Errorf("unshallow for resume of %s: %w", taskBranch, err)
-			}
-		}
-		if err := git(dir, "fetch", "origin", taskBranch); err != nil {
-			return false, fmt.Errorf("fetch remote task branch %s: %w", taskBranch, err)
-		}
-		return true, git(dir, "checkout", "-B", taskBranch, "FETCH_HEAD")
+	if !branchExists {
+		return false, "", git(dir, "checkout", "-b", taskBranch)
 	}
-	return false, git(dir, "checkout", "-b", taskBranch)
+	// Unshallow so the merge against origin/<base> has a merge base. Only
+	// when the clone was shallow (FullClone=false): `git fetch --unshallow` on
+	// an already-complete repo fatals ("does not make sense"), so skip it for a
+	// full clone, which already has the full history.
+	if !fullClone {
+		if err := git(dir, "fetch", "--unshallow", "origin"); err != nil {
+			return false, "", fmt.Errorf("unshallow for resume of %s: %w", taskBranch, err)
+		}
+	}
+	if err := git(dir, "fetch", "origin", taskBranch); err != nil {
+		return false, "", fmt.Errorf("fetch remote task branch %s: %w", taskBranch, err)
+	}
+	if err := git(dir, "checkout", "-B", taskBranch, "FETCH_HEAD"); err != nil {
+		return false, "", err
+	}
+	if !reconcile {
+		return true, "", nil
+	}
+	result, err = reconcileWithBase(dir, taskBranch, baseBranch, git)
+	return true, result, err
+}
+
+// reconcileWithBase brings a resumed task branch up to date with the repo's
+// base branch by MERGING origin/<base> into it (issue #131: a resumed branch
+// was silently left days behind main, so the agent reasoned about code that no
+// longer existed).
+//
+// Merge, never rebase or reset. The task branch is already published on origin
+// and this platform forbids force-push, so rewriting its history would leave
+// the agent's next plain `git push` rejected as non-fast-forward: its committed
+// work would be stranded on a branch nobody can advance, and recovering would
+// need exactly the force-push that is denied. A merge only ever ADDS a commit,
+// so every commit the agent has already made stays reachable and the existing
+// non-force push in CommitAndPush stays a fast-forward. It is also the only
+// strategy with a safe failure mode: `git merge --abort` restores HEAD, the
+// index and the working tree exactly, whereas a failed rebase leaves the repo
+// mid-replay with detached HEAD.
+//
+// The reconcile is skipped entirely when the branch already contains the base
+// tip, so a healthy resume does not accrue an empty merge commit per turn.
+// A genuine conflict is a hard error: resuming on a tree we know is stale is
+// the bug, so bootstrap fails loudly instead.
+func reconcileWithBase(dir, taskBranch, baseBranch string, git GitRunner) (string, error) {
+	if err := git(dir, "fetch", "origin"); err != nil {
+		return reconcileFetchFail, fmt.Errorf("fetch origin to reconcile resumed branch %s: %w", taskBranch, err)
+	}
+	baseRef := "origin/" + baseBranch
+	if baseBranch == "" {
+		// No base branch pinned by the operator: resolve the remote's own
+		// default head. If that fails we cannot know what "current" means, so
+		// report it (WARN + counted result) rather than pretend the tree is fresh.
+		if err := git(dir, "remote", "set-head", "origin", "--auto"); err != nil {
+			return reconcileBaseUnresolved, nil
+		}
+		baseRef = "origin/HEAD"
+	}
+	// Exit 0 means baseRef is already an ancestor of HEAD: nothing to merge.
+	if git(dir, "merge-base", "--is-ancestor", baseRef, "HEAD") == nil {
+		return reconcileUpToDate, nil
+	}
+	msg := "tatara bootstrap: reconcile " + taskBranch + " with " + baseRef
+	if err := git(dir, "merge", "-m", msg, baseRef); err != nil {
+		// Abort restores the pre-merge HEAD, index and working tree; no commit
+		// the agent made is lost. Then fail loud rather than resume stale.
+		_ = git(dir, "merge", "--abort")
+		return reconcileConflict, fmt.Errorf("reconcile resumed branch %s with %s (merge aborted, no committed work lost): %w", taskBranch, baseRef, err)
+	}
+	return reconcileMerged, nil
+}
+
+// recordReconcile emits the reconcile outcome as a counted, logged business
+// action (rules 12+13). A stale resume that got merged is as important to see
+// as one that failed, so every non-empty result is reported.
+func recordReconcile(p Params, repo, taskBranch, baseRef, result string) {
+	if result == "" {
+		return
+	}
+	if p.M != nil {
+		p.M.BootstrapReconcileTotal.WithLabelValues(result).Inc()
+	}
+	if p.Log == nil {
+		return
+	}
+	args := []any{"action", "bootstrap_reconcile", "repo", repo, "task_branch", taskBranch,
+		"base_ref", baseRef, "result", result}
+	switch result {
+	case reconcileConflict, reconcileFetchFail:
+		p.Log.Error("resumed task branch could not be reconciled with its base branch", args...)
+	case reconcileBaseUnresolved:
+		p.Log.Warn("resumed task branch not reconciled: base branch could not be resolved", args...)
+	default:
+		p.Log.Info("resumed task branch reconciled with its base branch", args...)
+	}
+}
+
+// baseRefName is the ref recordReconcile reports for a repo whose base branch
+// is baseBranch, mirroring reconcileWithBase's own resolution.
+func baseRefName(baseBranch string) string {
+	if baseBranch == "" {
+		return "origin/HEAD"
+	}
+	return "origin/" + baseBranch
 }
 
 func Render(p Params, git GitRunner) error {
@@ -198,7 +302,8 @@ func Render(p Params, git GitRunner) error {
 				// primary): a secondary repo silently left on the wrong branch
 				// would make the agent commit the wrong state. Fail loud so the
 				// operator retries the run.
-				resumed, err := checkoutTaskBranch(dest, checkoutBranch, p.FullClone, git)
+				resumed, result, err := checkoutTaskBranch(dest, checkoutBranch, r.Branch, p.FullClone, p.TaskBranch != "", git)
+				recordReconcile(p, r.Name, checkoutBranch, baseRefName(r.Branch), result)
 				if err != nil {
 					if p.M != nil {
 						p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()
@@ -254,7 +359,8 @@ func Render(p Params, git GitRunner) error {
 		}
 		action := "clone"
 		if checkoutBranch != "" {
-			resumed, err := checkoutTaskBranch(repoDest, checkoutBranch, p.FullClone, git)
+			resumed, result, err := checkoutTaskBranch(repoDest, checkoutBranch, p.RepoBranch, p.FullClone, p.TaskBranch != "", git)
+			recordReconcile(p, p.RepoURL, checkoutBranch, baseRefName(p.RepoBranch), result)
 			if err != nil {
 				if p.M != nil {
 					p.M.BootstrapCloneTotal.WithLabelValues("fail").Inc()

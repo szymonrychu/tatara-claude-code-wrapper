@@ -193,7 +193,7 @@ func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log
 		var err error
 		if len(cfg.Repos) > 0 {
 			var pushedRepos []string
-			pushedRepos, err = bootstrap.CommitAndPushAll(cfg.Workspace, cfg.Repos, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
+			pushedRepos, err = bootstrap.CommitAndPushAll(cfg.Workspace, cfg.Repos, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner(), log, m)
 			rec.PushedRepos = pushedRepos
 		} else {
 			// Single-repo clones into workspace/<owner>/<repo>, not the
@@ -203,7 +203,7 @@ func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log
 				err = fmt.Errorf("cannot derive repo dir from REPO_URL %q for commit/push", cfg.RepoURL)
 			} else {
 				var pushed bool
-				pushed, err = bootstrap.CommitAndPush(repoDir, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner())
+				pushed, err = bootstrap.CommitAndPush(repoDir, cfg.TaskBranch, "tatara agent: "+cfg.TaskBranch, gitRunner(), log, m)
 				if pushed {
 					rec.PushedRepos = []string{primaryRepoName(cfg)}
 				}

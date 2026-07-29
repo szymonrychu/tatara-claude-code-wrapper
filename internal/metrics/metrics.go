@@ -46,6 +46,17 @@ type Metrics struct {
 	// Bootstrap render counter (rule 13: per-step observability).
 	BootstrapRenderTotal *prometheus.CounterVec // label: result=ok|fail
 
+	// Resumed-task-branch reconciliation against the repo's base branch
+	// (issue #131). A resume that silently kept a stale tree is exactly the
+	// business action rule 12/13 want visible, so every outcome is counted:
+	// result=up_to_date|merged|conflict|fetch_fail|base_unresolved.
+	BootstrapReconcileTotal *prometheus.CounterVec // label: result
+
+	// Oversized blobs the turn finaliser refused to stage (issue #131): a build
+	// artifact swept up by `git add -A` poisons the task branch for every later
+	// turn, and `--no-verify` bypasses the pre-commit size hook that would catch it.
+	CommitOversizedBlobSkipped prometheus.Counter
+
 	// Per-turn token/cost metrics (rule 13: tokens are the loop's primary cost
 	// driver and the clearest runaway signal). Counters keep the cumulative-spend
 	// property the operator can later budget on.
@@ -126,6 +137,10 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_outcome_reprompt_total", Help: "Critical-outcome MCP tool rejections re-prompted to the agent, by tool and result."}, []string{"tool", "result"}),
 		BootstrapRenderTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_bootstrap_render_total", Help: "Bootstrap config-render steps by result (ok|fail)."}, []string{"result"}),
+		BootstrapReconcileTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_bootstrap_reconcile_total", Help: "Resumed task-branch reconciliations against the repo base branch by result (up_to_date|merged|conflict|fetch_fail|base_unresolved)."}, []string{"result"}),
+		CommitOversizedBlobSkipped: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ccw_commit_oversized_blob_skipped_total", Help: "Oversized files the turn finaliser refused to stage, keeping build artifacts out of the task branch."}),
 		TurnTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_turn_tokens_total", Help: "Claude tokens consumed per turn, summed across the turn, by token type, model, Task kind, repo, and project."}, []string{"type", "model", "kind", "repo", "project"}),
 		TurnCostUSD: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -149,6 +164,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.BootstrapHookInstall, m.LifecycleHookTotal, m.HookOutcome, m.MetricPushTotal,
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.HTTPInFlight, m.HTTPPanicsTotal,
 		m.AuthTotal, m.TurnResumes, m.TurnRefusals, m.OutcomeRepromptTotal, m.BootstrapRenderTotal,
+		m.BootstrapReconcileTotal, m.CommitOversizedBlobSkipped,
 		m.TurnTokensTotal, m.TurnCostUSD, m.InternalIssueTotal, m.InternalIssueDrainTimeoutTotal,
 		m.ToolCallsTotal, m.SkillsInstalled, m.SkillsCloneFailures, m.AgentsInstalled)
 	return m

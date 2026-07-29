@@ -2,3 +2,8 @@ bin/
 dist/
 *.log
 .worktrees/
+# Binaries built straight into the repo root (`go build -o wrapper ./cmd/wrapper`)
+# instead of into bin/. One of these was committed onto an agent task branch and
+# inherited by every later turn (issue #131).
+/wrapper
+/cc-stop-hook
