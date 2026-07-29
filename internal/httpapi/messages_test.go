@@ -385,7 +385,7 @@ func TestGetSession_ReportsContractVersion(t *testing.T) {
 
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
-	require.Equal(t, float64(2), got["contractVersion"],
+	require.Equal(t, float64(version.ContractVersion), got["contractVersion"],
 		"the operator asserts this BEFORE turn-0; an absent field means an old wrapper (contract G.10)")
 
 	// D-W3: the existing fields survive. The operator reads them.
