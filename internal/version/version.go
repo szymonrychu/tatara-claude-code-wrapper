@@ -17,4 +17,4 @@ var Date = "unknown"
 // tool call the pod makes would 404, and it would burn its whole turn budget
 // working around them, silently. Bump this in the same release that ships a
 // breaking agent-facing change. Contract G.10.
-const ContractVersion = 3
+const ContractVersion = 4
