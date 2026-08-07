@@ -7,7 +7,7 @@ ARG GO_VERSION=1.26.3
 ARG NODE_VERSION=22
 # Pinned for reproducible builds. Bumped by .github/workflows/refresh-claude-code.yml
 # (daily npm check -> semver:patch auto-merge PR -> release rebuilds this layer).
-ARG CLAUDE_CODE_VERSION=2.1.201
+ARG CLAUDE_CODE_VERSION=2.1.224
 # v1.7.0 is the first cli tag reporting ContractVersion=3; an older one is
 # refused by the operator at pod-ready. Bumped by the cli->wrapper cd-release.
 ARG TATARA_CLI_VERSION=v1.7.0
