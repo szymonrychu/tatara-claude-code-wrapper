@@ -10,7 +10,7 @@ ARG NODE_VERSION=22
 ARG CLAUDE_CODE_VERSION=2.1.201
 # v1.7.0 is the first cli tag reporting ContractVersion=3; an older one is
 # refused by the operator at pod-ready. Bumped by the cli->wrapper cd-release.
-ARG TATARA_CLI_VERSION=v1.7.0
+ARG TATARA_CLI_VERSION=v2.0.1
 # Skills plugin ref the wrapper boot-clones at runtime. Pinned to a semver tag so
 # the skills->wrapper cd-release bump can rewrite this line (mirrors
 # TATARA_CLI_VERSION). The Go default (cmd/wrapper/config.go) stays "main" for
