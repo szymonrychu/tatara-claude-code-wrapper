@@ -88,8 +88,16 @@ ENV HOME=/home/agent HOME_DIR=/home/agent WORKSPACE=/workspace
 # and mise >= 2026.6 rejects them by default; the download checksum still applies.
 ARG MISE_VERSION
 ENV MISE_VERSION=${MISE_VERSION}
+# PYTHON_VERSION is pinned EXACT, not to the 3.13 minor. A floating minor
+# resolves to whatever CPython released most recently, and mise only has a
+# precompiled python-build-standalone build once that project publishes one -
+# a lag of hours to days. In the gap mise silently falls back to compiling from
+# source, and this base (node:bookworm-slim) has no C compiler, so the image
+# build dies on `configure: error: no acceptable C compiler found in $PATH`.
+# That is what broke the v2.0.0 release. python.compile=false below turns a
+# future miss into an immediate, self-describing failure instead of that.
 # renovate: repository=python/cpython
-ARG PYTHON_VERSION=3.13
+ARG PYTHON_VERSION=3.13.15
 # renovate: repository=pre-commit/pre-commit
 ARG PRECOMMIT_VERSION=4.6.0
 RUN curl https://mise.run | sh \
@@ -101,6 +109,7 @@ RUN curl https://mise.run | sh \
     && /home/agent/.local/bin/mise settings set experimental "true" \
     && /home/agent/.local/bin/mise settings set trusted_config_paths "/workspace" \
     && /home/agent/.local/bin/mise settings set python.github_attestations "false" \
+    && /home/agent/.local/bin/mise settings set python.compile "false" \
     && /home/agent/.local/bin/mise use -g "python@${PYTHON_VERSION}" \
     && /home/agent/.local/bin/mise exec -- python3 --version \
     && /home/agent/.local/bin/mise use -g "pre-commit@${PRECOMMIT_VERSION}" \
