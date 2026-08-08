@@ -38,10 +38,18 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
 FROM harbor.szymonrichert.pl/containers/tatara-cli:${TATARA_CLI_VERSION} AS tatara-cli
 
 # Stage 3: guard -- verify the baked cli still advertises the tools the wrapper relies on.
-# This stage runs `go test ./internal/bootstrap -run TestTataraMCP_AdvertisesScmProjectTools`
-# with /usr/local/bin/tatara from the tatara-cli stage on PATH.  The image build FAILS if
-# the pinned cli dropped submit_outcome / scm_read / issue_write / mr_write / task_get /
-# project_get / task_context / task_note / report_internal_issue.
+# This stage runs the live-oracle tests in ./internal/bootstrap with
+# /usr/local/bin/tatara from the tatara-cli stage on PATH.  The image build FAILS if:
+#   - the pinned cli dropped submit_outcome / scm_read / issue_write / mr_write /
+#     task_get / project_get / task_context / task_note / report_internal_issue
+#     (TestTataraMCP_AdvertisesScmProjectTools), or
+#   - any MCP tool name this repo puts in agent-facing prompt text -- today the
+#     global CLAUDE.md this image injects into every pod -- is no longer advertised
+#     (TestAgentPromptToolNamesAreAdvertised, #136). The names are discovered by
+#     scanning the repo's own prompt constants, not read from a list someone must
+#     remember to extend.
+# TATARA_MCP_GUARD=required turns "no tatara binary" from a skip into a hard failure,
+# so this stage cannot go green by quietly running nothing.
 FROM golang:${GO_VERSION}-alpine AS test-guard
 RUN apk add --no-cache git ca-certificates
 COPY --from=tatara-cli /usr/local/bin/tatara /usr/local/bin/tatara
@@ -49,7 +57,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN go test ./internal/bootstrap -run TestTataraMCP_AdvertisesScmProjectTools -count=1
+RUN go test ./internal/promptguard -count=1
+RUN TATARA_MCP_GUARD=required go test ./internal/bootstrap \
+      -run 'TestTataraMCP_AdvertisesScmProjectTools|TestAgentPromptToolNamesAreAdvertised' -count=1 -v
 
 # Stage 4: runtime -- node + claude in their own layer for trivial bumps.
 FROM node:${NODE_VERSION}-bookworm-slim
