@@ -445,6 +445,14 @@ func Render(p Params, git GitRunner) error {
 // headlessDirective is appended to the agent's global CLAUDE.md on every
 // bootstrap. The agent runs in a pod with no human at the terminal, so it must
 // never wait on an interactive prompt; decisions go to the issue thread instead.
+//
+// Every MCP tool name in this constant is checked against the baked cli's live
+// tools/list by TestAgentPromptToolNamesAreAdvertised, which the Dockerfile's
+// guard stage runs on every image build. It named comment_on_issue and
+// decline_implementation until 2026-08-08, 14 days after tatara-cli reaped both
+// (#136): a blocked agent got `tool not found` from the highest-priority
+// instruction surface it has, at the moment it was already stuck. Do not add a
+// tool name here without confirming the live server advertises it.
 const headlessDirective = `
 
 ---
@@ -457,11 +465,15 @@ interactive tools AskUserQuestion, ExitPlanMode and EnterPlanMode are disabled
 no one to approve a plan. Do not wait on a dialog or picker.
 
 When you need a decision, a choice between options, or any clarification,
-surface it as a comment on the issue with the comment_on_issue MCP tool: lay out
-the options and your recommendation there and continue with your best judgement.
-If a decision blocks you from making any progress at all, call
-decline_implementation with the reason. The issue thread is your only channel to
-a human.
+surface it on the issue thread with the issue_write(action="comment", ...) MCP
+tool: lay out the options and your recommendation there and continue with your
+best judgement.
+
+If a decision blocks you from making any progress at all, say so in the outcome
+you submit: end the turn through submit_outcome with the reason spelled out.
+Every task ends through submit_outcome, and it is the one channel to a human
+your agent kind is always granted - issue_write is not granted to every kind,
+and your skill names the tools you actually have.
 `
 
 // delegationDirective is appended to the agent's global CLAUDE.md on every

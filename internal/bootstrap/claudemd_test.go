@@ -10,10 +10,17 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
 )
 
-// The agent runs headless with the issue thread as its only human channel.
-// Bootstrap must always append a directive routing decisions to the
-// comment_on_issue MCP tool, appended after (not replacing) any provided
+// The agent runs headless. Bootstrap must always append a directive routing
+// decisions to a LIVE MCP tool, appended after (not replacing) any provided
 // GlobalClaudeMd.
+//
+// #136: this used to name comment_on_issue and decline_implementation, both
+// reaped from tatara-cli on 2026-07-13. The two tools the directive may name
+// are issue_write (the action="comment" form that replaced comment_on_issue)
+// and submit_outcome (the always-on terminal tool that replaced
+// decline_implementation). The retired names must never come back - a blocked
+// agent following this text gets `tool not found` from the one instruction
+// surface it reads when it is already stuck.
 func TestRender_AppendsHeadlessDecisionDirective(t *testing.T) {
 	home := t.TempDir()
 	ws := t.TempDir()
@@ -31,9 +38,13 @@ func TestRender_AppendsHeadlessDecisionDirective(t *testing.T) {
 	got := string(b)
 
 	require.Contains(t, got, "OPERATOR GLOBAL RULES")
-	require.Contains(t, got, "comment_on_issue")
-	require.Contains(t, got, "decline_implementation")
+	require.Contains(t, got, `issue_write(action="comment"`)
+	require.Contains(t, got, "submit_outcome")
 	require.Contains(t, got, "AskUserQuestion")
+	for _, reaped := range []string{"comment_on_issue", "decline_implementation", "already_done"} {
+		require.NotContainsf(t, got, reaped,
+			"the injected global CLAUDE.md names %q, retired from tatara-cli on 2026-07-13", reaped)
+	}
 }
 
 // The directive must be present even when no GlobalClaudeMd is configured.
@@ -50,7 +61,7 @@ func TestRender_DirectivePresentWithoutGlobalClaudeMd(t *testing.T) {
 
 	b, err := os.ReadFile(filepath.Join(home, ".claude", "CLAUDE.md"))
 	require.NoError(t, err)
-	require.Contains(t, string(b), "comment_on_issue")
+	require.Contains(t, string(b), "issue_write")
 }
 
 // task-kind redesign Decision 6: the main agent should delegate work to the
