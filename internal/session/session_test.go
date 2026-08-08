@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/convstore"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/transcript"
@@ -2083,4 +2085,79 @@ func TestDrainInternalIssues_MidTurnAttributionUnaffectedByFallback(t *testing.T
 	// turn-1 reported nothing and must still drain empty (no leakage from
 	// the fallback or from turn-2's report).
 	require.Nil(t, m.DrainInternalIssues(id1))
+}
+
+// #547 follow-up: the transcript tailer is what advances a turn's
+// LastActivityAt, and LastActivityAt is what BOTH the wrapper's own inactivity
+// timer and the operator's turn-timeout deadline anchor on. Before this fix,
+// Follow was launched only from Complete() - i.e. after the FIRST Stop hook -
+// so during a pod's first turn no activity tick could ever fire. Since a pod's
+// whole life is usually one turn, that made the "inactivity window" a hard
+// wall-clock cap on the entire turn.
+//
+// Live: an mtg-decks implement agent wrote a decklist, captured a meta snapshot
+// and ran its sim scripts for 60 minutes while lastActivityAt sat frozen at the
+// submit instant, and was torn down mid-work with nothing pushed.
+//
+// The transcript file is created by claude AFTER the turn starts, so the fix has
+// to discover it rather than be handed a path - which is exactly what this test
+// pins: the file appears only after Submit.
+func TestTailer_AdvancesLastActivityDuringTheFirstTurn(t *testing.T) {
+	home := t.TempDir()
+	workspace := t.TempDir()
+	transcriptDir := convstore.TranscriptDir(home, workspace)
+	require.NoError(t, os.MkdirAll(transcriptDir, 0o755))
+
+	buf := &syncBuffer{}
+	log := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	store := turn.NewStore()
+	ids := []string{"turn-1"}
+	idx := 0
+	// now advances 1s per call so a Touch is observable against StartedAt.
+	var nowCalls int64
+	m := session.New(
+		session.Config{
+			TurnTimeout: 30 * time.Second,
+			SubmitSeq:   session.DefaultSubmitSeq,
+			HomeDir:     home,
+			Workspace:   workspace,
+		},
+		store,
+		metrics.New(prometheus.NewRegistry()),
+		log,
+		func() time.Time { n := atomic.AddInt64(&nowCalls, 1); return time.Unix(100+n, 0) },
+		func() string { s := ids[idx]; idx++; return s },
+	)
+	m.SetWriterForTest(&fakePTY{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	m.StartTailer(ctx)
+
+	id, err := m.Submit("hi", "", false)
+	require.NoError(t, err)
+
+	rec, ok := store.Get(id)
+	require.True(t, ok)
+	startedAt := rec.StartedAt
+
+	// claude creates the transcript only once the turn is under way. NOTE the
+	// tailer is never told this path: Complete() is deliberately NOT called.
+	line := `{"type":"assistant","uuid":"uuid-live","sessionId":"sess-live","timestamp":"2026-08-08T10:57:40.000Z","message":{"role":"assistant","content":[{"type":"text","text":"working"}],"stop_reason":null,"usage":{"input_tokens":1,"output_tokens":1}}}`
+	require.NoError(t, os.WriteFile(filepath.Join(transcriptDir, "sess-live.jsonl"),
+		[]byte(line+"\n"), 0o644))
+
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		got, ok := store.Get(id)
+		require.True(t, ok)
+		if got.LastActivityAt.After(startedAt) {
+			return // the anchor moved: the turn is visibly alive
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	got, _ := store.Get(id)
+	t.Fatalf("lastActivityAt = %s, still not after startedAt %s: a working turn looks identical to a hung one, so the timeout kills it mid-work",
+		got.LastActivityAt, startedAt)
 }

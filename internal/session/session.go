@@ -1026,8 +1026,120 @@ func (mgr *Manager) Submit(text, callbackURL string, handoff bool) (string, erro
 	mgr.mu.Lock()
 	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.failTimeout(id) })
 	mgr.mu.Unlock()
+	// The timer just installed is an INACTIVITY timer, and the only thing that
+	// resets it is onTailerActivity. Start following the transcript now, not at
+	// the first Stop hook, or a turn that never completes never gets a tick.
+	mgr.ensureTailerFollowing()
 	mgr.log.Info("turn submitted", "action", "turn_submit", "turn_id", id)
 	return id, nil
+}
+
+// ensureTailerFollowing starts the transcript tailer on this pod's own
+// conversation, discovering the file rather than waiting to be handed a path.
+//
+// It exists because Follow used to be launched from exactly one place -
+// Complete(), off the first Stop hook's TranscriptPath - which meant no
+// transcript line was read until a turn had ALREADY finished. Every tick that
+// advances Record.LastActivityAt and resets the turn's inactivity timer comes
+// from that tailer, so during a pod's first turn there were no ticks at all: a
+// pod whose whole life is one long turn (the common shape) could never report
+// activity, and both the wrapper's own timer and the operator's turn-timeout
+// deadline - anchored on max(turn-started-at, turn-last-activity-at) - degraded
+// into a hard wall-clock cap on the turn. An agent 60 minutes into productive
+// work looked exactly like one hung 60 minutes ago.
+//
+// Discovery, not a path parameter, because claude names the transcript after a
+// session id that does not exist until it has booted and started the turn. The
+// glob is the same one shouldResume already trusts (transcriptExistsOnDisk), and
+// rests on the same one-conversation-per-pod invariant; the newest match wins so
+// a Restore/Fork blob left at boot cannot outrank the live conversation.
+//
+// Safe to call on every Submit: tailerStarted latches, so only the first call
+// launches anything. Ticks for a turn that is not current are dropped by
+// onTailerActivity, so nothing read here can extend or resurrect another turn.
+func (mgr *Manager) ensureTailerFollowing() {
+	mgr.mu.Lock()
+	if mgr.tailer == nil || mgr.tailerStarted {
+		mgr.mu.Unlock()
+		return
+	}
+	if mgr.cfg.HomeDir == "" || mgr.cfg.Workspace == "" {
+		// TranscriptDir would be meaningless, so there is nothing to discover.
+		// Complete()'s hook-driven start remains the fallback.
+		mgr.mu.Unlock()
+		return
+	}
+	mgr.tailerStarted = true
+	tailer := mgr.tailer
+	tailerCtx := mgr.tailerCtx
+	dir := convstore.TranscriptDir(mgr.cfg.HomeDir, mgr.cfg.Workspace)
+	mgr.wg.Add(1)
+	mgr.mu.Unlock()
+
+	go func() {
+		defer mgr.wg.Done()
+		path, ok := mgr.awaitTranscriptFile(tailerCtx, dir)
+		if !ok {
+			return
+		}
+		mgr.mu.Lock()
+		// Complete() may have raced in with the hook's authoritative path. If it
+		// did, it owns the tailer and has already started it on that path.
+		if mgr.transcriptPath != "" && mgr.transcriptPath != path {
+			mgr.mu.Unlock()
+			return
+		}
+		mgr.transcriptPath = path
+		mgr.mu.Unlock()
+
+		mgr.log.Info("transcript tailer started from discovery",
+			"action", "tailer_discovered", "path", path)
+		if err := tailer.Follow(tailerCtx, path); err != nil && tailerCtx.Err() == nil {
+			mgr.log.Error("transcript tailer error", "err", err)
+		}
+	}()
+}
+
+// awaitTranscriptFile polls dir until claude has written its conversation there,
+// returning the newest *.jsonl. ok is false when ctx ends first.
+func (mgr *Manager) awaitTranscriptFile(ctx context.Context, dir string) (string, bool) {
+	const pollEvery = 500 * time.Millisecond
+	for {
+		if ctx == nil || ctx.Err() != nil {
+			return "", false
+		}
+		matches, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+		if err != nil {
+			mgr.log.Warn("tailer: transcript glob failed",
+				"action", "tailer_discover_failed", "dir", dir, "err", err)
+			return "", false
+		}
+		if newest, ok := newestFile(matches); ok {
+			return newest, true
+		}
+		select {
+		case <-ctx.Done():
+			return "", false
+		case <-time.After(pollEvery):
+		}
+	}
+}
+
+// newestFile returns the most recently modified path. Unstattable entries are
+// skipped rather than failing the whole discovery.
+func newestFile(paths []string) (string, bool) {
+	var best string
+	var bestMod time.Time
+	for _, p := range paths {
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if best == "" || fi.ModTime().After(bestMod) {
+			best, bestMod = p, fi.ModTime()
+		}
+	}
+	return best, best != ""
 }
 
 // Complete is invoked from the internal endpoint when a Stop hook fires.
