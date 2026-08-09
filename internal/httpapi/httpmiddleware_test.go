@@ -23,9 +23,13 @@ type aliveCtl struct{}
 func (a *aliveCtl) Submit(_, _ string, _ bool) (string, error) { return "t", nil }
 func (a *aliveCtl) Complete(_ session.HookResult) error        { return nil }
 func (a *aliveCtl) Snapshot() session.Snapshot                 { return session.Snapshot{State: session.Ready} }
-func (a *aliveCtl) TranscriptPath() string                     { return "" }
-func (a *aliveCtl) Alive() bool                                { return true }
-func (a *aliveCtl) Shutdown(_ context.Context) error           { return nil }
+func (a *aliveCtl) Probe(_ string) (string, error)             { return "probe-1", nil }
+func (a *aliveCtl) ProbeStatus(_ string) (session.ProbeStatus, bool) {
+	return session.ProbeStatus{}, false
+}
+func (a *aliveCtl) TranscriptPath() string           { return "" }
+func (a *aliveCtl) Alive() bool                      { return true }
+func (a *aliveCtl) Shutdown(_ context.Context) error { return nil }
 
 func newAPIWithMetrics(t *testing.T) (*httpapi.API, *metrics.Metrics, *prometheus.Registry) {
 	t.Helper()

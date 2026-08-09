@@ -26,6 +26,11 @@ type SessionController interface {
 	Submit(text, callbackURL string, handoff bool) (string, error)
 	Complete(session.HookResult) error
 	Snapshot() session.Snapshot
+	// Probe writes a question into the PTY of a possibly-busy agent and
+	// returns a probe id. It never reports "busy": a turn in flight is the
+	// only situation in which it is worth calling.
+	Probe(text string) (string, error)
+	ProbeStatus(probeID string) (session.ProbeStatus, bool)
 	TranscriptPath() string
 	Alive() bool
 	Shutdown(context.Context) error
@@ -170,6 +175,8 @@ func (a *API) mountV1(r chi.Router) {
 	r.Get("/v1/messages/{turnID}", a.getMessage)
 	r.Get("/v1/session", a.getSession)
 	r.Get("/v1/transcript", a.getTranscript)
+	r.Post("/v1/probe", a.postProbe)
+	r.Get("/v1/probe/{probeId}", a.getProbe)
 	r.Delete("/v1/session", a.deleteSession)
 }
 

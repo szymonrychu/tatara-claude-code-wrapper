@@ -1,0 +1,5 @@
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-09T17:33:07Z","sessionId":"sess-w3","content":"Do not stop. Reply with exactly TATARA-ALIVE <one sentence>."}
+{"type":"assistant","timestamp":"2026-08-09T17:33:09Z","sessionId":"sess-w3","uuid":"u-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu-1","name":"Bash","input":{"command":"go test ./..."}}]}}
+{"type":"user","timestamp":"2026-08-09T17:33:41Z","sessionId":"sess-w3","uuid":"u-2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu-1","content":"ok"}]}}
+{"type":"queue-operation","operation":"dequeue","timestamp":"2026-08-09T17:33:41Z","sessionId":"sess-w3"}
+{"type":"assistant","timestamp":"2026-08-09T17:33:42Z","sessionId":"sess-w3","uuid":"u-3","message":{"role":"assistant","content":[{"type":"text","text":"TATARA-ALIVE I am running the wrapper test suite and waiting on go test."}]}}

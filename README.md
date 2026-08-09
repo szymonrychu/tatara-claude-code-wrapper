@@ -37,11 +37,25 @@ ingress.
 | `GET /v1/session` | - | 200 `{... ,"contractVersion":2}` |
 | `DELETE /v1/session` | - | 202, graceful shutdown, pod exits |
 | `GET /v1/transcript` | - | 200, full JSONL session transcript (debug) |
+| `POST /v1/probe` | `{"text":"..."}` (optional) | 202 `ProbeStatus`; **never 409**; 503 no live PTY |
+| `GET /v1/probe/{probeId}` | - | 200 `ProbeStatus`; 404 unknown or superseded |
 | `GET /healthz` `/readyz` `/metrics` | - | Operator endpoints |
 
 `POST /v1/interject` is gone (404) - mid-flight events now ride in at the
 next turn boundary as the `<events>` block of the next bundle, not as
 mid-turn PTY injection.
+
+`POST /v1/probe` is the one thing that DOES write mid-turn, and it exists
+precisely because `POST /v1/messages` answers 409 for the whole duration of a
+turn: without it there is no way to ask a possibly-hung agent what it is
+doing, only to kill it. It is not a turn - it takes no turn slot, resets no
+deadline, consumes no turn budget, and its own transcript lines are excluded
+from the inactivity heartbeat so probing cannot keep a hung agent alive.
+`GET /v1/probe/{probeId}` reports one of three states, which are three
+different diagnoses: `pending` (the CLI took the message but never handed it
+to the model - the turn is blocked inside a single long tool call),
+`delivered` (the model has it and is reaching tool-call boundaries), and
+`answered` (an assistant reply starting with the literal `TATARA-ALIVE`).
 
 Turns are strictly sequential. `handoff:true` marks the operator's TTL stop
 turn: it is the only turn admitted past `AGENT_POD_TTL_SECONDS` (exactly

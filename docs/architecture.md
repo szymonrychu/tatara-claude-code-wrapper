@@ -165,6 +165,8 @@ Public surface (`Router()`), all `/v1/*` require a valid Keycloak JWT
 | GET | `/v1/messages/{turnId}` | full result; `404` if unknown |
 | GET | `/v1/session` | `{state, turnsCompleted, model, repo}` |
 | GET | `/v1/transcript` | full JSONL transcript; `404` before the first turn |
+| POST | `/v1/probe` | `{text?}` written mid-turn into the PTY -> `202 ProbeStatus`. **Never `409`** - working while a turn is in flight is the point; `503` when there is no live PTY |
+| GET | `/v1/probe/{probeId}` | `200 ProbeStatus` (`pending`\|`delivered`\|`answered`); `404` if unknown or superseded |
 | DELETE | `/v1/session` | graceful shutdown -> pod exits |
 
 Operator surface (open, not ingress-exposed): `/healthz` (always 200 while the

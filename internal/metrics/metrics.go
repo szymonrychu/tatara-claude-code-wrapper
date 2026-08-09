@@ -85,6 +85,20 @@ type Metrics struct {
 	// tool call, which silence alone cannot distinguish from productive work.
 	QueueOpsTotal *prometheus.CounterVec // label: op=enqueue|remove|dequeue|other
 
+	// Liveness probes. POST /v1/probe writes a question straight into the PTY
+	// mid-turn, because POST /v1/messages 409s while a turn is in flight and is
+	// therefore useless for asking a possibly-hung agent what it is doing.
+	//
+	// ProbesTotal counts the write attempt; ProbeOutcomesTotal counts what the
+	// transcript said happened, and its three outcomes are three DIFFERENT
+	// diagnoses, not one success and two flavours of timeout:
+	// answered = alive and steerable; delivered_unanswered = reaching tool-call
+	// boundaries but not responding; never_delivered = never reached a
+	// boundary at all, i.e. wedged inside one long tool call.
+	ProbesTotal        *prometheus.CounterVec // label: result=ok|write_fail|unavailable
+	ProbeAnswerSeconds prometheus.Histogram   // send -> answer latency
+	ProbeOutcomesTotal *prometheus.CounterVec // label: outcome=answered|delivered_unanswered|never_delivered
+
 	// Skills delivery metrics (rule 13: boot-time clone and filter are fallible).
 	SkillsInstalled     *prometheus.CounterVec // label: profile
 	SkillsCloneFailures prometheus.Counter
@@ -160,6 +174,13 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_tool_calls_total", Help: "Agent tool calls observed in the transcript by tool name (clamped) and outcome (success|error)."}, []string{"tool", "outcome"}),
 		QueueOpsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_queue_operations_total", Help: "Queue operations observed in the transcript by operation (enqueue|remove|dequeue|other)."}, []string{"op"}),
+		ProbesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_probes_total", Help: "Mid-turn liveness probes written to the PTY, by result (ok|write_fail|unavailable)."}, []string{"result"}),
+		ProbeAnswerSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "ccw_probe_answer_seconds", Help: "Latency from writing a liveness probe to the agent answering it.",
+			Buckets: prometheus.ExponentialBuckets(0.5, 2, 12)}),
+		ProbeOutcomesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_probe_outcomes_total", Help: "Terminal liveness-probe outcomes (answered|delivered_unanswered|never_delivered); never_delivered means the turn never reached a tool-call boundary."}, []string{"outcome"}),
 		SkillsInstalled: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "wrapper_skills_installed_total", Help: "Skills installed at boot by profile."}, []string{"profile"}),
 		SkillsCloneFailures: prometheus.NewCounter(prometheus.CounterOpts{
@@ -176,6 +197,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.BootstrapReconcileTotal, m.CommitOversizedBlobSkipped,
 		m.TurnTokensTotal, m.TurnCostUSD, m.InternalIssueTotal, m.InternalIssueDrainTimeoutTotal,
 		m.ToolCallsTotal, m.QueueOpsTotal,
+		m.ProbesTotal, m.ProbeAnswerSeconds, m.ProbeOutcomesTotal,
 		m.SkillsInstalled, m.SkillsCloneFailures, m.AgentsInstalled)
 	return m
 }
