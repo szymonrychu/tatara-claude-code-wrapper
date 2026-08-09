@@ -343,6 +343,15 @@ func OutcomeErrorStatus(errText string) (int, bool) {
 		return code, true
 	}
 	for i := 0; i < len(s); i++ {
+		// THE MARKER MUST START A WORD. Without this, "code" and "returned" match
+		// as SUFFIXES of ordinary words - "scanned barcode 404 not found",
+		// "failed to decode 500 bytes", "unreturned 502 after retry" - and each
+		// one is read as an HTTP status. That false positive is this fix's own
+		// failure mode running backwards: a bogus 4xx strips the mandatory retry
+		// directive off a failure that was genuinely retryable.
+		if i > 0 && isWordByte(s[i-1]) {
+			continue
+		}
 		for _, marker := range httpStatusMarkers {
 			if !strings.HasPrefix(s[i:], marker) {
 				continue
@@ -354,6 +363,13 @@ func OutcomeErrorStatus(errText string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// isWordByte reports whether b can be part of a word, for the boundary check
+// above. ASCII is enough: every marker is ASCII, so only an ASCII byte can be
+// the tail of a word that swallows one.
+func isWordByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_'
 }
 
 // leadingStatus reads a standalone 3-digit status in [400,599] off the front of

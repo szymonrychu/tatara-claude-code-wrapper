@@ -28,6 +28,16 @@ func TestOutcomeErrorStatus(t *testing.T) {
 		{"a four-digit number is not a status", "4001 items", 0, false},
 		{"a 2xx is not an error status", "200 ok", 0, false},
 		{"a duration is not a status", "timed out after 500ms", 0, false},
+		// A MARKER MUST START A WORD. "code" and "returned" are common English
+		// word suffixes; matching them unanchored read a bare number out of
+		// ordinary prose and stripped the mandatory retry directive off a
+		// genuinely retryable failure (PR #157 review round 1).
+		{"barcode is not the marker code", "scanned barcode 404 not found in catalog", 0, false},
+		{"decode is not the marker code", "failed to decode 500 bytes of payload", 0, false},
+		{"unreturned is not the marker returned", "unreturned 502 after retry", 0, false},
+		{"a word ending in http is not the marker", "libhttp 400 handles", 0, false},
+		{"the marker still matches after punctuation", "(status:400)", 400, true},
+		{"the marker still matches at a word start", "operator status 404 on write", 404, true},
 		{"empty", "", 0, false},
 	}
 	for _, tc := range tests {
