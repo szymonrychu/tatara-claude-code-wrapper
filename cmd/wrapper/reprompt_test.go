@@ -17,8 +17,13 @@ func TestReprompt_BudgetAndRollback(t *testing.T) {
 		var calls int
 		a := &app{log: testLogger(), submitFn: func(text, cb string) (string, error) {
 			calls++
-			require.Contains(t, text, "rejected by the operator")
-			require.Contains(t, text, "non-blank")
+			// tatara-operator#578: a 4xx no longer carries the mandatory
+			// "call it again until it succeeds" directive, which is exactly
+			// the loop that burned mt-i-mtg-decks-22. It is a corrective
+			// refusal now. TestRepromptDirective_MandatoryOnlyForRetryable
+			// pins the wording per class.
+			require.Contains(t, text, "REFUSED by the operator")
+			require.NotContains(t, text, "Do not finish the turn until the call succeeds")
 			require.Equal(t, "https://cb/x", cb)
 			return "turn-1", nil
 		}}
