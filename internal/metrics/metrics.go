@@ -78,6 +78,13 @@ type Metrics struct {
 	// "other") so cardinality stays bounded (rule 13).
 	ToolCallsTotal *prometheus.CounterVec // labels: tool, outcome=success|error
 
+	// Queue operations observed in the transcript. Claude Code parks a message
+	// that arrives while a turn is mid-tool-call and writes `enqueue`, then
+	// `remove`/`dequeue` when it is actually delivered to the model. An enqueue
+	// with no matching removal is the shape of a turn wedged inside one long
+	// tool call, which silence alone cannot distinguish from productive work.
+	QueueOpsTotal *prometheus.CounterVec // label: op=enqueue|remove|dequeue|other
+
 	// Skills delivery metrics (rule 13: boot-time clone and filter are fallible).
 	SkillsInstalled     *prometheus.CounterVec // label: profile
 	SkillsCloneFailures prometheus.Counter
@@ -151,6 +158,8 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "tatara_wrapper_internal_issue_drain_timeout_total", Help: "Times DrainInternalIssues timed out waiting for the transcript tailer to catch up before draining anyway (degraded path, trailing report may be dropped)."}),
 		ToolCallsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_tool_calls_total", Help: "Agent tool calls observed in the transcript by tool name (clamped) and outcome (success|error)."}, []string{"tool", "outcome"}),
+		QueueOpsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_queue_operations_total", Help: "Queue operations observed in the transcript by operation (enqueue|remove|dequeue|other)."}, []string{"op"}),
 		SkillsInstalled: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "wrapper_skills_installed_total", Help: "Skills installed at boot by profile."}, []string{"profile"}),
 		SkillsCloneFailures: prometheus.NewCounter(prometheus.CounterOpts{
@@ -166,6 +175,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.AuthTotal, m.TurnResumes, m.TurnRefusals, m.OutcomeRepromptTotal, m.BootstrapRenderTotal,
 		m.BootstrapReconcileTotal, m.CommitOversizedBlobSkipped,
 		m.TurnTokensTotal, m.TurnCostUSD, m.InternalIssueTotal, m.InternalIssueDrainTimeoutTotal,
-		m.ToolCallsTotal, m.SkillsInstalled, m.SkillsCloneFailures, m.AgentsInstalled)
+		m.ToolCallsTotal, m.QueueOpsTotal,
+		m.SkillsInstalled, m.SkillsCloneFailures, m.AgentsInstalled)
 	return m
 }

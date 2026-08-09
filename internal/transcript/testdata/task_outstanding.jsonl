@@ -1,0 +1,5 @@
+{"type":"assistant","uuid":"uuid-w1-1","sessionId":"sess-w1","timestamp":"2026-08-09T17:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_task_1","name":"Task","input":{"subagent_type":"general-purpose"}}]}}
+{"type":"assistant","uuid":"uuid-w1-2","sessionId":"sess-w1","timestamp":"2026-08-09T17:05:00Z","message":{"role":"assistant","content":[{"type":"text","text":"waiting on the subagent"}]}}
+{"type":"assistant","uuid":"uuid-w1-3","sessionId":"sess-w1","timestamp":"2026-08-09T17:20:00Z","message":{"role":"assistant","content":[{"type":"text","text":"still waiting"}]}}
+{"type":"assistant","uuid":"uuid-w1-4","sessionId":"sess-w1","timestamp":"2026-08-09T17:34:00Z","message":{"role":"assistant","content":[{"type":"text","text":"still waiting"}]}}
+{"type":"user","uuid":"uuid-w1-5","sessionId":"sess-w1","timestamp":"2026-08-09T17:35:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_task_1","content":"subagent done","is_error":false}]}}
