@@ -19,7 +19,12 @@ BUILDKITD_ADDR="tcp://buildkitd.arc-runners:1234"
 # VERSION, the SHORT_SHA tag, and the cloned context all on the same commit.
 BUILD_REF="${BUILD_REF:-$GITHUB_SHA}"
 SHORT_SHA="${BUILD_REF:0:7}"
-VERSION="$(git describe --tags --always --dirty)"
+# The release job passes the authoritative tag in via VERSION; git describe
+# is only the ci-path fallback (no release tag cut yet). git describe must not
+# be trusted to pick the release tag itself: a re-run of a release that failed
+# after cutting its tag leaves two semver tags on the same commit, and describe
+# resolves to the LOWER one, publishing the image under the wrong version.
+VERSION="${VERSION:-$(git describe --tags --always --dirty)}"
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # TATARA_CLI_VERSION pins the cli SHA baked into the image; keep in sync with
 # Dockerfile ARG default and Makefile default.  Use the short SHA published by
