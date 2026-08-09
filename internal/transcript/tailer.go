@@ -204,7 +204,13 @@ type Tailer struct {
 	internalIssueCounter InternalIssueCounter
 	toolCallsCounter     ToolCallsCounter
 	queueOpsCounter      QueueOpsCounter
-	onActivity           func(turnID string)
+	onActivity           func(turnID string, probeOriginated bool)
+
+	// probes, when set, follows an in-flight liveness probe through the
+	// transcript. Owned by the session Manager (it must survive
+	// CCW_LOG_TRANSCRIPT=false, which means no Tailer at all), so this is a
+	// borrowed reference and may be nil.
+	probes *ProbeTracker
 
 	// queue records unmatched `queue-operation` enqueues. Observation only in
 	// this phase - nothing reads it to make a decision yet.
@@ -306,8 +312,22 @@ func (t *Tailer) QueuePendingSince() (time.Time, bool) {
 // WithActivity attaches a hook fired once per processed transcript line that
 // carries an in-flight turn id. It is the per-turn liveness heartbeat the
 // session uses to reset its inactivity deadline. Returns self for chaining.
-func (t *Tailer) WithActivity(fn func(turnID string)) *Tailer {
+//
+// probeOriginated marks a line the wrapper's own liveness probe caused. The
+// turn deadline is an INACTIVITY timer, so without that flag a probe would
+// reset the deadline of the very turn it is investigating - probing a hung
+// agent would keep it alive indefinitely, which is the exact opposite of the
+// point. See classifyProbeEnqueue for how narrow the flag is.
+func (t *Tailer) WithActivity(fn func(turnID string, probeOriginated bool)) *Tailer {
 	t.onActivity = fn
+	return t
+}
+
+// WithProbes attaches the session's ProbeTracker so probe lifecycle
+// transitions are observed off the transcript. nil-safe, returns self for
+// chaining.
+func (t *Tailer) WithProbes(p *ProbeTracker) *Tailer {
+	t.probes = p
 	return t
 }
 
@@ -462,10 +482,29 @@ func (t *Tailer) CaughtUpTo(target int64, timeout time.Duration) bool {
 	}
 }
 
-func (t *Tailer) fireActivity(turnID string) {
+func (t *Tailer) fireActivity(turnID string, probeOriginated bool) {
 	if t.onActivity != nil && turnID != "" {
-		t.onActivity(turnID)
+		t.onActivity(turnID, probeOriginated)
 	}
+}
+
+// classifyProbeEnqueue reports whether entry is the `enqueue` line the CLI
+// wrote for the wrapper's own in-flight probe, stamping the probe's
+// EnqueuedAt as a side effect.
+//
+// The match is deliberately as narrow as it can be made: an `enqueue`
+// operation whose content is byte-equal (modulo surrounding whitespace) to the
+// registered probe text. Nothing else in the transcript is ever excluded from
+// the turn's inactivity heartbeat - in particular the removal line and the
+// answer itself both count as activity, because by then the agent has demonstrably
+// reached a tool-call boundary and is genuinely alive. The enqueue alone proves
+// nothing: the CLI writes it the instant the paste lands, whether or not the
+// agent is running.
+func (t *Tailer) classifyProbeEnqueue(entry transcriptEntry) bool {
+	if t.probes == nil || entry.Type != "queue-operation" || clampQueueOp(entry.Operation) != "enqueue" {
+		return false
+	}
+	return t.probes.NoteEnqueue(queueContentText(entry.Content), entry.entryTime())
 }
 
 // knownNonMessageTypes is the fixed cardinality set for non-message transcript entries.
@@ -695,6 +734,16 @@ func (t *Tailer) processQueueOperation(entry transcriptEntry, turnID string) {
 		t.queue.enqueue(key, entry.entryTime())
 	case "remove", "dequeue":
 		t.queue.remove(key)
+		// A removal is what actually hands a queued message to the model, so
+		// it is what promotes a pending probe to delivered. It is matched by
+		// SHAPE, not by content: a real remove/dequeue line usually carries no
+		// content at all, so there is nothing to compare against the probe
+		// text. `dequeue` is an undocumented third operation that behaves like
+		// `remove` and is far from rare (1266 vs 1156 on-disk), so ignoring it
+		// would strand roughly half of all probes in pending forever.
+		if t.probes != nil {
+			t.probes.NoteRemoval(entry.entryTime())
+		}
 	}
 }
 
@@ -711,9 +760,18 @@ func (t *Tailer) processLine(raw []byte) {
 	// the session mutex is taken at most once per poll cycle.
 	turnID := t.turnID()
 
+	// The line is unmarshalled BEFORE the activity hook fires because whether
+	// it counts as agent progress depends on what it is: the enqueue line the
+	// wrapper's own probe caused must not reset the deadline of the turn it is
+	// probing. A malformed line still counts as activity (it came from the
+	// agent's process either way) and is reported below.
+	var entry transcriptEntry
+	parseErr := json.Unmarshal(raw, &entry)
+
 	// Any non-empty transcript line is agent progress: signal liveness for the
 	// in-flight turn so the session can treat its deadline as an inactivity timer.
-	t.fireActivity(turnID)
+	probeOriginated := parseErr == nil && t.classifyProbeEnqueue(entry)
+	t.fireActivity(turnID, probeOriginated)
 
 	// On turn change, drop any tool_use ids left uncorrelated by the prior turn
 	// (a tool_result that never arrived) so toolNames cannot grow unbounded.
@@ -731,14 +789,13 @@ func (t *Tailer) processLine(raw []byte) {
 		t.taskTurnID = turnID
 	}
 
-	var entry transcriptEntry
-	if err := json.Unmarshal(raw, &entry); err != nil {
+	if parseErr != nil {
 		// Malformed line - emit raw event, never drop
 		t.log.Info("agent stream",
 			"action", "agent_stream",
 			"stream_type", "raw",
 			"raw_line", t.redactor.Scrub(string(raw)),
-			"parse_error", err.Error(),
+			"parse_error", parseErr.Error(),
 			"turn_id", turnID,
 		)
 		t.incCounter("raw")
@@ -824,6 +881,24 @@ func (t *Tailer) processLine(raw []byte) {
 				"text", t.redactor.Scrub(block.Text),
 			)
 			t.incCounter("text")
+			// A probe answer is an ordinary assistant text block - the spike
+			// confirmed it lands in the transcript exactly like any other, at
+			// the next tool-call boundary, without disturbing the turn in
+			// flight. Only assistant blocks are considered so the CLI's echo
+			// of the probe text back as a user message (which necessarily
+			// contains the marker, since the probe asks for it) cannot answer
+			// the probe itself.
+			if t.probes != nil && msg.Role == "assistant" {
+				if latency, ok := t.probes.NoteAssistantText(block.Text, entry.entryTime()); ok {
+					t.log.Info("liveness probe answered",
+						"action", "probe_answered",
+						"turn_id", turnID,
+						"session_id", entry.SessionID,
+						"latency_ms", latency.Milliseconds(),
+						"text", t.redactor.Scrub(block.Text),
+					)
+				}
+			}
 		case "thinking":
 			if block.Thinking == "" {
 				// Empty Thinking field is an unexpected shape - emit raw so it is
