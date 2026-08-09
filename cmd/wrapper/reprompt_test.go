@@ -22,9 +22,9 @@ func TestReprompt_BudgetAndRollback(t *testing.T) {
 			require.Equal(t, "https://cb/x", cb)
 			return "turn-1", nil
 		}}
-		require.True(t, a.reprompt("decline_implementation", "400: blank reason", "https://cb/x"))
-		require.True(t, a.reprompt("decline_implementation", "400", "https://cb/x"))
-		require.False(t, a.reprompt("decline_implementation", "400", "https://cb/x"),
+		require.True(t, a.reprompt("submit_outcome", "400: blank reason", "https://cb/x"))
+		require.True(t, a.reprompt("submit_outcome", "400", "https://cb/x"))
+		require.False(t, a.reprompt("submit_outcome", "400", "https://cb/x"),
 			"third re-prompt must be refused once the budget is exhausted")
 		require.Equal(t, maxOutcomeReprompts, calls)
 	})
@@ -39,9 +39,9 @@ func TestReprompt_BudgetAndRollback(t *testing.T) {
 			}
 			return "turn-2", nil
 		}}
-		require.False(t, a.reprompt("already_done", "400", ""), "a failed submit must not count against the budget")
+		require.False(t, a.reprompt("submit_outcome", "400", ""), "a failed submit must not count against the budget")
 		fail = false
-		require.True(t, a.reprompt("already_done", "400", ""), "budget must be intact after a failed submit")
+		require.True(t, a.reprompt("submit_outcome", "400", ""), "budget must be intact after a failed submit")
 		require.Equal(t, 2, calls)
 	})
 
@@ -57,7 +57,7 @@ func TestReprompt_BudgetAndRollback(t *testing.T) {
 		var wg sync.WaitGroup
 		for i := 0; i < 10; i++ {
 			wg.Add(1)
-			go func() { defer wg.Done(); a.reprompt("decline_implementation", "e", "") }()
+			go func() { defer wg.Done(); a.reprompt("submit_outcome", "e", "") }()
 		}
 		wg.Wait()
 		require.LessOrEqual(t, calls, maxOutcomeReprompts)

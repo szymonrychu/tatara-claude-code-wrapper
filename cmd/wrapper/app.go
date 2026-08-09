@@ -55,6 +55,35 @@ type app struct {
 	// to a.sess.Submit. Injectable so the re-prompt budget logic is unit-testable
 	// without a live PTY session.
 	submitFn func(text, callbackURL string) (string, error)
+	// heldInternalIssues carries report_internal_issue reports forward from a
+	// turn whose callback the outcome re-prompt suppressed onto the next turn's
+	// callback. That callback is a pod's only egress for these reports (agent
+	// pods are not Loki-scraped), so without the hand-off a re-prompted turn's
+	// reports are lost outright. Guarded by heldIssuesMu: finalizeTurn runs on a
+	// per-turn goroutine.
+	heldIssuesMu       sync.Mutex
+	heldInternalIssues []turn.InternalIssueReport
+}
+
+// holdInternalIssues parks reports from a turn whose callback was suppressed by
+// the outcome re-prompt, for the next turn's callback to carry.
+func (a *app) holdInternalIssues(reports []turn.InternalIssueReport) {
+	if len(reports) == 0 {
+		return
+	}
+	a.heldIssuesMu.Lock()
+	defer a.heldIssuesMu.Unlock()
+	a.heldInternalIssues = append(a.heldInternalIssues, reports...)
+}
+
+// takePendingInternalIssues returns and clears the reports held from earlier
+// suppressed turns.
+func (a *app) takePendingInternalIssues() []turn.InternalIssueReport {
+	a.heldIssuesMu.Lock()
+	defer a.heldIssuesMu.Unlock()
+	held := a.heldInternalIssues
+	a.heldInternalIssues = nil
+	return held
 }
 
 func newApp(ctx context.Context, cfg config) (*app, error) {
@@ -219,6 +248,19 @@ func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log
 		}
 	}
 
+	// Drain any report_internal_issue calls the agent made this turn so the
+	// operator's callback carries them (agent pods are not Loki-scraped; only
+	// the operator's collected stdout is alertable), and pick up anything a
+	// previous re-prompted turn handed forward.
+	//
+	// This MUST stay above the outcome-reprompt block below, which returns
+	// early to suppress this turn's callback. With the drain underneath it, a
+	// re-prompted turn lost 100% of its reports: the accumulator is keyed by
+	// turn id, so the next turn's drain never matches, and the suppressed
+	// callback is the only egress a pod has (#136 pre-mortem 1, filed as a
+	// residual in docs/superpowers/plans/2026-07-19-w1-lastcompleted-fallback.md).
+	rec.InternalIssues = append(a.takePendingInternalIssues(), a.sess.DrainInternalIssues(rec.ID)...)
+
 	// Defect C: a critical outcome tool (submit_outcome) the operator rejected
 	// (e.g. blank reason -> 400) shows up in the turn transcript as an
 	// is_error tool_result. Rather than let the turn finish
@@ -234,8 +276,13 @@ func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log
 		} else if found {
 			if a.reprompt(toolName, errText, rec.CallbackURL) {
 				m.OutcomeRepromptTotal.WithLabelValues(toolName, "reprompted").Inc()
+				// Hand this turn's reports to the next one: rec is discarded
+				// here and its callback never sent, so without this they are
+				// lost outright.
+				a.holdInternalIssues(rec.InternalIssues)
 				log.Info("re-prompted agent after rejected outcome tool; suppressing this turn's callback",
-					"action", "outcome_reprompt", "turn_id", rec.ID, "tool", toolName, "error", errText)
+					"action", "outcome_reprompt", "turn_id", rec.ID, "tool", toolName, "error", errText,
+					"held_internal_issues", len(rec.InternalIssues))
 				return
 			}
 			m.OutcomeRepromptTotal.WithLabelValues(toolName, "budget_exhausted").Inc()
@@ -243,11 +290,6 @@ func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log
 				"action", "outcome_reprompt", "turn_id", rec.ID, "tool", toolName)
 		}
 	}
-
-	// Drain any report_internal_issue calls the agent made this turn so the
-	// operator's callback carries them (agent pods are not Loki-scraped; only
-	// the operator's collected stdout is alertable).
-	rec.InternalIssues = a.sess.DrainInternalIssues(rec.ID)
 
 	url := rec.CallbackURL
 	if url == "" {
