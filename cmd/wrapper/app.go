@@ -262,27 +262,41 @@ func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log
 	rec.InternalIssues = append(a.takePendingInternalIssues(), a.sess.DrainInternalIssues(rec.ID)...)
 
 	// Defect C: a critical outcome tool (submit_outcome) the operator rejected
-	// (e.g. blank reason -> 400) shows up in the turn transcript as an
-	// is_error tool_result. Rather than let the turn finish
-	// silently (which the operator misreads as "refused-no-explanation"),
-	// re-prompt the agent to retry with a non-blank reason, and skip THIS
-	// turn's callback - the re-prompted turn delivers its own. Bounded by
+	// shows up in the turn transcript as an is_error tool_result. Rather than
+	// let the turn finish silently (which the operator misreads as
+	// "refused-no-explanation"), re-prompt the agent and skip THIS turn's
+	// callback - the re-prompted turn delivers its own. Bounded by
 	// maxOutcomeReprompts so a stuck agent still reaches the operator's cap.
+	//
+	// THE DIRECTIVE IS CLASSIFIED BY STATUS (tatara-operator#578). It used to be
+	// one MANDATORY "call it again, do not finish the turn until it succeeds" for
+	// EVERY is_error result. Against a 4xx that instruction is unsatisfiable by
+	// construction - a client error means the identical call can never succeed -
+	// so it turns one bad response into a turn loop and, through the operator's
+	// pod-recreation budget, into a burned Task. Task
+	// mt-i-mtg-decks-22-3f4594d8ce81d4d0 spent 7 pod runs and 3 pod recreations
+	// that way on a single doomed 400. Only a 5xx or an unclassifiable transport
+	// failure is retryable; see repromptDirective.
 	if path := a.sess.TranscriptPath(); path != "" {
 		toolName, errText, found, ferr := transcript.FailedCriticalOutcome(path)
 		if ferr != nil {
 			log.Warn("outcome-reprompt scan failed; delivering callback as-is",
 				"action", "outcome_reprompt", "turn_id", rec.ID, "error", ferr)
 		} else if found {
+			retryable := retryableOutcomeFailure(errText)
+			result := "reprompted"
+			if !retryable {
+				result = "reprompted_corrective"
+			}
 			if a.reprompt(toolName, errText, rec.CallbackURL) {
-				m.OutcomeRepromptTotal.WithLabelValues(toolName, "reprompted").Inc()
+				m.OutcomeRepromptTotal.WithLabelValues(toolName, result).Inc()
 				// Hand this turn's reports to the next one: rec is discarded
 				// here and its callback never sent, so without this they are
 				// lost outright.
 				a.holdInternalIssues(rec.InternalIssues)
 				log.Info("re-prompted agent after rejected outcome tool; suppressing this turn's callback",
 					"action", "outcome_reprompt", "turn_id", rec.ID, "tool", toolName, "error", errText,
-					"held_internal_issues", len(rec.InternalIssues))
+					"retryable", retryable, "held_internal_issues", len(rec.InternalIssues))
 				return
 			}
 			m.OutcomeRepromptTotal.WithLabelValues(toolName, "budget_exhausted").Inc()
@@ -558,12 +572,60 @@ func readLines(p string) []string {
 
 func newTurnID() string { return "turn-" + strconv.FormatInt(time.Now().UnixNano(), 36) }
 
+// retryableOutcomeFailure classifies a rejected outcome tool_result
+// (tatara-operator#578). A 5xx is the operator failing on its own side and the
+// identical call succeeds once it recovers; a 4xx is a CLIENT error and the
+// identical call can never succeed.
+//
+// AN UNCLASSIFIABLE TEXT IS TREATED AS RETRYABLE. A transport failure, an MCP
+// framing error or any wording that carries no status is exactly the case where
+// a retry is the right move, and it must never be silently downgraded into "this
+// is your fault, do not retry".
+func retryableOutcomeFailure(errText string) bool {
+	status, ok := transcript.OutcomeErrorStatus(errText)
+	if !ok {
+		return true
+	}
+	return status >= 500
+}
+
+// repromptDirective is the corrective text a re-prompt carries, and the whole
+// point of splitting it in two (tatara-operator#578).
+//
+// THE MANDATORY FORM IS ONLY EVER LEGAL FOR A RETRYABLE FAILURE. "Do not finish
+// the turn until the call succeeds" is satisfiable when the operator failed
+// transiently. Aimed at a 4xx it is an instruction to loop forever on a call
+// that is refused by construction, which is precisely what burned
+// mt-i-mtg-decks-22: three identical re-submissions per turn, seven pod runs,
+// three pod recreations, parked no-outcome.
+//
+// The non-retryable form keeps the reason this path exists - a MALFORMED payload
+// is a 4xx the agent really can correct - while (a) forbidding an unchanged
+// resend, and (b) explicitly authorising the agent to STOP and report, which is
+// the only correct move against a precondition it cannot influence.
+func repromptDirective(tool, errText string, retryable bool) string {
+	errText = strings.TrimSpace(errText)
+	if retryable {
+		return fmt.Sprintf("Your %s call failed on the operator's side, which is not a rejection of "+
+			"what you sent: %s. That is a transient failure, so the same call should succeed. "+
+			"Call %s again with the SAME arguments. Do not finish the turn until the call succeeds.",
+			tool, errText, tool)
+	}
+	return fmt.Sprintf("Your %s call was REFUSED by the operator: %s. This is a client error, so the "+
+		"IDENTICAL call will never succeed - do not resend it unchanged and do not retry it in a loop. "+
+		"If the refusal names something you can correct (a missing or malformed argument), fix that one "+
+		"thing and call %s once more. If instead it describes a precondition you cannot change, STOP: "+
+		"finish the turn and file it with report_internal_issue.",
+		tool, errText, tool)
+}
+
 // reprompt submits a corrective turn telling the agent its critical outcome
-// tool call was rejected and must be retried with a non-blank reason. It returns
-// true when a re-prompt was issued, false when the budget is exhausted or the
-// session would not accept a new turn (in which case the caller delivers the
-// callback so the operator's empty-retry cap applies). The corrective text reuses
-// the same callback URL so the eventual completion still reaches the operator.
+// tool call was rejected, in the form repromptDirective picks for the failure's
+// class. It returns true when a re-prompt was issued, false when the budget is
+// exhausted or the session would not accept a new turn (in which case the caller
+// delivers the callback so the operator's empty-retry cap applies). The
+// corrective text reuses the same callback URL so the eventual completion still
+// reaches the operator.
 func (a *app) reprompt(tool, errText, callbackURL string) bool {
 	a.repromptMu.Lock()
 	if a.outcomeReprompts >= maxOutcomeReprompts {
@@ -573,9 +635,7 @@ func (a *app) reprompt(tool, errText, callbackURL string) bool {
 	a.outcomeReprompts++
 	a.repromptMu.Unlock()
 
-	msg := fmt.Sprintf("Your %s call was rejected by the operator: %s. "+
-		"This is mandatory: call %s again with a clear, non-blank `reason` explaining the decision. "+
-		"Do not finish the turn until the call succeeds.", tool, strings.TrimSpace(errText), tool)
+	msg := repromptDirective(tool, errText, retryableOutcomeFailure(errText))
 	if _, err := a.submitFn(msg, callbackURL); err != nil {
 		// Roll back the budget consumption: no turn was actually submitted.
 		a.repromptMu.Lock()
