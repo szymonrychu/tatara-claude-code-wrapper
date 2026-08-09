@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -260,4 +261,100 @@ func TestFinalizeTurn_DrainsInternalIssuesIntoRecord_DespiteTailerPollLag(t *tes
 		t.Errorf("delivered.InternalIssues = %+v, want [%+v] (report flushed to disk before the Stop hook must never be dropped by tailer poll lag)",
 			delivered.InternalIssues, want)
 	}
+}
+
+// TestFinalizeTurn_OutcomeRepromptDoesNotLoseInternalIssues covers #136's
+// pre-mortem 1, a self-documented residual from
+// docs/superpowers/plans/2026-07-19-w1-lastcompleted-fallback.md:383
+// ("cmd/wrapper/app.go:239's outcome-reprompt early return still drops
+// rec.InternalIssues for that turn - separate bug").
+//
+// The drain used to sit BELOW the outcome-reprompt early return, so a turn
+// whose submit_outcome was rejected lost every report_internal_issue call it
+// made: the callback for that turn is deliberately suppressed, the accumulator
+// is keyed by turn id, and agent pods are not Loki-scraped - the operator
+// callback is the only egress. The loss was total and silent, and it was
+// dormant only while the re-prompt itself was dead code (the trigger named two
+// tools tatara-cli had reaped).
+//
+// Draining above the early return is necessary but not sufficient: rec is
+// discarded on that path. The reports must be carried onto the NEXT turn's
+// callback, which is what this test pins.
+func TestFinalizeTurn_OutcomeRepromptDoesNotLoseInternalIssues(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	lines := []string{
+		// The turn reports a platform problem ...
+		`{"type":"assistant","uuid":"u1","sessionId":"s1","timestamp":"2026-07-29T12:44:35.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"mcp__tatara__report_internal_issue","input":{"category":"workspace_broken","severity":"warn","description":"no C toolchain in the pod","offending_tool":"Bash (make test)","resource_id":"res-1"}}]}}`,
+		// ... then its submit_outcome is rejected client-side by the cli.
+		`{"type":"assistant","uuid":"u2","sessionId":"s1","timestamp":"2026-07-29T12:44:36.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu2","name":"mcp__tatara__submit_outcome","input":{"action":"declined"}}]}}`,
+		`{"type":"user","uuid":"u3","sessionId":"s1","timestamp":"2026-07-29T12:44:37.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu2","is_error":true,"content":"submit_outcome: decline_reason required (non-empty) when action=declined"}]}}`,
+	}
+	require.NoError(t, os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644))
+
+	wh := &waitForLogHandler{want: "internal issue report", ready: make(chan struct{})}
+	tailer := transcript.NewTailer(slog.New(wh), transcript.NewRedactor(nil), func() string { return "turn-1" })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	followDone := make(chan error, 1)
+	go func() { followDone <- tailer.Follow(ctx, path) }()
+	select {
+	case <-wh.ready:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for the tailer to process the internal issue line")
+	}
+	cancel()
+	<-followDone
+
+	mgr := session.New(session.Config{}, turn.NewStore(), metrics.New(prometheus.NewRegistry()), testLogger(), time.Now, func() string { return "turn-1" })
+	mgr.SetTailerForTest(tailer)
+	mgr.SetTranscriptPathForTest(path)
+
+	var delivered turn.Record
+	gotCh := make(chan struct{}, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&delivered)
+		gotCh <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	sender := webhook.New(webhook.Config{Retries: 1}, metrics.New(prometheus.NewRegistry()), testLogger())
+
+	var submits int
+	a := &app{log: testLogger(), sess: mgr, submitFn: func(text, cb string) (string, error) {
+		submits++
+		require.Contains(t, text, "submit_outcome")
+		return "turn-2", nil
+	}}
+
+	// Turn 1: rejected submit_outcome -> re-prompt, callback suppressed.
+	a.finalizeTurn(&turn.Record{ID: "turn-1", CallbackURL: srv.URL},
+		config{}, metrics.New(prometheus.NewRegistry()), testLogger(), sender, "")
+	require.Equal(t, 1, submits, "a rejected submit_outcome must re-prompt the agent")
+	select {
+	case <-gotCh:
+		t.Fatal("turn 1's callback must be suppressed while the agent is re-prompted")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Turn 2: the re-prompted turn succeeds. Its callback must carry turn 1's
+	// report, which has nowhere else to go.
+	mgr.SetTranscriptPathForTest("")
+	a.finalizeTurn(&turn.Record{ID: "turn-2", CallbackURL: srv.URL},
+		config{}, metrics.New(prometheus.NewRegistry()), testLogger(), sender, "")
+	select {
+	case <-gotCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn 2's callback never delivered")
+	}
+
+	want := turn.InternalIssueReport{
+		Category: "workspace_broken", Severity: "warn", Description: "no C toolchain in the pod",
+		OffendingTool: "Bash (make test)", ResourceID: "res-1",
+	}
+	require.Equalf(t, []turn.InternalIssueReport{want}, delivered.InternalIssues,
+		"a report filed during a re-prompted turn must reach the operator on the next callback; "+
+			"the suppressed turn's callback is its only egress")
 }

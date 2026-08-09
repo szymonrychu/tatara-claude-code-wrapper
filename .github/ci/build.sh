@@ -29,7 +29,7 @@ BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # TATARA_CLI_VERSION pins the cli SHA baked into the image; keep in sync with
 # Dockerfile ARG default and Makefile default.  Use the short SHA published by
 # tatara-cli CI (both SHORT_SHA and VERSION tags are pushed on every main merge).
-TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-v1.7.0}"
+TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-v2.0.1}"
 # TATARA_SKILLS_REF pins the skills plugin ref baked as the runtime ENV default;
 # keep in sync with the Dockerfile ARG default and Makefile default. Rewritten by
 # the skills->wrapper cd-release bump - which rewrites the DOCKERFILE only, so
@@ -55,9 +55,12 @@ EOF
 CONTEXT="https://github.com/szymonrychu/${REPO}.git#${BUILD_REF}"
 
 # Build-guard FIRST (build-only, never pushed). The Dockerfile `test-guard`
-# stage runs the MCP-tools flowthrough test with the pinned tatara cli on PATH;
-# if the baked cli dropped a tool the wrapper relies on, the test fails and this
-# command exits non-zero BEFORE the runtime image below is built/pushed. This is
+# stage runs the MCP-tools flowthrough test with the pinned tatara cli on PATH,
+# plus the prompt-text guard (#136) that checks every MCP tool name this repo
+# puts in front of an agent against that same live tools/list; if the baked cli
+# dropped a tool the wrapper relies on or names in the CLAUDE.md it injects, the
+# test fails and this command exits non-zero BEFORE the runtime image below is
+# built/pushed. This is
 # the explicit driver the guard needs: buildkit does dead-stage elimination, so
 # building only the runtime target would never reach test-guard (it is not in
 # the runtime DAG). Omitting --output builds the target stage for its side
