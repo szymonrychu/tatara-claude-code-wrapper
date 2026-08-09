@@ -1,0 +1,1 @@
+{"parentUuid":"uuid-parent-1","isSidechain":true,"userType":"external","cwd":"/workspace","sessionId":"sess-sub","version":"2.1.226","gitBranch":"main","type":"assistant","uuid":"uuid-sub-1","timestamp":"2026-08-09T17:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"subagent working"}]}}

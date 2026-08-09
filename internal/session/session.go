@@ -108,6 +108,23 @@ type Snapshot struct {
 	LastActivityAt time.Time `json:"lastActivityAt"` // last agent_stream event of the in-flight turn; zero when idle
 	// ContractVersion is asserted by the operator before turn-0 (contract G.10).
 	ContractVersion int `json:"contractVersion"`
+
+	// LastSubagentActivityAt is the last transcript line read from any
+	// subagents/agent-*.jsonl file. The parent transcript can be silent for
+	// the entire lifetime of a subagent run (measured: 2095s), so
+	// LastActivityAt alone reports a busy pod as idle. Zero when no subagent
+	// line has ever been read.
+	LastSubagentActivityAt time.Time `json:"lastSubagentActivityAt"`
+	// OutstandingSubagentCalls is the number of `Task` tool_use blocks in the
+	// parent transcript with no matching tool_result: subagents believed to be
+	// running right now.
+	OutstandingSubagentCalls int64 `json:"outstandingSubagentCalls"`
+	// ProbePendingSince and StallSuspectedSince are part of the stall-detection
+	// contract and are reported so the operator side has a stable shape from
+	// the first release. They are always zero in this phase: nothing probes
+	// and nothing marks a stall yet.
+	ProbePendingSince   time.Time `json:"probePendingSince"`
+	StallSuspectedSince time.Time `json:"stallSuspectedSince"`
 }
 
 type Manager struct {
@@ -173,6 +190,17 @@ type Manager struct {
 	tailerCtx     context.Context
 	tailerCancel  context.CancelFunc
 	tailerStarted bool
+
+	// subagentsStarted latches the subagents/ watcher so ensureTailerFollowing
+	// can be called on every Submit without launching a second poller.
+	subagentsStarted bool
+	// lastSubagentActivity is a UnixNano stamp of the most recent transcript
+	// line read from any subagents/agent-*.jsonl. Atomic because it is written
+	// from each subagent tailer's goroutine and read by Snapshot. It is
+	// DELIBERATELY not fed into the turn's inactivity timer in this phase:
+	// doing so would change when turns time out, which is a behaviour change
+	// this phase does not make.
+	lastSubagentActivity atomic.Int64
 }
 
 func New(cfg Config, store *turn.Store, m *metrics.Metrics, log *slog.Logger, now func() time.Time, newID func() string) *Manager {
@@ -213,6 +241,7 @@ func (mgr *Manager) StartTailer(ctx context.Context) {
 	tailer.WithCounter(mgr.m.StreamEventsTotal)
 	tailer.WithInternalIssueCounter(mgr.m.InternalIssueTotal)
 	tailer.WithToolCallsCounter(mgr.m.ToolCallsTotal)
+	tailer.WithQueueOpsCounter(mgr.m.QueueOpsTotal)
 	tailer.WithActivity(mgr.onTailerActivity)
 	tailerCtx, cancel := context.WithCancel(ctx) //nolint:gosec // cancel is stored in mgr.tailerCancel and invoked by Shutdown/path-change restart
 	mgr.mu.Lock()
@@ -247,6 +276,25 @@ func (mgr *Manager) onTailerActivity(turnID string) {
 	}
 	mgr.store.Touch(turnID, mgr.now())
 	mgr.timer.Reset(mgr.cfg.TurnTimeout)
+}
+
+// onSubagentActivity is the liveness hook for a subagent transcript
+// (subagents/agent-*.jsonl). It stamps lastSubagentActivity AND NOTHING ELSE.
+//
+// It deliberately does NOT touch mgr.timer, mgr.store, or the in-flight turn.
+// Subagent work is currently invisible to the wrapper, so wiring it into the
+// turn's inactivity timer would silently make turns that used to time out stop
+// timing out - a behaviour change. This phase publishes the observation
+// through Snapshot.LastSubagentActivityAt and lets the operator decide what to
+// do with it. TestSubagentActivity_DoesNotResetTurnTimer guards this.
+func (mgr *Manager) onSubagentActivity(string) {
+	mgr.lastSubagentActivity.Store(mgr.now().UnixNano())
+}
+
+// FireSubagentActivityForTest drives the subagent activity hook directly,
+// simulating a line read from a subagent transcript. Test-only.
+func (mgr *Manager) FireSubagentActivityForTest(turnID string) {
+	mgr.onSubagentActivity(turnID)
 }
 
 // logTranscriptEnabled returns true unless CCW_LOG_TRANSCRIPT is explicitly "false".
@@ -1076,6 +1124,8 @@ func (mgr *Manager) ensureTailerFollowing() {
 	mgr.wg.Add(1)
 	mgr.mu.Unlock()
 
+	mgr.ensureSubagentsFollowing(tailerCtx, dir)
+
 	go func() {
 		defer mgr.wg.Done()
 		path, ok := mgr.awaitTranscriptFile(tailerCtx, dir)
@@ -1096,6 +1146,103 @@ func (mgr *Manager) ensureTailerFollowing() {
 			"action", "tailer_discovered", "path", path)
 		if err := tailer.Follow(tailerCtx, path); err != nil && tailerCtx.Err() == nil {
 			mgr.log.Error("transcript tailer error", "err", err)
+		}
+	}()
+}
+
+// subagentPollInterval is how often followSubagents re-globs for new subagent
+// transcripts. A subagent that runs for seconds is still worth seeing, and the
+// glob is one syscall against a directory with a handful of entries.
+const subagentPollInterval = 2 * time.Second
+
+// ensureSubagentsFollowing launches the subagents/ watcher exactly once.
+func (mgr *Manager) ensureSubagentsFollowing(ctx context.Context, dir string) {
+	mgr.mu.Lock()
+	if mgr.subagentsStarted {
+		mgr.mu.Unlock()
+		return
+	}
+	mgr.subagentsStarted = true
+	mgr.wg.Add(1)
+	mgr.mu.Unlock()
+
+	go func() {
+		defer mgr.wg.Done()
+		mgr.followSubagents(ctx, dir)
+	}()
+}
+
+// followSubagents watches <dir>/subagents/ for agent-*.jsonl files and starts
+// one additional Tailer per file it has not seen before.
+//
+// This closes the wrapper's largest observability hole. Claude Code writes a
+// subagent's entire conversation to <sessionDir>/subagents/agent-<id>.jsonl,
+// and the main tailer's discovery glob (`<dir>/*.jsonl`) is non-recursive, so
+// it never sees any of it. During one real subagent run the parent transcript
+// was silent for 2095 seconds - 35 minutes in which the pod was working flat
+// out and the wrapper could not tell it apart from a hang.
+//
+// Each subagent tailer is wired to onSubagentActivity, which stamps a
+// timestamp and nothing else: this phase makes the work VISIBLE, it does not
+// change what anything does about it. The subagent tailers share the session's
+// tailerCtx, so Shutdown cancels them along with the main one.
+//
+// Files are never un-followed; a pod that launches very many subagents holds
+// one file handle each until shutdown. Acceptable at observed volumes and
+// tracked as a follow-up for the phase that adds idle-close.
+func (mgr *Manager) followSubagents(ctx context.Context, dir string) {
+	subDir := filepath.Join(dir, "subagents")
+	pattern := filepath.Join(subDir, "agent-*.jsonl")
+	seen := make(map[string]bool)
+	for {
+		if ctx == nil || ctx.Err() != nil {
+			return
+		}
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			// The pattern is a constant with no metacharacter risk, so an error
+			// here is not recoverable by retrying: stop rather than log-spam.
+			mgr.log.Warn("tailer: subagent glob failed; subagent transcripts will not be followed",
+				"action", "subagent_discover_failed", "dir", subDir, "err", err)
+			return
+		}
+		for _, path := range matches {
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+			mgr.startSubagentTailer(ctx, path)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(subagentPollInterval):
+		}
+	}
+}
+
+// startSubagentTailer launches one Tailer over a single subagent transcript.
+//
+// It gets its own Tailer (not the session's) because Tailer.Follow owns one
+// file. It is wired to the stream/tool/queue counters so a subagent's tool
+// failures and queue operations are still counted, but NOT to the
+// internal-issue accumulator: only the main tailer is ever drained, so
+// accumulating there would grow a slice nothing reads.
+func (mgr *Manager) startSubagentTailer(ctx context.Context, path string) {
+	redactor := transcript.NewRedactor(secretsFromEnv())
+	tailer := transcript.NewTailer(mgr.log, redactor, mgr.currentTurnID)
+	tailer.WithCounter(mgr.m.StreamEventsTotal)
+	tailer.WithToolCallsCounter(mgr.m.ToolCallsTotal)
+	tailer.WithQueueOpsCounter(mgr.m.QueueOpsTotal)
+	tailer.WithActivity(mgr.onSubagentActivity)
+
+	mgr.log.Info("subagent transcript tailer started",
+		"action", "subagent_tailer_started", "path", path)
+	mgr.wg.Add(1)
+	go func() {
+		defer mgr.wg.Done()
+		if err := tailer.Follow(ctx, path); err != nil && ctx.Err() == nil {
+			mgr.log.Error("subagent transcript tailer error", "action", "subagent_tailer_error", "path", path, "err", err)
 		}
 	}()
 }
@@ -1360,6 +1507,14 @@ func (mgr *Manager) Snapshot() Snapshot {
 			lastActivity = rec.LastActivityAt
 		}
 	}
+	var lastSubagent time.Time
+	if ns := mgr.lastSubagentActivity.Load(); ns != 0 {
+		lastSubagent = time.Unix(0, ns)
+	}
+	var outstandingSubagents int64
+	if mgr.tailer != nil {
+		outstandingSubagents = mgr.tailer.OutstandingTaskCalls()
+	}
 	return Snapshot{
 		State:           mgr.state,
 		TurnsCompleted:  mgr.turnsSucceeded, // successful turns only (finding 11)
@@ -1368,6 +1523,11 @@ func (mgr *Manager) Snapshot() Snapshot {
 		Repo:            mgr.cfg.Repo,
 		LastActivityAt:  lastActivity,
 		ContractVersion: version.ContractVersion,
+
+		LastSubagentActivityAt:   lastSubagent,
+		OutstandingSubagentCalls: outstandingSubagents,
+		// ProbePendingSince/StallSuspectedSince are intentionally left zero:
+		// the probe and the stall marker land in later phases.
 	}
 }
 

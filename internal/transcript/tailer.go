@@ -61,6 +61,15 @@ type ToolCallsCounter interface {
 	WithLabelValues(lvs ...string) prometheus.Counter
 }
 
+// QueueOpsCounter is satisfied by *prometheus.CounterVec with label {op}. It
+// counts `queue-operation` transcript entries, which are how Claude Code
+// records a message being parked while a turn is mid-tool-call and later
+// delivered. Distinct interface from StreamCounter so the 1-label {op} shape
+// is explicit at the call site.
+type QueueOpsCounter interface {
+	WithLabelValues(lvs ...string) prometheus.Counter
+}
+
 // tataraToolPrefix is the namespace every tatara MCP tool carries as Claude
 // sees it (the cli server registers as "tatara"). Any tool under this prefix
 // is the platform's own bounded surface, so it is kept verbatim as the metric
@@ -92,6 +101,98 @@ func clampToolName(name string) string {
 	return "other"
 }
 
+// taskToolName is the built-in tool Claude Code uses to launch a subagent.
+// An outstanding Task call is the parent turn's only in-band evidence that
+// work is happening in a subagent transcript rather than in its own file.
+const taskToolName = "Task"
+
+// knownQueueOps is the fixed cardinality set for the ccw_queue_operations_total
+// {op} label. Observed in real transcripts: `enqueue` (a message parked while
+// the turn is mid-tool-call), `remove` and `dequeue` (it left the queue).
+var knownQueueOps = map[string]bool{
+	"enqueue": true, "remove": true, "dequeue": true,
+}
+
+// clampQueueOp bounds the ccw_queue_operations_total{op} label.
+func clampQueueOp(op string) string {
+	if knownQueueOps[op] {
+		return op
+	}
+	return "other"
+}
+
+// maxPendingQueueItems bounds the queueTracker's pending slice. A transcript
+// is read from the start on every (re)open, so an enqueue whose remove was
+// written before the tailer attached can linger; the cap makes that leak
+// bounded rather than unbounded.
+const maxPendingQueueItems = 128
+
+type queuedItem struct {
+	key string
+	at  time.Time
+}
+
+// queueTracker records `queue-operation` enqueues that have not yet been
+// matched by a remove/dequeue. An enqueue with no matching removal is the
+// signal that a message was accepted by the CLI but never delivered to the
+// model - i.e. the turn is blocked inside a single long tool call. In this
+// phase nothing acts on it; it is exposed through PendingSince for later
+// phases and for tests.
+//
+// Guarded by its own mutex: it is written from the tailer goroutine and read
+// from whichever goroutine asks for a snapshot.
+type queueTracker struct {
+	mu      sync.Mutex
+	pending []queuedItem
+}
+
+// enqueue records that key entered the queue at at.
+func (q *queueTracker) enqueue(key string, at time.Time) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.pending = append(q.pending, queuedItem{key: key, at: at})
+	if len(q.pending) > maxPendingQueueItems {
+		q.pending = q.pending[len(q.pending)-maxPendingQueueItems:]
+	}
+}
+
+// remove drops the oldest pending item matching key. A real `remove` line
+// frequently carries NO content (verified against on-disk transcripts), in
+// which case key is "" and the whole pending set is cleared: the queue
+// drained and there is no way to tell which item left. An unmatched non-empty
+// key also drops the oldest entry rather than leaving it pending forever,
+// since the only way to see a removal for an unseen enqueue is to have
+// attached to the transcript after that enqueue was written.
+func (q *queueTracker) remove(key string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.pending) == 0 {
+		return
+	}
+	if key == "" {
+		q.pending = nil
+		return
+	}
+	for i, it := range q.pending {
+		if it.key == key {
+			q.pending = append(q.pending[:i:i], q.pending[i+1:]...)
+			return
+		}
+	}
+	q.pending = q.pending[1:]
+}
+
+// PendingSince returns the enqueue time of the oldest queue entry that has
+// not been removed, and whether there is one at all.
+func (q *queueTracker) PendingSince() (time.Time, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.pending) == 0 {
+		return time.Time{}, false
+	}
+	return q.pending[0].at, true
+}
+
 // Tailer reads a JSONL transcript file from the start and follows appends.
 // It re-opens the file on inode change (claude restart) and never drops a
 // malformed line (emits a raw event instead).
@@ -102,7 +203,23 @@ type Tailer struct {
 	counter              StreamCounter
 	internalIssueCounter InternalIssueCounter
 	toolCallsCounter     ToolCallsCounter
+	queueOpsCounter      QueueOpsCounter
 	onActivity           func(turnID string)
+
+	// queue records unmatched `queue-operation` enqueues. Observation only in
+	// this phase - nothing reads it to make a decision yet.
+	queue queueTracker
+
+	// taskUseIDs holds the ids of `Task` tool_use blocks whose tool_result has
+	// not arrived, i.e. subagents believed to still be running. Deliberately
+	// NOT keyed off toolNames: that map exists only when WithToolCallsCounter
+	// is wired, so keying off it would make subagent visibility depend on an
+	// unrelated metric being enabled. Written and read only from the
+	// processLine goroutine; taskCalls mirrors len(taskUseIDs) as an atomic so
+	// OutstandingTaskCalls can be read from any goroutine.
+	taskUseIDs map[string]struct{}
+	taskTurnID string
+	taskCalls  atomic.Int64
 
 	// toolNames correlates a tool_use_id to its clamped tool name so a later
 	// tool_result (which carries only the id) can be attributed to a tool for
@@ -138,7 +255,10 @@ type Tailer struct {
 // NewTailer constructs a Tailer. turnID is called per event to get the current
 // in-flight turn id (may return ""). counter may be nil (no metrics).
 func NewTailer(log *slog.Logger, redactor *Redactor, turnID func() string) *Tailer {
-	return &Tailer{log: log, redactor: redactor, turnID: turnID}
+	return &Tailer{
+		log: log, redactor: redactor, turnID: turnID,
+		taskUseIDs: make(map[string]struct{}),
+	}
 }
 
 // WithCounter attaches a prometheus-compatible counter. Returns self for chaining.
@@ -160,6 +280,27 @@ func (t *Tailer) WithToolCallsCounter(c ToolCallsCounter) *Tailer {
 	t.toolCallsCounter = c
 	t.toolNames = make(map[string]string)
 	return t
+}
+
+// WithQueueOpsCounter attaches a 1-label {op} counter for `queue-operation`
+// transcript entries. nil-safe, returns self for chaining.
+func (t *Tailer) WithQueueOpsCounter(c QueueOpsCounter) *Tailer {
+	t.queueOpsCounter = c
+	return t
+}
+
+// OutstandingTaskCalls returns the number of `Task` tool_use blocks seen with
+// no matching tool_result: the count of subagents this transcript believes are
+// still running. Safe to call from any goroutine.
+func (t *Tailer) OutstandingTaskCalls() int64 {
+	return t.taskCalls.Load()
+}
+
+// QueuePendingSince returns the enqueue time of the oldest `queue-operation`
+// entry with no matching removal, and whether there is one. Safe to call from
+// any goroutine.
+func (t *Tailer) QueuePendingSince() (time.Time, bool) {
+	return t.queue.PendingSince()
 }
 
 // WithActivity attaches a hook fired once per processed transcript line that
@@ -328,8 +469,12 @@ func (t *Tailer) fireActivity(turnID string) {
 }
 
 // knownNonMessageTypes is the fixed cardinality set for non-message transcript entries.
+// `queue-operation`, `attachment` and `file-history-snapshot` are all common
+// in real transcripts and were previously clamping to "other", which made the
+// "other" bucket useless as an unknown-shape signal.
 var knownNonMessageTypes = map[string]bool{
 	"system": true, "summary": true, "user": true, "assistant": true,
+	"queue-operation": true, "attachment": true, "file-history-snapshot": true,
 }
 
 // clampNonMessageType maps unknown entry.Type values to "other" so the
@@ -474,6 +619,31 @@ type transcriptEntry struct {
 	SessionID string         `json:"sessionId"`
 	Timestamp string         `json:"timestamp"`
 	Message   *transcriptMsg `json:"message,omitempty"`
+
+	// Operation and Content carry the `queue-operation` payload. Content is
+	// raw because it is the queue key, and a `remove` line often omits it
+	// entirely.
+	Operation string          `json:"operation,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+
+	// IsSidechain marks an entry belonging to a subagent's conversation
+	// rather than the main one; ParentUUID links it back. Both are how a
+	// subagent's work is identified whether it is inlined in the parent
+	// transcript or written to subagents/agent-<id>.jsonl. ParentUUID is
+	// often JSON null, which unmarshals to "".
+	IsSidechain bool   `json:"isSidechain,omitempty"`
+	ParentUUID  string `json:"parentUuid,omitempty"`
+}
+
+// entryTime parses the entry's RFC3339 timestamp, falling back to now when it
+// is missing or unparseable.
+func (e transcriptEntry) entryTime() time.Time {
+	if e.Timestamp != "" {
+		if ts, err := time.Parse(time.RFC3339, e.Timestamp); err == nil {
+			return ts
+		}
+	}
+	return time.Now()
 }
 
 type transcriptMsg struct {
@@ -496,6 +666,36 @@ type contentBlock struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	IsError   bool            `json:"is_error,omitempty"`
 	Content   json.RawMessage `json:"content,omitempty"`
+}
+
+// processQueueOperation logs, counts and tracks one `queue-operation` entry.
+// The queue key is the raw JSON of the entry's content so an enqueue and its
+// removal compare byte-for-byte; a removal with no content clears the whole
+// pending set (see queueTracker.remove).
+func (t *Tailer) processQueueOperation(entry transcriptEntry, turnID string) {
+	op := clampQueueOp(entry.Operation)
+	key := string(entry.Content)
+
+	t.log.Info("agent stream queue operation",
+		"action", "agent_stream_queue_operation",
+		"stream_type", "queue-operation",
+		"op", entry.Operation,
+		"session_id", entry.SessionID,
+		"transcript_uuid", entry.UUID,
+		"ts", entry.Timestamp,
+		"turn_id", turnID,
+		"content", t.redactor.Scrub(key),
+	)
+	if t.queueOpsCounter != nil {
+		t.queueOpsCounter.WithLabelValues(op).Inc() //nolint:errcheck
+	}
+
+	switch op {
+	case "enqueue":
+		t.queue.enqueue(key, entry.entryTime())
+	case "remove", "dequeue":
+		t.queue.remove(key)
+	}
 }
 
 func (t *Tailer) processLine(raw []byte) {
@@ -522,6 +722,15 @@ func (t *Tailer) processLine(raw []byte) {
 		t.tcTurnID = turnID
 	}
 
+	// Same reasoning for outstanding Task calls: a subagent whose tool_result
+	// never arrived cannot outlive the turn that launched it, so the counter
+	// resets rather than drifting upward for the life of the pod.
+	if turnID != t.taskTurnID {
+		clear(t.taskUseIDs)
+		t.taskCalls.Store(0)
+		t.taskTurnID = turnID
+	}
+
 	var entry transcriptEntry
 	if err := json.Unmarshal(raw, &entry); err != nil {
 		// Malformed line - emit raw event, never drop
@@ -534,6 +743,32 @@ func (t *Tailer) processLine(raw []byte) {
 		)
 		t.incCounter("raw")
 		return
+	}
+
+	// A sidechain entry is a subagent's work. Logged at DEBUG so the parent
+	// link is queryable without adding a field to every ordinary line.
+	if entry.IsSidechain {
+		t.log.Debug("agent stream sidechain",
+			"action", "agent_stream_sidechain",
+			"stream_type", entry.Type,
+			"session_id", entry.SessionID,
+			"transcript_uuid", entry.UUID,
+			"parent_uuid", entry.ParentUUID,
+			"is_sidechain", true,
+			"ts", entry.Timestamp,
+			"turn_id", turnID,
+		)
+	}
+
+	// queue-operation carries no message, so it must be handled BEFORE the
+	// entry.Message == nil return below. It is how Claude Code records a
+	// message parked while the turn is mid-tool-call: `enqueue` when the CLI
+	// accepts it, `remove`/`dequeue` when it is actually handed to the model.
+	// An enqueue with no matching removal therefore means the turn is wedged
+	// inside one long tool call - the signal a later phase acts on. This phase
+	// only records it.
+	if entry.Type == "queue-operation" {
+		t.processQueueOperation(entry, turnID)
 	}
 
 	if entry.Message == nil {
@@ -629,6 +864,12 @@ func (t *Tailer) processLine(raw []byte) {
 				"input", inputStr,
 			)
 			t.incCounter("tool_use")
+			if block.Name == taskToolName && block.ID != "" {
+				if _, dup := t.taskUseIDs[block.ID]; !dup {
+					t.taskUseIDs[block.ID] = struct{}{}
+					t.taskCalls.Add(1)
+				}
+			}
 			if t.toolCallsCounter != nil {
 				// Record id -> clamped name so the matching tool_result (which
 				// carries only the id) can be attributed to a tool.
@@ -651,6 +892,10 @@ func (t *Tailer) processLine(raw []byte) {
 				"content", contentStr,
 			)
 			t.incCounter("tool_result")
+			if _, ok := t.taskUseIDs[block.ToolUseID]; ok {
+				delete(t.taskUseIDs, block.ToolUseID)
+				t.taskCalls.Add(-1)
+			}
 			if t.toolCallsCounter != nil {
 				// Attribute the result to its tool via the correlation map; a
 				// result with no matching tool_use clamps to "other".

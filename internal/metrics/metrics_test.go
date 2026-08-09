@@ -183,3 +183,31 @@ func TestMetrics_TurnRefusals_Registered(t *testing.T) {
 	}
 	t.Fatal("ccw_turn_refusals_total not found")
 }
+
+// TestMetrics_QueueOpsTotal_Registered asserts ccw_queue_operations_total is
+// registered with the bounded {op} label. An enqueue with no matching removal
+// is the only in-band signal that a turn is wedged inside one long tool call,
+// so it has to be countable fleet-wide.
+func TestMetrics_QueueOpsTotal_Registered(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	require.NotNil(t, m.QueueOpsTotal)
+	m.QueueOpsTotal.WithLabelValues("enqueue").Inc()
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() != "ccw_queue_operations_total" {
+			continue
+		}
+		require.Len(t, mf.GetMetric(), 1)
+		lbls := map[string]string{}
+		for _, lp := range mf.GetMetric()[0].GetLabel() {
+			lbls[lp.GetName()] = lp.GetValue()
+		}
+		require.Equal(t, "enqueue", lbls["op"])
+		require.Equal(t, float64(1), mf.GetMetric()[0].GetCounter().GetValue())
+		return
+	}
+	t.Fatal("ccw_queue_operations_total not registered")
+}
