@@ -155,7 +155,19 @@ type Manager struct {
 	// deadline: see admit.
 	handoffAdmitted atomic.Bool
 
-	mu       sync.Mutex
+	mu sync.Mutex
+	// ptyMu serialises every write to the PTY that is part of a
+	// paste+SubmitDelay+submit sequence (Submit, resubmitOriginalPrompt, the
+	// bare resume nudge). Today the turn slot (current != "") is the only
+	// thing preventing two such sequences from interleaving, because only one
+	// Submit can be in flight at a time. W3's mid-turn probe writes to the PTY
+	// while a turn already holds the slot, breaking that guarantee, so the
+	// sequences need their own explicit lock. Deliberately DISTINCT from mu:
+	// mu must never be held across a PTY write (see the comment above
+	// Submit's write below), and ptyMu is held across a 400ms sleep by
+	// design, which would stall every mu-holding caller (Snapshot, Alive,
+	// Complete) for the duration if the two were the same lock.
+	ptyMu    sync.Mutex
 	w        ptyWriter
 	proc     claudeProcess
 	ring     *ringBuffer
@@ -843,7 +855,10 @@ func (mgr *Manager) resumeTurn(id string, resumed bool) {
 
 	// In-flight turn: send only the submit keystroke - the prompt is already in the
 	// restored conversation via --continue.
-	if _, err := w.Write([]byte(seq.Submit)); err != nil {
+	mgr.ptyMu.Lock()
+	_, err := w.Write([]byte(seq.Submit))
+	mgr.ptyMu.Unlock()
+	if err != nil {
 		mgr.m.TurnResumes.WithLabelValues("write_fail", "nudge").Inc()
 		mgr.failTurn(id, fmt.Sprintf("resume write submit: %v", err))
 		return
@@ -864,7 +879,10 @@ func (mgr *Manager) resubmitOriginalPrompt(id string, w ptyWriter, seq SubmitSeq
 	if !ok || rec.Text == "" {
 		mgr.log.Error("resume: turn text unavailable for fresh-relaunch resubmit; falling back to nudge",
 			"action", "turn_resume", "turn_id", id)
-		if _, err := w.Write([]byte(seq.Submit)); err != nil {
+		mgr.ptyMu.Lock()
+		_, err := w.Write([]byte(seq.Submit))
+		mgr.ptyMu.Unlock()
+		if err != nil {
 			mgr.m.TurnResumes.WithLabelValues("write_fail", "nudge").Inc()
 			mgr.failTurn(id, fmt.Sprintf("resume write submit: %v", err))
 			return
@@ -872,17 +890,21 @@ func (mgr *Manager) resubmitOriginalPrompt(id string, w ptyWriter, seq SubmitSeq
 		mgr.installResumeTimer(id, started, "nudge")
 		return
 	}
+	mgr.ptyMu.Lock()
 	if _, err := w.Write([]byte(seq.PasteStart + rec.Text + seq.PasteEnd)); err != nil {
+		mgr.ptyMu.Unlock()
 		mgr.m.TurnResumes.WithLabelValues("write_fail", "resubmit").Inc()
 		mgr.failTurn(id, fmt.Sprintf("resume write paste: %v", err))
 		return
 	}
 	time.Sleep(mgr.cfg.SubmitDelay)
 	if _, err := w.Write([]byte(seq.Submit)); err != nil {
+		mgr.ptyMu.Unlock()
 		mgr.m.TurnResumes.WithLabelValues("write_fail", "resubmit").Inc()
 		mgr.failTurn(id, fmt.Sprintf("resume write submit: %v", err))
 		return
 	}
+	mgr.ptyMu.Unlock()
 	mgr.installResumeTimer(id, started, "resubmit")
 }
 
@@ -1055,20 +1077,25 @@ func (mgr *Manager) Submit(text, callbackURL string, handoff bool) (string, erro
 	seq := mgr.cfg.SubmitSeq
 	mgr.mu.Unlock()
 
-	// Paste and submit happen outside the lock so that Snapshot/Alive/Complete
-	// are not blocked for the full SubmitDelay (finding 2). Both writes are to
-	// the same logical PTY, ordered by the fact
-	// that only one goroutine (this one) drives the paste+submit sequence at a time
-	// (the turn slot above guarantees no concurrent Submit).
+	// Paste and submit happen outside mu so that Snapshot/Alive/Complete are
+	// not blocked for the full SubmitDelay (finding 2). ptyMu instead
+	// serialises the sequence against any other PTY-writing path (resume
+	// nudge/resubmit, or W3's mid-turn probe) so no write can land inside the
+	// paste block or the delay window; the turn slot above only guarantees no
+	// concurrent Submit, not exclusivity against those other writers.
+	mgr.ptyMu.Lock()
 	if _, err := w.Write([]byte(seq.PasteStart + text + seq.PasteEnd)); err != nil {
+		mgr.ptyMu.Unlock()
 		mgr.failSubmitWrite(id, "write pty paste", err, now)
 		return "", fmt.Errorf("write pty paste: %w", err)
 	}
 	time.Sleep(mgr.cfg.SubmitDelay)
 	if _, err := w.Write([]byte(seq.Submit)); err != nil {
+		mgr.ptyMu.Unlock()
 		mgr.failSubmitWrite(id, "write pty submit", err, now)
 		return "", fmt.Errorf("write pty submit: %w", err)
 	}
+	mgr.ptyMu.Unlock()
 
 	// Install the timeout timer and log only after writes succeed.
 	mgr.mu.Lock()
