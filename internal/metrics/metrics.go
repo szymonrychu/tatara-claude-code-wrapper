@@ -99,6 +99,22 @@ type Metrics struct {
 	ProbeAnswerSeconds prometheus.Histogram   // send -> answer latency
 	ProbeOutcomesTotal *prometheus.CounterVec // label: outcome=answered|delivered_unanswered|never_delivered
 
+	// InterruptsTotal counts POST /v1/interrupt (a single ESC byte written to
+	// the PTY). result=unconfirmed is the one worth alerting on: the ESC was
+	// written but no interruption marker appeared in the transcript, which
+	// means the turn is still in flight and the pod is still not free for the
+	// operator's handoff turn.
+	InterruptsTotal *prometheus.CounterVec // label: result=ok|write_fail|unavailable|unconfirmed
+
+	// TurnStallSuspected counts turns that went a full TurnTimeout without any
+	// transcript activity. It replaces the timeout FAILURE the wrapper used to
+	// inflict at this point: the wrapper no longer kills turns on inactivity,
+	// so this counter and Snapshot.StallSuspectedSince are the entire
+	// wrapper-side output of the inactivity timer. It can fire repeatedly for
+	// one turn - the timer re-arms - so it counts windows of silence, not
+	// stalled turns.
+	TurnStallSuspected prometheus.Counter
+
 	// Skills delivery metrics (rule 13: boot-time clone and filter are fallible).
 	SkillsInstalled     *prometheus.CounterVec // label: profile
 	SkillsCloneFailures prometheus.Counter
@@ -181,6 +197,10 @@ func New(reg prometheus.Registerer) *Metrics {
 			Buckets: prometheus.ExponentialBuckets(0.5, 2, 12)}),
 		ProbeOutcomesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_probe_outcomes_total", Help: "Terminal liveness-probe outcomes (answered|delivered_unanswered|never_delivered); never_delivered means the turn never reached a tool-call boundary."}, []string{"outcome"}),
+		InterruptsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_interrupts_total", Help: "ESC interrupts written to the PTY, by result (ok|write_fail|unavailable|unconfirmed); unconfirmed means no interruption marker reached the transcript and the turn is still in flight."}, []string{"result"}),
+		TurnStallSuspected: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "ccw_turn_stall_suspected_total", Help: "Windows of a full TurnTimeout with no transcript activity on an in-flight turn. The wrapper no longer fails such turns; the operator decides."}),
 		SkillsInstalled: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "wrapper_skills_installed_total", Help: "Skills installed at boot by profile."}, []string{"profile"}),
 		SkillsCloneFailures: prometheus.NewCounter(prometheus.CounterOpts{
@@ -198,6 +218,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.TurnTokensTotal, m.TurnCostUSD, m.InternalIssueTotal, m.InternalIssueDrainTimeoutTotal,
 		m.ToolCallsTotal, m.QueueOpsTotal,
 		m.ProbesTotal, m.ProbeAnswerSeconds, m.ProbeOutcomesTotal,
+		m.InterruptsTotal, m.TurnStallSuspected,
 		m.SkillsInstalled, m.SkillsCloneFailures, m.AgentsInstalled)
 	return m
 }

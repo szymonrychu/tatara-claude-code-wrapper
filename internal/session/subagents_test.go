@@ -130,7 +130,9 @@ func waitForSubagentStamp(t *testing.T, m *session.Manager, after time.Time, tim
 // through Snapshot; deciding what to do with it belongs to the operator.
 //
 // Mirrors TestActivity_StaleTurnDoesNotResetTimer: hammer the hook across a
-// window longer than TurnTimeout and require the turn to have timed out anyway.
+// window longer than TurnTimeout and require the inactivity timer to have
+// tripped anyway. Since W4 tripping it reports a suspected stall rather than
+// failing the turn, so the stall stamp is the observable.
 func TestSubagentActivity_DoesNotResetTurnTimer(t *testing.T) {
 	fp := &fakePTY{}
 	m, _ := newMgr(t, fp) // TurnTimeout 50ms
@@ -145,11 +147,12 @@ func TestSubagentActivity_DoesNotResetTurnTimer(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
+	require.False(t, m.Snapshot().StallSuspectedSince.IsZero(),
+		"subagent activity reset the turn's inactivity timer: W1 is supposed to be observation only, and this silently changes when the wrapper reports a stall")
 	select {
 	case r := <-done:
-		require.Equal(t, turn.Failed, r.State)
+		t.Fatalf("the inactivity timer resolved the turn (state=%s); it may only report", r.State)
 	default:
-		t.Fatal("subagent activity reset the turn's inactivity timer: W1 is supposed to be observation only, and this silently changes when turns time out")
 	}
 
 	// The observation itself must still have been recorded.
@@ -157,18 +160,17 @@ func TestSubagentActivity_DoesNotResetTurnTimer(t *testing.T) {
 		"the hook must stamp the timestamp even though it does not touch the timer")
 }
 
-// TestSnapshot_StallFieldsPresentAndZero pins the additive-only shape of the
-// new Snapshot fields. ProbePendingSince and StallSuspectedSince exist so the
-// operator side has a stable JSON shape from this release on, but nothing sets
-// them until later phases; a non-zero value here would mean behaviour landed
-// early.
+// TestSnapshot_StallFieldsPresentAndZero pins the idle shape of the
+// stall-detection Snapshot fields: an idle session with no turn in flight
+// reports zero for all of them, so the operator can distinguish "nothing is
+// wrong" from "the wrapper is too old to say".
 func TestSnapshot_StallFieldsPresentAndZero(t *testing.T) {
 	fp := &fakePTY{}
 	m, _ := newMgr(t, fp)
 
 	snap := m.Snapshot()
-	require.True(t, snap.ProbePendingSince.IsZero(), "no probe exists in this phase")
-	require.True(t, snap.StallSuspectedSince.IsZero(), "nothing marks a stall in this phase")
+	require.True(t, snap.ProbePendingSince.IsZero(), "no probe has been sent")
+	require.True(t, snap.StallSuspectedSince.IsZero(), "an idle session has no turn to suspect")
 	require.True(t, snap.LastSubagentActivityAt.IsZero())
 	require.Equal(t, int64(0), snap.OutstandingSubagentCalls)
 }

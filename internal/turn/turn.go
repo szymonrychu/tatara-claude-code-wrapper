@@ -14,6 +14,19 @@ const (
 	Failed   State = "failed"
 )
 
+// StopReasonInterrupted is the synthetic stop_reason stamped on a turn the
+// operator cut short with POST /v1/interrupt. The CLI writes no stop_reason at
+// all on that path (an ESC'd turn has no terminal assistant message), so the
+// wrapper supplies one: without it the callback is indistinguishable from a
+// turn that failed for any other reason.
+const StopReasonInterrupted = "interrupted"
+
+// ErrInterrupted is the Record.Error text for an interrupted turn. The state
+// stays Failed rather than Complete deliberately - the agent did not finish,
+// and reporting success would let the operator advance a Task on a half-done
+// turn - but FinalText still carries whatever the agent had said by then.
+const ErrInterrupted = "turn interrupted"
+
 // Record is one user turn and its eventual result.
 type Record struct {
 	ID             string          `json:"turnId"`

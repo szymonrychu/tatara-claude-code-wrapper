@@ -39,6 +39,7 @@ ingress.
 | `GET /v1/transcript` | - | 200, full JSONL session transcript (debug) |
 | `POST /v1/probe` | `{"text":"..."}` (optional) | 202 `ProbeStatus`; **never 409**; 503 no live PTY |
 | `GET /v1/probe/{probeId}` | - | 200 `ProbeStatus`; 404 unknown or superseded |
+| `POST /v1/interrupt` | - | 202 `{"turnId":"..."}`; **never 409**; 503 no live PTY |
 | `GET /healthz` `/readyz` `/metrics` | - | Operator endpoints |
 
 `POST /v1/interject` is gone (404) - mid-flight events now ride in at the
@@ -56,6 +57,25 @@ different diagnoses: `pending` (the CLI took the message but never handed it
 to the model - the turn is blocked inside a single long tool call),
 `delivered` (the model has it and is reaching tool-call boundaries), and
 `answered` (an assistant reply starting with the literal `TATARA-ALIVE`).
+
+`POST /v1/interrupt` writes a single ESC byte. Unlike pasted text, which the
+CLI only consumes at the next tool-call boundary, ESC cancels synchronously
+(~40ms) even in the middle of a running tool call - so it works against the
+one failure mode worth interrupting. The session, sessionId, transcript and
+full conversation context all survive and the next turn runs normally in the
+same session; the ESC'd turn is reported as `state=failed`,
+`stopReason=interrupted`, carrying whatever text the agent had produced.
+
+**The wrapper no longer fails a turn on inactivity.** The per-turn
+`TURN_TIMEOUT_SECONDS` timer now only records a suspected stall
+(`ccw_turn_stall_suspected_total`, `GET /v1/session`'s `stallSuspectedSince`)
+and re-arms. A wrapper inside one pod cannot tell a hang from work it cannot
+see - a single subagent run silenced the parent transcript for 35 minutes - and
+it has no way to probe, hand off, or stop anything. That judgement belongs to
+the operator, which probes, grants grace, re-probes, escalates to
+`POST /v1/interrupt` and only then stops the pod. The only remaining
+wrapper-side bound on a turn is `AGENT_POD_TTL_SECONDS`, which refuses to
+START new work past the pod deadline and never touches a turn in flight.
 
 Turns are strictly sequential. `handoff:true` marks the operator's TTL stop
 turn: it is the only turn admitted past `AGENT_POD_TTL_SECONDS` (exactly

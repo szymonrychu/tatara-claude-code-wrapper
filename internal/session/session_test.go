@@ -197,28 +197,33 @@ func TestComplete_MarksDoneAndFiresCallback(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestTurnTimeout_FailsAndFiresCallback(t *testing.T) {
+// TestTurnTimeout_NoLongerFailsTheTurn is the inversion phase W4 makes: this
+// test asserted the opposite until the wrapper stopped killing turns on
+// inactivity. See TestInactivityTimer_MarksStallSuspectedAndReArms for what
+// happens instead, and markStallSuspected for why.
+func TestTurnTimeout_NoLongerFailsTheTurn(t *testing.T) {
 	fp := &fakePTY{}
-	m, store := newMgr(t, fp)
+	m, store := newMgr(t, fp) // TurnTimeout 50ms
 	done := make(chan *turn.Record, 1)
 	m.OnTurnDone = func(r *turn.Record) { done <- r }
 
 	_, _ = m.Submit("hi", "https://cb/x", false)
 	select {
 	case r := <-done:
-		require.Equal(t, turn.Failed, r.State)
-	case <-time.After(time.Second):
-		t.Fatal("timeout did not fire")
+		t.Fatalf("the inactivity timer resolved the turn (state=%s); no wrapper path may fail a turn on elapsed time", r.State)
+	case <-time.After(400 * time.Millisecond):
 	}
 	rec, _ := store.Get("turn-1")
-	require.Equal(t, turn.Failed, rec.State)
+	require.Equal(t, turn.Running, rec.State)
+	require.Equal(t, session.Busy, m.Snapshot().State)
+	require.False(t, m.Snapshot().StallSuspectedSince.IsZero(), "the silence must still be REPORTED")
 }
 
 // TestTurnTimeout_ResetsOnActivity verifies the per-turn deadline is an
-// inactivity timer: a turn that keeps producing transcript activity survives
-// well past the original wall-clock TurnTimeout, and only fails once activity
-// stops for a full TurnTimeout window. It also confirms activity advances
-// LastActivityAt on the turn record.
+// inactivity timer rather than a wall clock: a turn that keeps producing
+// transcript activity never trips it, and only a full TurnTimeout of silence
+// does. It also confirms activity advances LastActivityAt on the turn record.
+// Since W4 the trip is a REPORT (stallSuspectedSince), not a failure.
 func TestTurnTimeout_ResetsOnActivity(t *testing.T) {
 	fp := &fakePTY{}
 	store := turn.NewStore()
@@ -255,14 +260,19 @@ func TestTurnTimeout_ResetsOnActivity(t *testing.T) {
 	rec, _ := store.Get("turn-1")
 	require.Equal(t, turn.Running, rec.State, "an actively streaming turn must survive past TurnTimeout")
 	require.True(t, rec.LastActivityAt.After(time.Unix(100, 0)), "activity must advance LastActivityAt")
+	require.True(t, m.Snapshot().StallSuspectedSince.IsZero(), "a streaming turn is never stall-suspected")
 
-	// Silence: the inactivity timer must now fire.
+	// Silence: the inactivity timer must now trip, and REPORT rather than kill.
+	require.Eventually(t, func() bool { return !m.Snapshot().StallSuspectedSince.IsZero() },
+		2*time.Second, 10*time.Millisecond,
+		"the inactivity timer did not trip after activity stopped")
 	select {
 	case r := <-done:
-		require.Equal(t, turn.Failed, r.State)
-	case <-time.After(2 * time.Second):
-		t.Fatal("inactivity timeout did not fire after activity stopped")
+		t.Fatalf("the inactivity timer resolved the turn (state=%s); it may only report", r.State)
+	default:
 	}
+	rec, _ = store.Get("turn-1")
+	require.Equal(t, turn.Running, rec.State)
 }
 
 // TestActivity_StaleTurnDoesNotResetTimer verifies that activity attributed to a
@@ -276,18 +286,20 @@ func TestActivity_StaleTurnDoesNotResetTimer(t *testing.T) {
 	_, err := m.Submit("hi", "https://cb/x", false)
 	require.NoError(t, err)
 
-	// Hammer activity for a stale turn id across a window longer than TurnTimeout.
-	// If stale activity (wrongly) reset the timer, the turn would stay Running.
+	// Hammer activity for a stale turn id across a window longer than
+	// TurnTimeout. If stale activity (wrongly) reset the timer, the in-flight
+	// turn would never be reported as stall-suspected.
 	for i := 0; i < 8; i++ {
 		m.FireActivityForTest("turn-999")
 		time.Sleep(20 * time.Millisecond)
 	}
 
+	require.False(t, m.Snapshot().StallSuspectedSince.IsZero(),
+		"stale-turn activity reset the live timer; the in-flight turn was never reported as silent")
 	select {
 	case r := <-done:
-		require.Equal(t, turn.Failed, r.State)
+		t.Fatalf("the inactivity timer resolved the turn (state=%s); it may only report", r.State)
 	default:
-		t.Fatal("stale-turn activity reset the live timer; in-flight turn did not time out")
 	}
 }
 
@@ -522,9 +534,13 @@ func TestSubmitLog_HasActionField(t *testing.T) {
 	require.True(t, found, "no 'turn submitted' log line found")
 }
 
-// TestFailTimeout_HasActionAndDurationMs verifies failTimeout log has action+duration_ms (finding 6)
-// and that TurnDuration histogram is observed (finding 8).
-func TestFailTimeout_HasActionAndDurationMs(t *testing.T) {
+// TestMarkStallSuspected_HasActionAndSilentMs verifies the stall-suspected log
+// line carries the structured fields the operator's runbook keys on (finding
+// 6). It replaced the "turn timed out" assertion when W4 stopped failing turns
+// on inactivity: there is no timeout log any more because there is no timeout.
+// The TurnDuration histogram assertion moved with it - a stall-suspected turn
+// has not finished, so nothing observes a duration for it yet.
+func TestMarkStallSuspected_HasActionAndSilentMs(t *testing.T) {
 	buf := &syncBuffer{}
 	log := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
@@ -545,10 +561,15 @@ func TestFailTimeout_HasActionAndDurationMs(t *testing.T) {
 	_, err := mgr.Submit("hi", "", false)
 	require.NoError(t, err)
 
+	// The stamp is taken under the lock and the log line emitted after it is
+	// released, so wait on the log itself rather than on the stamp.
+	require.Eventually(t, func() bool { return bytes.Contains(buf.Bytes(), []byte("turn_stall_suspected")) },
+		2*time.Second, 10*time.Millisecond, "the inactivity timer never tripped")
+	require.False(t, mgr.Snapshot().StallSuspectedSince.IsZero())
 	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("turn did not time out")
+	case r := <-done:
+		t.Fatalf("the inactivity timer resolved the turn (state=%s); it may only report", r.State)
+	default:
 	}
 
 	// Check log
@@ -557,25 +578,26 @@ func TestFailTimeout_HasActionAndDurationMs(t *testing.T) {
 	found := false
 	for _, ln := range lines {
 		var rec map[string]any
-		if json.Unmarshal(ln, &rec) == nil && rec["msg"] == "turn timed out" {
-			require.Equal(t, "turn_timeout", rec["action"], "action field missing in 'turn timed out' log")
-			require.NotNil(t, rec["duration_ms"], "duration_ms missing in 'turn timed out' log")
+		if json.Unmarshal(ln, &rec) == nil && rec["action"] == "turn_stall_suspected" {
+			require.Equal(t, "WARN", rec["level"], "a suspected stall is a WARN, not an INFO buried in the stream")
+			require.NotNil(t, rec["silent_ms"], "silent_ms missing in the stall-suspected log")
+			require.NotNil(t, rec["turn_age_ms"], "turn_age_ms missing in the stall-suspected log")
+			require.Equal(t, "turn-1", rec["turn_id"])
 			found = true
 		}
 	}
-	require.True(t, found, "no 'turn timed out' log line found")
+	require.True(t, found, "no 'turn_stall_suspected' log line found")
 
-	// Check that TurnDuration histogram was observed (finding 8)
+	// The counter is the fleet-wide view of the same event.
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
 	for _, mf := range mfs {
-		if mf.GetName() == "ccw_turn_duration_seconds" {
-			hist := mf.GetMetric()[0].GetHistogram()
-			require.Greater(t, hist.GetSampleCount(), uint64(0), "TurnDuration histogram not observed for timed-out turn")
+		if mf.GetName() == "ccw_turn_stall_suspected_total" {
+			require.Greater(t, mf.GetMetric()[0].GetCounter().GetValue(), float64(0))
 			return
 		}
 	}
-	t.Fatal("ccw_turn_duration_seconds metric not found")
+	t.Fatal("ccw_turn_stall_suspected_total metric not found")
 }
 
 // TestComplete_MetersTokensAndCost verifies that a completed turn moves the
@@ -969,20 +991,26 @@ func TestSnapshot_TurnsCompletedVsFinished(t *testing.T) {
 	require.Equal(t, 1, snap.TurnsCompleted, "TurnsCompleted should be 1 after 1 success")
 	require.Equal(t, 1, snap.TurnsFinished, "TurnsFinished should be 1 after 1 terminal")
 
-	// Turn 2: let it time out (TurnTimeout=50ms).
+	// Turn 2: interrupt it. Since W4 this is the wrapper's only non-success
+	// terminal path that does not also kill the session (inactivity no longer
+	// ends a turn at all), and it is what the operator's stall escalation
+	// actually does.
+	m.SetTranscriptPathForTest(filepath.Join("testdata", "interrupted_turn.jsonl"))
 	done := make(chan struct{}, 1)
 	m.OnTurnDone = func(*turn.Record) { done <- struct{}{} }
 	_, err = m.Submit("t2", "", false)
 	require.NoError(t, err)
+	_, err = m.Interrupt()
+	require.NoError(t, err)
 	select {
 	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("turn did not time out")
+	case <-time.After(5 * time.Second):
+		t.Fatal("interrupted turn never resolved")
 	}
 
 	snap = m.Snapshot()
-	require.Equal(t, 1, snap.TurnsCompleted, "TurnsCompleted must not increment on timeout (still 1)")
-	require.Equal(t, 2, snap.TurnsFinished, "TurnsFinished must increment on timeout (now 2)")
+	require.Equal(t, 1, snap.TurnsCompleted, "TurnsCompleted must not increment on an interrupt (still 1)")
+	require.Equal(t, 2, snap.TurnsFinished, "TurnsFinished must increment on an interrupt (now 2)")
 }
 
 // TestRelaunch_StoppingAbortsFreshProc verifies that if Shutdown() sets

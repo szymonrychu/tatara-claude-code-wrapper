@@ -104,6 +104,7 @@ func (f *fakeCtlErr) Probe(text string) (string, error)                    { ret
 func (f *fakeCtlErr) ProbeStatus(string) (session.ProbeStatus, bool) {
 	return session.ProbeStatus{}, false
 }
+func (f *fakeCtlErr) Interrupt() (string, error)     { return "", nil }
 func (f *fakeCtlErr) TranscriptPath() string         { return "" }
 func (f *fakeCtlErr) Alive() bool                    { return true }
 func (f *fakeCtlErr) Shutdown(context.Context) error { return nil }
