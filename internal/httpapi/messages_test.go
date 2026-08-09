@@ -31,6 +31,29 @@ type fakeCtl struct {
 	transcriptPath string
 	submittedTexts []string
 	lastHandoff    bool // the handoff flag of the most recent Submit
+
+	// Probe seam. probedTexts records every Probe body so a test can assert
+	// the default-text path; probeStatus/probeFound drive ProbeStatus.
+	probeID     string
+	probeErr    error
+	probedTexts []string
+	probeStatus session.ProbeStatus
+	probeFound  bool
+}
+
+func (f *fakeCtl) Probe(text string) (string, error) {
+	f.probedTexts = append(f.probedTexts, text)
+	if f.probeErr != nil {
+		return "", f.probeErr
+	}
+	return f.probeID, nil
+}
+
+func (f *fakeCtl) ProbeStatus(id string) (session.ProbeStatus, bool) {
+	if !f.probeFound || id != f.probeStatus.ID {
+		return session.ProbeStatus{}, false
+	}
+	return f.probeStatus, true
 }
 
 func (f *fakeCtl) Submit(text, cb string, handoff bool) (string, error) {

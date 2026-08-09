@@ -1,0 +1,4 @@
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-09T17:33:07Z","sessionId":"sess-w3","content":"Do not stop. Reply with exactly TATARA-ALIVE <one sentence>."}
+{"type":"queue-operation","operation":"remove","timestamp":"2026-08-09T17:33:11Z","sessionId":"sess-w3"}
+{"type":"user","timestamp":"2026-08-09T17:33:12Z","sessionId":"sess-w3","uuid":"u-1","message":{"role":"user","content":[{"type":"text","text":"TATARA-ALIVE this echo is a user message and must not answer the probe."}]}}
+{"type":"assistant","timestamp":"2026-08-09T17:33:13Z","sessionId":"sess-w3","uuid":"u-2","message":{"role":"assistant","content":[{"type":"text","text":"TATARA-ALIVE rebasing the feature branch onto main."}]}}

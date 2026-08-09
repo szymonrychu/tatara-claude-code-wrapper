@@ -704,7 +704,7 @@ func TestTailer_FiresActivityPerLine(t *testing.T) {
 	var got []string
 	h := newCaptureHandler()
 	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "turn-1" })
-	tailer.WithActivity(func(id string) {
+	tailer.WithActivity(func(id string, _ bool) {
 		mu.Lock()
 		got = append(got, id)
 		mu.Unlock()
@@ -742,7 +742,7 @@ func TestTailer_NoActivityWhenNoInFlightTurn(t *testing.T) {
 	var fired int
 	h := newCaptureHandler()
 	tailer := NewTailer(slog.New(h), NewRedactor(nil), func() string { return "" })
-	tailer.WithActivity(func(string) {
+	tailer.WithActivity(func(string, bool) {
 		mu.Lock()
 		fired++
 		mu.Unlock()

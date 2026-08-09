@@ -213,7 +213,24 @@ type Manager struct {
 	// doing so would change when turns time out, which is a behaviour change
 	// this phase does not make.
 	lastSubagentActivity atomic.Int64
+
+	// probes tracks the in-flight liveness probe. It lives on the Manager, not
+	// on the Tailer, because CCW_LOG_TRANSCRIPT=false means there is no Tailer
+	// at all and Probe must still accept, write and report (as pending
+	// forever, which is honest: with no transcript reader the wrapper cannot
+	// know whether the probe was delivered).
+	probes *transcript.ProbeTracker
 }
+
+// DefaultProbeText is the probe body used when POST /v1/probe omits one. It
+// ends with the exact instruction the answer detector keys on, so the endpoint
+// is correct by construction rather than depending on every caller to
+// remember the marker.
+const DefaultProbeText = "Do not stop what you are doing. Reply with exactly TATARA-ALIVE <one sentence about what you are doing right now>."
+
+// ProbeStatus is the state of one liveness probe. Aliased to the transcript
+// package, which owns the JSONL parsing that drives every transition.
+type ProbeStatus = transcript.ProbeStatus
 
 func New(cfg Config, store *turn.Store, m *metrics.Metrics, log *slog.Logger, now func() time.Time, newID func() string) *Manager {
 	if cfg.BootTimeout <= 0 {
@@ -230,6 +247,7 @@ func New(cfg Config, store *turn.Store, m *metrics.Metrics, log *slog.Logger, no
 	// call's fixed-clock sequencing in tests (e.g. Submit/Complete duration
 	// assertions), and in production now() is time.Now anyway.
 	mgr := &Manager{cfg: cfg, store: store, m: m, log: log, now: now, newID: newID, state: Booting, ring: newRing(), startedAt: time.Now()}
+	mgr.probes = transcript.NewProbeTracker().WithOutcomeObserver(mgr.recordProbeOutcome)
 	mgr.spawn = func(cfg Config, resume bool) (claudeProcess, error) {
 		p, err := spawnClaude(cfg, resume)
 		if err != nil {
@@ -255,6 +273,7 @@ func (mgr *Manager) StartTailer(ctx context.Context) {
 	tailer.WithToolCallsCounter(mgr.m.ToolCallsTotal)
 	tailer.WithQueueOpsCounter(mgr.m.QueueOpsTotal)
 	tailer.WithActivity(mgr.onTailerActivity)
+	tailer.WithProbes(mgr.probes)
 	tailerCtx, cancel := context.WithCancel(ctx) //nolint:gosec // cancel is stored in mgr.tailerCancel and invoked by Shutdown/path-change restart
 	mgr.mu.Lock()
 	mgr.tailer = tailer
@@ -280,7 +299,20 @@ func (mgr *Manager) currentTurnID() string {
 // (hung) turn still fails after TurnTimeout of no transcript output. Events for a
 // stale or already-cleared turn are ignored so a late event cannot extend or
 // resurrect a turn the timeout path has finished.
-func (mgr *Manager) onTailerActivity(turnID string) {
+//
+// probeOriginated lines are the one exception, and they are excluded from BOTH
+// the deadline reset and LastActivityAt. The turn deadline is an inactivity
+// timer, so a probe that counted as activity would reset the deadline of the
+// very turn it was sent to investigate: probing a hung agent every few minutes
+// would keep it alive for as long as the operator kept asking, and the more
+// suspicious a turn looked the longer it would survive. LastActivityAt is
+// excluded for the same reason one level up - the operator anchors its own
+// stall deadline on it (refreshLastActivity), so leaving it in would move the
+// bug from the wrapper to the operator instead of fixing it.
+func (mgr *Manager) onTailerActivity(turnID string, probeOriginated bool) {
+	if probeOriginated {
+		return
+	}
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	if turnID == "" || turnID != mgr.current || mgr.timer == nil {
@@ -299,14 +331,17 @@ func (mgr *Manager) onTailerActivity(turnID string) {
 // timing out - a behaviour change. This phase publishes the observation
 // through Snapshot.LastSubagentActivityAt and lets the operator decide what to
 // do with it. TestSubagentActivity_DoesNotResetTurnTimer guards this.
-func (mgr *Manager) onSubagentActivity(string) {
+func (mgr *Manager) onSubagentActivity(_ string, probeOriginated bool) {
+	if probeOriginated {
+		return
+	}
 	mgr.lastSubagentActivity.Store(mgr.now().UnixNano())
 }
 
 // FireSubagentActivityForTest drives the subagent activity hook directly,
 // simulating a line read from a subagent transcript. Test-only.
 func (mgr *Manager) FireSubagentActivityForTest(turnID string) {
-	mgr.onSubagentActivity(turnID)
+	mgr.onSubagentActivity(turnID, false)
 }
 
 // logTranscriptEnabled returns true unless CCW_LOG_TRANSCRIPT is explicitly "false".
@@ -376,8 +411,20 @@ func (mgr *Manager) SimulateExitForTest(err error) {
 // tailer-observed agent_stream event for turnID. Test-only: exercises the
 // inactivity-timer reset without standing up a real tailer goroutine.
 func (mgr *Manager) FireActivityForTest(turnID string) {
-	mgr.onTailerActivity(turnID)
+	mgr.onTailerActivity(turnID, false)
 }
+
+// FireProbeActivityForTest drives the transcript activity hook with the
+// probe-originated flag set, simulating the enqueue line a mid-turn probe
+// causes. Test-only.
+func (mgr *Manager) FireProbeActivityForTest(turnID string) {
+	mgr.onTailerActivity(turnID, true)
+}
+
+// ProbeTrackerForTest exposes the manager's probe tracker so a test can drive
+// transcript-side transitions without standing up a tailer goroutine.
+// Test-only.
+func (mgr *Manager) ProbeTrackerForTest() *transcript.ProbeTracker { return mgr.probes }
 
 // SetSpawnForTest replaces the spawn function used by Start/relaunch. Test-only.
 func (mgr *Manager) SetSpawnForTest(fn func(cfg Config, resume bool) (ClaudeProcess, error)) {
@@ -1109,6 +1156,103 @@ func (mgr *Manager) Submit(text, callbackURL string, handoff bool) (string, erro
 	return id, nil
 }
 
+// ErrProbeUnavailable is returned by Probe when there is no PTY to write to
+// (the session is dead, still booting, or shutting down). It maps to 503, not
+// 409: 409 means "a turn is in flight", which is precisely the situation a
+// probe exists to work inside.
+var ErrProbeUnavailable = errors.New("probe unavailable: no live session")
+
+// Probe writes text straight into the PTY mid-turn and returns a probe id.
+//
+// It exists because there is no other door into a running agent's context. The
+// operator cannot ask a busy agent anything: POST /v1/messages maps
+// session.ErrBusy to 409 for the whole duration of a turn, so at exactly the
+// moment a turn looks hung - the moment worth investigating - the only
+// available action is to kill it. The PTY the wrapper already owns is the one
+// channel that stays open, and the spike verified (CLI 2.1.201 and 2.1.226)
+// that a mid-turn write using the wrapper's own paste sequence is consumed at
+// the next tool-call boundary, 2-4ms after the preceding tool_result, and
+// answered as an ordinary transcript line. One run landed the answer 34.1s
+// before the turn ended, and the original turn then resumed normally.
+//
+// Consequently Probe is NOT a turn and must never be mistaken for one:
+//
+//   - it never touches mgr.current, so it neither takes the turn slot nor
+//     returns ErrBusy. Returning 409 here would reintroduce the exact hole the
+//     endpoint exists to close.
+//   - it never touches mgr.timer. Installing or resetting the turn deadline
+//     from a probe would let an observation change the lifetime of the thing
+//     being observed.
+//   - it does not go through admit(): a pod past its TTL is a pod whose turn
+//     most needs diagnosing, and refusing to ask it questions helps nobody. A
+//     probe consumes no turn budget.
+//
+// The write itself takes ptyMu (phase W2) so the paste, the SubmitDelay and
+// the CR cannot interleave with a concurrent Submit or resume nudge - which is
+// a real possibility here for the first time, since a probe writes while
+// another sequence may hold the turn slot.
+func (mgr *Manager) Probe(text string) (string, error) {
+	if strings.TrimSpace(text) == "" {
+		text = DefaultProbeText
+	}
+	mgr.mu.Lock()
+	state, stopping, w, seq := mgr.state, mgr.stopping, mgr.w, mgr.cfg.SubmitSeq
+	mgr.mu.Unlock()
+	if w == nil || stopping || state == Dead || state == Booting {
+		mgr.m.ProbesTotal.WithLabelValues("unavailable").Inc()
+		return "", fmt.Errorf("%w (state=%s)", ErrProbeUnavailable, state)
+	}
+
+	id := mgr.newID()
+	now := mgr.now()
+	// Registered BEFORE the write: the CLI can write the enqueue line while
+	// the Write call is still returning, and an unregistered probe would miss
+	// its own enqueue - which is both the delivery signal and the activity
+	// exclusion.
+	mgr.probes.Register(id, text, now)
+
+	mgr.ptyMu.Lock()
+	if _, err := w.Write([]byte(seq.PasteStart + text + seq.PasteEnd)); err != nil {
+		mgr.ptyMu.Unlock()
+		mgr.probes.Discard(id)
+		mgr.m.ProbesTotal.WithLabelValues("write_fail").Inc()
+		mgr.log.Error("probe write failed", "action", "probe_write_fail", "stage", "paste", "probe_id", id, "err", err)
+		return "", fmt.Errorf("write pty paste: %w", err)
+	}
+	time.Sleep(mgr.cfg.SubmitDelay)
+	if _, err := w.Write([]byte(seq.Submit)); err != nil {
+		mgr.ptyMu.Unlock()
+		mgr.probes.Discard(id)
+		mgr.m.ProbesTotal.WithLabelValues("write_fail").Inc()
+		mgr.log.Error("probe write failed", "action", "probe_write_fail", "stage", "submit", "probe_id", id, "err", err)
+		return "", fmt.Errorf("write pty submit: %w", err)
+	}
+	mgr.ptyMu.Unlock()
+
+	mgr.m.ProbesTotal.WithLabelValues("ok").Inc()
+	mgr.log.Info("liveness probe sent", "action", "probe_sent", "probe_id", id, "turn_id", mgr.currentTurnID())
+	return id, nil
+}
+
+// ProbeStatus returns the tracked probe when id names it. Only the most recent
+// probe is retained (see transcript.ProbeTracker), so a superseded id reports
+// not-found rather than a stale answer.
+func (mgr *Manager) ProbeStatus(id string) (ProbeStatus, bool) {
+	return mgr.probes.Status(id)
+}
+
+// recordProbeOutcome is the ProbeTracker's terminal-outcome observer. Fired
+// once per probe: on the answer itself, or when a superseding probe or
+// shutdown closes an unanswered one out.
+func (mgr *Manager) recordProbeOutcome(outcome string, answerLatency time.Duration) {
+	mgr.m.ProbeOutcomesTotal.WithLabelValues(outcome).Inc()
+	if outcome == transcript.ProbeOutcomeAnswered {
+		mgr.m.ProbeAnswerSeconds.Observe(answerLatency.Seconds())
+	}
+	mgr.log.Info("liveness probe outcome", "action", "probe_outcome",
+		"outcome", outcome, "answer_latency_ms", answerLatency.Milliseconds())
+}
+
 // ensureTailerFollowing starts the transcript tailer on this pod's own
 // conversation, discovering the file rather than waiting to be handed a path.
 //
@@ -1542,6 +1686,10 @@ func (mgr *Manager) Snapshot() Snapshot {
 	if mgr.tailer != nil {
 		outstandingSubagents = mgr.tailer.OutstandingTaskCalls()
 	}
+	// A probe still pending means it has not been handed to the model. The
+	// older this stamp gets, the more confident the diagnosis "wedged inside
+	// one long tool call" becomes - it is not merely "the probe is late".
+	probePendingSince, _ := mgr.probes.PendingSince()
 	return Snapshot{
 		State:           mgr.state,
 		TurnsCompleted:  mgr.turnsSucceeded, // successful turns only (finding 11)
@@ -1553,8 +1701,9 @@ func (mgr *Manager) Snapshot() Snapshot {
 
 		LastSubagentActivityAt:   lastSubagent,
 		OutstandingSubagentCalls: outstandingSubagents,
-		// ProbePendingSince/StallSuspectedSince are intentionally left zero:
-		// the probe and the stall marker land in later phases.
+		ProbePendingSince:        probePendingSince,
+		// StallSuspectedSince is intentionally left zero: the stall marker
+		// lands in phase W4.
 	}
 }
 
@@ -1621,6 +1770,11 @@ func (mgr *Manager) Shutdown(ctx context.Context) error {
 	if cancel != nil {
 		cancel()
 	}
+	// Close out an unanswered probe so its outcome is counted. Without this
+	// the last probe of a pod's life - which is exactly the one sent to the
+	// turn that got the pod stopped - never reaches ccw_probe_outcomes_total,
+	// systematically censoring the failures from the metric.
+	mgr.probes.Finalize()
 	if w != nil {
 		_, _ = w.Write([]byte("\x03")) // Ctrl-C
 		_ = w.Close()
