@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -86,4 +87,88 @@ func TestRender_AppendsWorkerDelegationDirective(t *testing.T) {
 	require.Contains(t, got, "builder")
 	require.Contains(t, got, "architect")
 	require.Contains(t, got, "planning")
+}
+
+// The mid-turn push safety net auto-pushes the task branch, so a commit is
+// public the moment it is made and "commit then amend" is no longer a
+// supported workflow (force-push is in the settings deny list). The agent has
+// to be told, or it will plan a rewrite it cannot publish.
+func TestRender_AppendsAutoPushDirective(t *testing.T) {
+	home := t.TempDir()
+	ws := t.TempDir()
+
+	p := bootstrap.Params{
+		HomeDir:            home,
+		Workspace:          ws,
+		HookCommand:        "/usr/local/bin/cc-stop-hook",
+		RepoURL:            "https://github.com/owner/repo",
+		TaskBranch:         "tatara/feat-37-decks",
+		BranchPushInterval: 120 * time.Second,
+	}
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { return nil }))
+
+	b, err := os.ReadFile(filepath.Join(home, ".claude", "CLAUDE.md"))
+	require.NoError(t, err)
+	got := string(b)
+	require.Contains(t, got, "pushed")
+	require.Contains(t, got, "amend")
+	require.Contains(t, got, "force-push")
+	require.Contains(t, got, "make a new commit")
+}
+
+// BRANCH_PUSH_INTERVAL_SECONDS=0 turns the safety net off. The directive is
+// then the same plain lie the read-only case guards against, reached through
+// the other input: a task branch is set, so a TaskBranch-only gate would still
+// promise the agent a push that never happens - and the agent would skip an
+// amend it was actually free to make.
+func TestRender_NoAutoPushDirectiveWhenIntervalDisabled(t *testing.T) {
+	home := t.TempDir()
+	ws := t.TempDir()
+
+	p := bootstrap.Params{
+		HomeDir:            home,
+		Workspace:          ws,
+		HookCommand:        "/usr/local/bin/cc-stop-hook",
+		RepoURL:            "https://github.com/owner/repo",
+		TaskBranch:         "tatara/feat-37-decks",
+		BranchPushInterval: 0,
+	}
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { return nil }))
+
+	b, err := os.ReadFile(filepath.Join(home, ".claude", "CLAUDE.md"))
+	require.NoError(t, err)
+	require.NotContains(t, string(b), "force-push",
+		"nothing pushes at interval 0; the agent must not be told otherwise")
+}
+
+// The predicate that gates the directive MUST be the same one that gates the
+// ticker. Duplicating the condition in two packages is how the two drift, and
+// the drift IS the bug: the prose and the behaviour disagree silently.
+func TestAutoPushEnabled_IsTheSharedPredicate(t *testing.T) {
+	require.True(t, bootstrap.AutoPushEnabled("tatara/feat-1", 120*time.Second))
+	require.False(t, bootstrap.AutoPushEnabled("tatara/feat-1", 0),
+		"interval 0 is the explicit off switch")
+	require.False(t, bootstrap.AutoPushEnabled("", 120*time.Second),
+		"a read-only review checkout has no task branch and never pushes")
+	require.False(t, bootstrap.AutoPushEnabled("", 0))
+}
+
+// A read-only review checkout (CheckoutBranch, no TaskBranch) never pushes, so
+// telling that agent its branch is auto-pushed would be a plain lie.
+func TestRender_NoAutoPushDirectiveWithoutTaskBranch(t *testing.T) {
+	home := t.TempDir()
+	ws := t.TempDir()
+
+	p := bootstrap.Params{
+		HomeDir:        home,
+		Workspace:      ws,
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		RepoURL:        "https://github.com/owner/repo",
+		CheckoutBranch: "pr-head",
+	}
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { return nil }))
+
+	b, err := os.ReadFile(filepath.Join(home, ".claude", "CLAUDE.md"))
+	require.NoError(t, err)
+	require.NotContains(t, string(b), "force-push")
 }

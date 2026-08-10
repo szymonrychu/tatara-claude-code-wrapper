@@ -5,6 +5,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 )
@@ -75,6 +77,64 @@ func CommitAndPush(dir, branch, message string, git GitRunner, log *slog.Logger,
 		return false, err
 	}
 	return true, nil
+}
+
+// benignPushFailures are git push outcomes the mid-turn safety net must not
+// treat as failures. "everything up-to-date" is the ordinary no-new-commit
+// tick; the rejection forms mean the remote moved, which the next turn's
+// resume reconcile handles (see reconcileWithBase).
+//
+// Note that the production GitRunner deliberately drops git's combined output
+// (it can carry credential-helper expansions), so in the pod only the
+// zero-exit forms are recognised here. That is fine: PushOnly's caller treats
+// EVERY error as a warning it counts and logs, never as something fatal. This
+// classification is what keeps the counter honest for any runner that does
+// surface the message.
+var benignPushFailures = []string{
+	"everything up-to-date",
+	"everything up to date",
+	"non-fast-forward",
+	"fetch first",
+}
+
+// AutoPushEnabled is THE predicate for "this pod auto-pushes its task branch
+// mid-turn". Both consumers must call it and neither may re-derive it:
+// safetyPusher.Enabled decides whether the ticker runs, and autoPushDirective
+// decides whether the agent is told the ticker runs. Duplicating the condition
+// is how the two drift, and the drift is the bug - the pod then promises the
+// agent a push that never happens, and the agent skips an amend it was
+// actually free to make.
+//
+// taskBranch == "" is the read-only review checkout: the branch is someone
+// else's pull request head and must never be pushed. interval <= 0 is the
+// explicit off switch (BRANCH_PUSH_INTERVAL_SECONDS=0).
+func AutoPushEnabled(taskBranch string, interval time.Duration) bool {
+	return taskBranch != "" && interval > 0
+}
+
+// PushOnly pushes branch to origin and does nothing else. It is the mid-turn
+// safety net: `git add` and `git commit` are deliberately absent, so it never
+// takes .git/index.lock out from under the agent's own concurrent git calls
+// and can never publish a half-edited tree or a conflict marker. The branch
+// only ever advances by commits the agent chose to make.
+//
+// Why it exists: /workspace is the container writable layer with no volume, so
+// a commit that has not reached origin dies with the pod. Agent pod
+// imp-mtg-mtg-decks-i37 was OOMKilled six minutes after committing, and the
+// commit was gone. CommitAndPush at turn end is too coarse for a 42-minute
+// turn.
+func PushOnly(dir, branch string, git GitRunner) error {
+	err := git(dir, "push", "--no-verify", "--quiet", "origin", branch)
+	if err == nil {
+		return nil
+	}
+	msg := strings.ToLower(err.Error())
+	for _, benign := range benignPushFailures {
+		if strings.Contains(msg, benign) {
+			return nil
+		}
+	}
+	return err
 }
 
 // unstageOversizedBlobs walks the repo working tree and unstages every file

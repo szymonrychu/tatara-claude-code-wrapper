@@ -37,6 +37,10 @@ type app struct {
 	sess     *session.Manager
 	sender   *webhook.Sender
 	pusher   *pushclient.Pusher
+	// safety is the mid-turn push-only safety net: it pushes the task branch to
+	// origin on an interval so committed work is durable well before the turn
+	// finaliser runs. See safetypush.go.
+	safety *safetyPusher
 	// turnWG tracks the per-turn finalisation goroutines (commit/push then
 	// callback) spawned by OnTurnDone so shutdown can drain them and never lose
 	// the agent's commits to a pod teardown mid-push.
@@ -202,6 +206,11 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		Interval: time.Duration(cfg.PushIntervalSeconds) * time.Second,
 	}, reg, log, m)
 
+	// Mid-turn git push safety net: the turn finaliser's commit+push only runs
+	// at turn end, which on a 42-minute turn leaves committed work undurable for
+	// most of the turn. A no-op unless this pod owns a task branch.
+	a.safety = newSafetyPusher(cfg, gitRunner(), log, m)
+
 	return a, nil
 }
 
@@ -319,6 +328,7 @@ func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log
 
 func (a *app) run() error {
 	a.pusher.Start()
+	a.safety.Start()
 	errCh := make(chan error, 2)
 	go func() { errCh <- a.internal.ListenAndServe() }()
 	go func() { errCh <- a.pub.ListenAndServe() }()
@@ -329,6 +339,11 @@ func (a *app) shutdown(ctx context.Context) error {
 	// Stop pushing and remove this run's series before the rest tears down, so
 	// the operator drops them immediately rather than waiting for the TTL.
 	a.pusher.Shutdown(ctx)
+	// Stop the mid-turn safety net before the turn finalisers drain, so its
+	// pushes never race the finaliser's own commit+push on the same branch.
+	if a.safety != nil {
+		a.safety.Shutdown(ctx)
+	}
 	_ = a.sess.Shutdown(ctx)
 	// Drain the per-turn finalisation goroutines (commit/push then callback)
 	// before tearing down the sender, so a push in flight is allowed to finish
@@ -413,8 +428,11 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		GitUserEmail:      cfg.GitUserEmail,
 		TaskBranch:        cfg.TaskBranch,
 		CheckoutBranch:    cfg.CheckoutBranch,
-		FullClone:         cfg.FullClone,
-		Repos:             cfg.Repos,
+		// Render pushes nothing; it needs the interval only to decide whether to
+		// tell the agent the safety net is running (bootstrap.AutoPushEnabled).
+		BranchPushInterval: time.Duration(cfg.BranchPushIntervalSeconds) * time.Second,
+		FullClone:          cfg.FullClone,
+		Repos:              cfg.Repos,
 
 		HookPreClone:             cfg.HookPreClone,
 		HookPostClone:            cfg.HookPostClone,
