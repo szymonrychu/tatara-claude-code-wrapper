@@ -16,6 +16,28 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 )
 
+// scrubbedGitEnv is the environment every git call in this file runs under. It
+// drops EVERY inherited GIT_* variable before adding the ones we choose.
+//
+// That is not defensive tidiness, it is required for correctness. `go test` can
+// run from inside a git hook - this repo's own pre-push hook runs `make test` -
+// and git exports GIT_DIR and GIT_WORK_TREE to its hooks. Inheriting them points
+// every command here at the DEVELOPER'S repository instead of the temp one, so
+// `git init --bare <tmpdir>` re-initialises the real checkout as bare and
+// corrupts its config. This is not hypothetical: it happened once, and the
+// symptom (`core.bare and core.worktree do not make sense`) looks like a broken
+// checkout rather than a broken test.
+func scrubbedGitEnv(extra ...string) []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "GIT_") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env, extra...)
+}
+
 // realGit is a GitRunner backed by the actual git binary, with HOME and the
 // system config redirected so a developer's own git configuration cannot change
 // the outcome. The workspace contract is about what git really does to a real
@@ -27,7 +49,7 @@ func realGit(t *testing.T) bootstrap.GitRunner {
 	return func(dir string, args ...string) error {
 		cmd := exec.Command("git", args...) //nolint:gosec // test harness: git is a fixed binary and the args come from this file
 		cmd.Dir = dir
-		cmd.Env = append(os.Environ(),
+		cmd.Env = scrubbedGitEnv(
 			"HOME="+home,
 			"GIT_CONFIG_GLOBAL="+filepath.Join(home, "gitconfig"),
 			"GIT_CONFIG_NOSYSTEM=1",
@@ -50,7 +72,7 @@ func gitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...) //nolint:gosec // test harness: git is a fixed binary and the args come from this file
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = scrubbedGitEnv("GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.Output()
 	require.NoErrorf(t, err, "git %s", strings.Join(args, " "))
 	return strings.TrimSpace(string(out))
