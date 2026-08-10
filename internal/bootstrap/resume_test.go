@@ -656,3 +656,157 @@ func TestResumeDirective_LocalRemoteMergeBeforeBaseMerge(t *testing.T) {
 	required := strings.Index(md, "Hard requirement")
 	require.Less(t, recovered, required, "the informational middle tier precedes the mandatory tier")
 }
+
+// brokenRebaseState leaves dir in the shape a pod killed mid-rebase leaves it:
+// a truncated .git/rebase-merge that git refuses to abort ("could not read
+// head-name"), over a dirty working tree. It is the real failure, not a mock -
+// `git rebase --abort` genuinely exits non-zero against it and genuinely leaves
+// the tree dirty.
+func brokenRebaseState(t *testing.T, dir string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, ".git", "rebase-merge"), 0o755))
+	writeFile(t, dir, "README.md", "<<<<<<< HEAD\nhalf-applied work\n")
+	writeFile(t, dir, "extra.md", "and something new\n")
+}
+
+// TestPrepareWorkspace_FailedAbortRescuesRatherThanRecloning is the correction
+// to the first cut of this contract, which re-cloned when an abort failed over
+// a dirty tree. Re-cloning destroys uncommitted work, which is the exact
+// outcome the whole contract exists to prevent - a failed abort is when the
+// previous session's state is LEAST understood, not a licence to delete it.
+//
+// The tree is preserved on a dedicated rescue branch. Conflict markers may well
+// be committed there, and that is fine precisely because it is not the task
+// branch: PR #159's rule is that markers must never reach the branch the turn
+// finaliser and the mid-turn safety net PUSH, and a local rescue branch never
+// is one.
+func TestPrepareWorkspace_FailedAbortRescuesRatherThanRecloning(t *testing.T) {
+	git := realGit(t)
+	dest := initWorkRepo(t, git)
+	require.NoError(t, git(dest, "checkout", "-b", "tatara/task-alpha"))
+	taskTip := commitFile(t, git, dest, "work.md", "committed work\n", "real work")
+	brokenRebaseState(t, dest)
+
+	reg := prometheus.NewRegistry()
+	prep, err := bootstrap.PrepareWorkspace(dest, git, nil, metrics.New(reg))
+	require.NoError(t, err)
+	require.False(t, prep.Wiped, "a tree we cannot prove is disposable must never be re-cloned")
+	require.DirExists(t, dest)
+
+	require.Equal(t, taskTip, gitOut(t, dest, "rev-parse", "refs/heads/tatara/task-alpha"),
+		"the task branch must not advance: it is pushed, and a rescue may carry conflict markers")
+	require.Equal(t, "tatara/task-alpha", gitOut(t, dest, "rev-parse", "--abbrev-ref", "HEAD"),
+		"the rescue must hand the checkout back on the branch it found it")
+	require.Empty(t, gitOut(t, dest, "status", "--porcelain"),
+		"everything in the tree was preserved, so nothing is left uncommitted")
+
+	rescueTip := gitOut(t, dest, "rev-parse", "refs/heads/tatara-bootstrap-rescue-aborted")
+	require.NoError(t, git(dest, "merge-base", "--is-ancestor", taskTip, "tatara-bootstrap-rescue-aborted"),
+		"the commits that existed before the rescue must still be reachable from it")
+	require.Contains(t, gitOut(t, dest, "show", "--name-only", "--pretty=format:", rescueTip), "extra.md",
+		"the uncommitted tree is what the rescue branch exists to hold")
+
+	require.NotEmpty(t, prep.Required,
+		"a session that could not be cleanly aborted is exactly when the agent must look, so this is mandatory, not a footnote")
+	require.Contains(t, prep.Required[0], "tatara-bootstrap-rescue-aborted")
+	require.Contains(t, prep.Required[0], rescueTip[:12])
+	require.Empty(t, prep.Notes, "a mandatory item must not also be reported as background")
+	require.Equal(t, float64(1),
+		countedRecovery(t, reg, "ccw_bootstrap_workspace_recovered_total", "kind", "abort rescue"))
+}
+
+// TestPrepareWorkspace_FailedAbortUnusableRepoFallsBackToReclone pins the ONLY
+// remaining path that deletes anything: the rescue itself could not be
+// established, so there is no way to preserve the tree and no state left to
+// reason about. Every rescue branch name is taken here, which is the cheap
+// deterministic way to make the rescue impossible.
+func TestPrepareWorkspace_FailedAbortUnusableRepoFallsBackToReclone(t *testing.T) {
+	git := realGit(t)
+	dest := initWorkRepo(t, git)
+	for _, name := range bootstrap.AbortRescueBranchNamesForTest() {
+		require.NoError(t, git(dest, "branch", name))
+	}
+	brokenRebaseState(t, dest)
+
+	reg := prometheus.NewRegistry()
+	prep, err := bootstrap.PrepareWorkspace(dest, git, nil, metrics.New(reg))
+	require.NoError(t, err)
+	require.True(t, prep.Wiped, "with no way to preserve the tree, a re-clone is the only state left")
+	require.NoDirExists(t, dest)
+	require.Equal(t, float64(1),
+		countedRecovery(t, reg, "ccw_bootstrap_workspace_recovered_total", "kind", "unrecoverable"))
+}
+
+// TestPrepareWorkspace_FailedAbortCleanTreeRestoresHead: with nothing
+// uncommitted there is nothing to preserve, so `reset --hard HEAD` discards
+// exactly nothing and is the cheapest way back to a usable checkout.
+func TestPrepareWorkspace_FailedAbortCleanTreeRestoresHead(t *testing.T) {
+	git := realGit(t)
+	dest := initWorkRepo(t, git)
+	tip := commitFile(t, git, dest, "work.md", "committed\n", "work")
+	require.NoError(t, os.MkdirAll(filepath.Join(dest, ".git", "rebase-merge"), 0o755))
+
+	prep, err := bootstrap.PrepareWorkspace(dest, git, nil, nil)
+	require.NoError(t, err)
+	require.False(t, prep.Wiped)
+	require.Equal(t, tip, gitOut(t, dest, "rev-parse", "HEAD"))
+	require.Empty(t, prep.Required, "nothing was at risk, so nothing is required of the agent")
+}
+
+// TestResumeDirective_AbortRescueIsMandatory renders the whole boot and pins
+// where the Phase C rescue lands: tier two, with the branch name and the sha,
+// because a rescue branch nobody is told about is only marginally better than a
+// reflog entry and it lives on this volume alone.
+func TestResumeDirective_AbortRescueIsMandatory(t *testing.T) {
+	git := realGit(t)
+	remote := initBareRemote(t, git)
+	ws := t.TempDir()
+	p := workspaceParams(t, ws, remote, "tatara/task-alpha")
+	require.NoError(t, bootstrap.Render(p, git))
+
+	dest := bootstrap.RepoDir(ws, remote)
+	taskTip := commitFile(t, git, dest, "work.md", "committed work\n", "real work")
+	brokenRebaseState(t, dest)
+
+	require.NoError(t, bootstrap.Render(p, git),
+		"a session that could not be aborted is a job for the agent, never a boot failure")
+	require.Equal(t, taskTip, gitOut(t, dest, "rev-parse", "refs/heads/tatara/task-alpha"))
+	rescueTip := gitOut(t, dest, "rev-parse", "refs/heads/tatara-bootstrap-rescue-aborted")
+
+	md := injectedGlobalClaudeMd(t, p)
+	require.Contains(t, md, "hard requirement",
+		"the agent must be told to look, not merely informed in passing")
+	require.Contains(t, md, "tatara-bootstrap-rescue-aborted")
+	require.Contains(t, md, rescueTip[:12], "the directive must name the sha the agent has to inspect")
+
+	rescueAt := strings.Index(md, "tatara-bootstrap-rescue-aborted")
+	requiredAt := strings.Index(md, "Hard requirement")
+	require.Less(t, requiredAt, rescueAt, "the rescue belongs under the mandatory heading")
+}
+
+// TestResumeDirective_DetachedRescueIsSurfaced: the Phase D rescue branch is
+// only a name on this volume, so the agent has to be told it exists and where
+// to find it. It stays in the informational middle tier - nothing is required,
+// the work is already on the branch it was made on - but it must carry both the
+// branch name and the sha.
+func TestResumeDirective_DetachedRescueIsSurfaced(t *testing.T) {
+	git := realGit(t)
+	remote := initBareRemote(t, git)
+	ws := t.TempDir()
+	p := workspaceParams(t, ws, remote, "tatara/task-alpha")
+	require.NoError(t, bootstrap.Render(p, git))
+
+	dest := bootstrap.RepoDir(ws, remote)
+	commitFile(t, git, dest, "work.md", "committed work\n", "real work")
+	require.NoError(t, git(dest, "checkout", "--detach", "HEAD"))
+	writeFile(t, dest, "README.md", "work stranded on a detached HEAD\n")
+
+	require.NoError(t, bootstrap.Render(p, git))
+	rescueTip := gitOut(t, dest, "rev-parse", "refs/heads/tatara-bootstrap-rescue")
+
+	md := injectedGlobalClaudeMd(t, p)
+	require.Contains(t, md, "Workspace recovered from an interrupted session")
+	require.Contains(t, md, "tatara-bootstrap-rescue",
+		"a rescue branch the agent is never told about is barely better than a reflog entry")
+	require.Contains(t, md, rescueTip[:12], "the directive must name the sha")
+}

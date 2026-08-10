@@ -396,6 +396,9 @@ type resumedRepo struct {
 	// commit, a reattached HEAD). Platform noise - stale locks, a half-cloned
 	// .git - is deliberately absent: it is counted and logged, never surfaced.
 	notes []string
+	// required are repairs the agent must act on before anything else, rendered
+	// under the mandatory heading alongside the unfinished merges.
+	required []string
 }
 
 // reconciledCleanly reports whether either reconcile did visible, successful
@@ -445,8 +448,11 @@ func (r resumedRepo) reconciledCleanly() bool {
 // checkout path, where the branch belongs to someone else's pull request and
 // the agent must neither reconcile nor push it.
 func resumeDirective(repos []resumedRepo, workspaceNotes []string) string {
-	var clean, recovered, localUnreconciled, baseUnreconciled []resumedRepo
+	var clean, recovered, mustInspect, localUnreconciled, baseUnreconciled []resumedRepo
 	for _, r := range repos {
+		if len(r.required) > 0 {
+			mustInspect = append(mustInspect, r)
+		}
 		if r.localResult == reconcileLocalRemoteConflict {
 			localUnreconciled = append(localUnreconciled, r)
 		}
@@ -461,7 +467,7 @@ func resumeDirective(repos []resumedRepo, workspaceNotes []string) string {
 			clean = append(clean, r)
 		}
 	}
-	listed := orderedRepoUnion(localUnreconciled, baseUnreconciled, recovered, clean)
+	listed := orderedRepoUnion(mustInspect, localUnreconciled, baseUnreconciled, recovered, clean)
 	if len(listed) == 0 && len(workspaceNotes) == 0 {
 		return ""
 	}
@@ -481,8 +487,15 @@ func resumeDirective(repos []resumedRepo, workspaceNotes []string) string {
 			}
 		}
 	}
-	if len(localUnreconciled) > 0 || len(baseUnreconciled) > 0 {
+	if len(mustInspect) > 0 || len(localUnreconciled) > 0 || len(baseUnreconciled) > 0 {
 		b.WriteString(resumeConflictRequirement)
+		// A tree bootstrap could not make sense of comes first: whatever it holds
+		// may change what the merges below are even supposed to produce.
+		for _, r := range mustInspect {
+			for _, n := range r.required {
+				fmt.Fprintf(&b, "- In `%s`: %s.\n", r.dir, n)
+			}
+		}
 		for _, r := range localUnreconciled {
 			fmt.Fprintf(&b, "- In `%s`: fetch origin, merge `origin/%s` into your local `%s`, resolve every conflict, commit the merge.\n",
 				r.dir, r.taskBranch, r.taskBranch)
@@ -545,18 +558,21 @@ shaped the way the last session left it, so read these before you plan:
 `
 
 const resumeConflictRequirement = `
-### Hard requirement: finish the interrupted merge first
+### Hard requirement: repair the interrupted session first
 
-Bootstrap tried to merge and could not complete it, so it aborted the merge. The
-working tree is clean at the tip of the task branch and nothing you committed
-before is lost - but the branch is missing exactly the changes that could not be
-merged, and the code you are about to read is stale by them.
+The previous session was cut off part way through something bootstrap could not
+finish for you. Nothing you committed before is lost and the working tree is
+clean at the tip of the task branch - but the branch is missing exactly the
+changes that could not be applied, and the code you are about to read is stale
+by them.
 
 Resolving this is a hard requirement and your first action. Before you read or
 write any other code, before any planning, work through the list below IN THE
-ORDER GIVEN. Where both appear for one repository, the merge of your own branch
-against origin comes first: merging the base branch into a branch that is still
-missing half its own commits reconciles nothing.
+ORDER GIVEN, which is the order in which the items depend on each other: a tree
+bootstrap could not make sense of is inspected first, because what it holds can
+change what the merges are supposed to produce; then the merge of your own
+branch against origin, because merging the base branch into a branch that is
+still missing half its own commits reconciles nothing; then the base branch.
 
 `
 
@@ -673,12 +689,12 @@ func Render(p Params, git GitRunner) error {
 					}
 					return fmt.Errorf("checkout task branch in %s: %w", r.Name, err)
 				}
-				if resumed || len(prep.Notes) > 0 {
+				if resumed || len(prep.Notes) > 0 || len(prep.Required) > 0 {
 					action = "resume"
 					resumedRepos = append(resumedRepos, resumedRepo{
 						name: r.Name, dir: dest, taskBranch: checkoutBranch,
 						baseRef: baseRefName(r.Branch), result: result,
-						localResult: localResult, notes: prep.Notes,
+						localResult: localResult, notes: prep.Notes, required: prep.Required,
 					})
 				}
 			}
@@ -742,12 +758,12 @@ func Render(p Params, git GitRunner) error {
 				}
 				return err
 			}
-			if resumed || len(prep.Notes) > 0 {
+			if resumed || len(prep.Notes) > 0 || len(prep.Required) > 0 {
 				action = "resume"
 				resumedRepos = append(resumedRepos, resumedRepo{
 					name: p.RepoURL, dir: repoDest, taskBranch: checkoutBranch,
 					baseRef: baseRefName(p.RepoBranch), result: result,
-					localResult: localResult, notes: prep.Notes,
+					localResult: localResult, notes: prep.Notes, required: prep.Required,
 				})
 			}
 		}

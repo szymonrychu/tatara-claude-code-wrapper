@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
@@ -53,6 +54,13 @@ type WorkspacePrep struct {
 	// surfacing it would spend prompt budget on something the agent cannot act
 	// on.
 	Notes []string
+	// Required are repairs the agent must ACT on before anything else, rendered
+	// under the directive's mandatory heading rather than its informational one.
+	// Today that is the abort rescue alone: an operation that could not be
+	// cleanly aborted means the previous session died in a state bootstrap could
+	// not reason about, which is exactly when the agent needs to look rather
+	// than be told in passing.
+	Required []string
 }
 
 // PrepareWorkspace makes a possibly-inherited repo checkout safe to use, and
@@ -94,14 +102,17 @@ func PrepareWorkspace(dest string, git GitRunner, log *slog.Logger, m *metrics.M
 	prep.Notes = append(prep.Notes, abortNotes...)
 
 	// Phase D: the working tree.
-	treeNotes, wiped, err := rescueWorkingTree(dest, git, log, m, abortFailed)
+	treeNotes, required, wiped, err := rescueWorkingTree(dest, git, log, m, abortFailed)
 	if err != nil {
 		return prep, err
 	}
 	if wiped {
+		// Everything Phase C repaired went with the checkout, so report only the
+		// wipe: notes about a tree that no longer exists would be a lie.
 		return WorkspacePrep{Wiped: true}, nil
 	}
 	prep.Notes = append(prep.Notes, treeNotes...)
+	prep.Required = append(prep.Required, required...)
 	return prep, nil
 }
 
@@ -223,8 +234,58 @@ func abortInProgress(dest string, git GitRunner, log *slog.Logger, m *metrics.Me
 const rescueCommitMessage = "tatara bootstrap: rescue uncommitted work from an interrupted session"
 
 // rescueBranch names the commit made while HEAD was detached, so it stays
-// reachable after the task branch is checked out over it.
-const rescueBranch = "tatara-bootstrap-rescue"
+// reachable after the task branch is checked out over it. abortRescueBranch is
+// the Phase C equivalent, kept deliberately distinct: the two mean different
+// things to the agent (one is work it simply had not committed, the other is a
+// session bootstrap could not make sense of), and one name for both would make
+// them indistinguishable on the volume.
+const (
+	rescueBranch            = "tatara-bootstrap-rescue"
+	abortRescueBranch       = "tatara-bootstrap-rescue-aborted"
+	abortRescueMessage      = "tatara bootstrap: preserve a session that could not be cleanly aborted"
+	maxRescueBranchAttempts = 9
+)
+
+// rescueBranchNames are the names tried, in order, when claiming a rescue
+// branch. Suffixes exist so a second interrupted session never overwrites the
+// first one's rescue: the whole point of a rescue branch is that nothing on it
+// is disposable, and `branch -f` would quietly make it so.
+func rescueBranchNames(base string) []string {
+	names := []string{base}
+	for i := 2; i <= maxRescueBranchAttempts; i++ {
+		names = append(names, base+"-"+strconv.Itoa(i))
+	}
+	return names
+}
+
+// AbortRescueBranchNamesForTest exposes the Phase C rescue branch names so a
+// test can occupy every one of them and drive the only remaining path that
+// deletes anything.
+func AbortRescueBranchNamesForTest() []string { return rescueBranchNames(abortRescueBranch) }
+
+// claimRescueBranch creates and checks out the first free rescue name, carrying
+// the dirty working tree onto it. Returns the name claimed, or "" when every
+// name is taken and no rescue can be established.
+func claimRescueBranch(dest string, git GitRunner, base string) string {
+	for _, name := range rescueBranchNames(base) {
+		if git(dest, "checkout", "-b", name) == nil {
+			return name
+		}
+	}
+	return ""
+}
+
+// nameRescueBranch points a new branch at HEAD without moving anything, for the
+// detached case where the commit has already been made in the right place and
+// only needs a name to stay reachable.
+func nameRescueBranch(dest string, git GitRunner, base string) string {
+	for _, name := range rescueBranchNames(base) {
+		if git(dest, "branch", name) == nil {
+			return name
+		}
+	}
+	return ""
+}
 
 // rescueWorkingTree deals with whatever the previous session left in the tree.
 //
@@ -248,43 +309,42 @@ const rescueBranch = "tatara-bootstrap-rescue"
 // about at all. That is the single place in this file where work can be lost,
 // and it is bounded: everything already pushed is on origin, and the mid-turn
 // safety net pushes the task branch every couple of minutes.
-func rescueWorkingTree(dest string, git GitRunner, log *slog.Logger, m *metrics.Metrics, abortFailed bool) (notes []string, wiped bool, err error) {
+func rescueWorkingTree(dest string, git GitRunner, log *slog.Logger, m *metrics.Metrics, abortFailed bool) (notes, required []string, wiped bool, err error) {
 	dirty := git(dest, "diff", "--quiet") != nil || git(dest, "diff", "--cached", "--quiet") != nil
 
 	if abortFailed {
-		if dirty {
-			if rerr := os.RemoveAll(dest); rerr != nil {
-				return nil, false, fmt.Errorf("remove unrecoverable checkout %s: %w", dest, rerr)
-			}
-			recordRecovery(log, m, recoveryUnrecoverable, dest, "an abort failed over a dirty tree, so the checkout was re-cloned")
-			return nil, true, nil
+		if !dirty {
+			// Nothing is uncommitted, so `reset --hard HEAD` discards exactly
+			// nothing and is the cheapest way back to a checkout git will work
+			// with. No rescue branch is needed because nothing was at risk.
+			_ = git(dest, "reset", "--hard", "HEAD")
+			recordRecovery(log, m, recoveryResetAfterAbort, dest, "an abort failed over a clean tree, so the checkout was restored to HEAD")
+			return nil, nil, false, nil
 		}
-		_ = git(dest, "reset", "--hard", "HEAD")
-		recordRecovery(log, m, recoveryResetAfterAbort, dest, "an abort failed over a clean tree, so the checkout was restored to HEAD")
-		return nil, false, nil
+		return rescueUnabortable(dest, git, log, m)
 	}
 
 	// Detached HEAD is Phase E's problem: checking out the task branch
-	// reattaches it. It is recorded rather than surfaced because the agent has
-	// nothing to do about it - by the time the agent reads anything, it is
-	// already fixed.
+	// reattaches it. The detachment itself is recorded rather than surfaced
+	// because the agent has nothing to do about it - by the time the agent reads
+	// anything, it is already fixed.
 	detached := git(dest, "symbolic-ref", "-q", "HEAD") != nil
 	if detached {
 		recordRecovery(log, m, recoveryDetachedHead, dest, "the previous session left HEAD detached")
 	}
 	if !dirty {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 
 	if err := git(dest, "add", "-A"); err != nil {
-		return nil, false, nil //nolint:nilerr // best-effort rescue: a failed add leaves the tree exactly as found
+		return nil, nil, false, nil //nolint:nilerr // best-effort rescue: a failed add leaves the tree exactly as found
 	}
 	unstageOversizedBlobs(dest, git, log, m)
 	if git(dest, "diff", "--cached", "--quiet") == nil {
-		return nil, false, nil // everything staged was oversized and got unstaged
+		return nil, nil, false, nil // everything staged was oversized and got unstaged
 	}
 	if err := git(dest, "commit", "--no-verify", "-m", rescueCommitMessage); err != nil {
-		return nil, false, nil //nolint:nilerr // best-effort rescue: the tree is still on disk, unchanged
+		return nil, nil, false, nil //nolint:nilerr // best-effort rescue: the tree is still on disk, unchanged
 	}
 	sha := headSHA(dest)
 	note := "uncommitted work from the previous session was committed for you as `" + shortSHA(sha) + "` (" + rescueCommitMessage + "); review it and fold it into your own commits rather than assuming it is finished"
@@ -292,13 +352,81 @@ func rescueWorkingTree(dest string, git GitRunner, log *slog.Logger, m *metrics.
 		// The commit was made on a detached HEAD, so checking out the task
 		// branch would leave it reachable only through the reflog. A named
 		// branch is additive and costs nothing; losing the commit is the one
-		// outcome this whole file exists to prevent.
-		if git(dest, "branch", "-f", rescueBranch) == nil {
-			note += ". HEAD was detached at the time, so that commit is also kept on branch `" + rescueBranch + "`"
+		// outcome this whole file exists to prevent. The name is surfaced with
+		// the sha, because a rescue branch nobody is told about exists only on
+		// this volume and is barely better than the reflog entry it replaces.
+		if name := nameRescueBranch(dest, git, rescueBranch); name != "" {
+			note += ". HEAD was detached at the time, so that commit is also kept on branch `" + name + "`, which exists only in this workspace - nothing pushes it for you"
 		}
 	}
 	recordRecovery(log, m, recoveryRescueCommit, dest, "uncommitted work was committed, sha "+sha)
-	return []string{note}, false, nil
+	return []string{note}, nil, false, nil
+}
+
+// rescueUnabortable preserves a working tree whose in-progress operation could
+// not be aborted, and is the correction to this contract's first cut - which
+// re-cloned here, destroying uncommitted work in the one situation where the
+// previous session's state is LEAST understood. A failed abort is not a licence
+// to delete; it is the strongest reason not to.
+//
+// The tree goes onto a dedicated rescue branch, claimed and checked out BEFORE
+// the commit so the commit lands there and the branch the checkout was found on
+// never moves. That ordering is the whole design:
+//
+// Committing conflict markers is acceptable here, and only here. PR #159's rule
+// is that markers must never reach the task branch, because the turn finaliser
+// stages the whole tree with `git add -A` and the mid-turn safety net pushes
+// that branch every couple of minutes - so markers on it become published
+// markers. A local rescue branch is neither staged nor pushed by anything, so
+// the rule is not in tension with preserving the tree. Do not "fix" this into
+// discarding the markers: the tree is the only record of what the dead session
+// was doing.
+//
+// A re-clone survives as the fallback for exactly one case: the rescue could
+// not be established at all, so there is no way to preserve the tree and
+// nothing left that can be reasoned about.
+func rescueUnabortable(dest string, git GitRunner, log *slog.Logger, m *metrics.Metrics) (notes, required []string, wiped bool, err error) {
+	branch := claimRescueBranch(dest, git, abortRescueBranch)
+	if branch == "" {
+		return nil, nil, true, wipeUnrecoverable(dest, log, m)
+	}
+	if aerr := git(dest, "add", "-A"); aerr != nil {
+		return nil, nil, true, wipeUnrecoverable(dest, log, m)
+	}
+	unstageOversizedBlobs(dest, git, log, m)
+	if git(dest, "diff", "--cached", "--quiet") == nil {
+		// Everything in the tree was an oversized artifact and got unstaged, so
+		// there is nothing worth a rescue commit. Hand the checkout back and
+		// leave it at that; the artifacts are still on disk.
+		_ = git(dest, "checkout", "-")
+		return nil, nil, false, nil
+	}
+	if cerr := git(dest, "commit", "--no-verify", "-m", abortRescueMessage); cerr != nil {
+		return nil, nil, true, wipeUnrecoverable(dest, log, m)
+	}
+	sha := headSHA(dest)
+	// Back to the branch the checkout was found on, which never moved and is now
+	// clean because everything that was uncommitted lives on the rescue branch.
+	// A failure here is harmless: Phase E checks the task branch out regardless.
+	_ = git(dest, "checkout", "-")
+	recordRecovery(log, m, recoveryAbortRescue, dest, "a session that could not be aborted was preserved on a rescue branch, sha "+sha)
+	return nil, []string{
+		"the previous session was interrupted inside a git operation that could NOT be cleanly aborted, so bootstrap could not tell what state it was in. " +
+			"The working tree exactly as it stood has been preserved on branch `" + branch + "` at `" + shortSHA(sha) + "`, which exists only in this workspace - nothing pushes it for you. " +
+			"That commit may contain conflict markers or a half-applied change; it was kept off your task branch for exactly that reason. " +
+			"Inspect it (`git show " + shortSHA(sha) + "`, `git diff " + branch + "`), salvage anything real onto your task branch, and only then continue",
+	}, false, nil
+}
+
+// wipeUnrecoverable removes a checkout whose tree could not be preserved. This
+// is the ONLY path in the contract that deletes content, and it is reached only
+// when the rescue itself could not be established.
+func wipeUnrecoverable(dest string, log *slog.Logger, m *metrics.Metrics) error {
+	if err := os.RemoveAll(dest); err != nil {
+		return fmt.Errorf("remove unrecoverable checkout %s: %w", dest, err)
+	}
+	recordRecovery(log, m, recoveryUnrecoverable, dest, "an interrupted session could neither be aborted nor preserved, so the checkout was re-cloned")
+	return nil
 }
 
 // headSHA reads the current commit out of .git rather than shelling out for it:
@@ -346,6 +474,7 @@ const (
 	recoveryInvalidGit      = "invalid git"
 	recoveryUnrecoverable   = "unrecoverable"
 	recoveryResetAfterAbort = "reset after abort"
+	recoveryAbortRescue     = "abort rescue"
 	recoveryDetachedHead    = "detached head"
 	recoveryRescueCommit    = "rescue commit"
 	recoveryWrongTask       = "wrong task"
