@@ -56,6 +56,19 @@ type Metrics struct {
 	// result=up_to_date|merged|conflict|fetch_fail|base_unresolved.
 	BootstrapReconcileTotal *prometheus.CounterVec // label: result
 
+	// Resumed-workspace repairs on a persistent /workspace volume. Both are
+	// SILENT to the agent by design (nothing it can act on), so this counter is
+	// the only fleet-wide view of how often volumes come back damaged.
+	//
+	// BootstrapLockCleared: stale .git locks a killed pod left holding. A rising
+	// rate means pods are being killed mid-git, not that the cleanup is wrong.
+	// The label is collapsed to the fixed file names plus "refs" so a branch
+	// name can never blow up the cardinality.
+	BootstrapLockCleared *prometheus.CounterVec // label: lock
+	// BootstrapWorkspaceRecovered: every other repair, by kind (an aborted
+	// merge/rebase, a rescue commit, a wrong-Task wipe, an unusable checkout).
+	BootstrapWorkspaceRecovered *prometheus.CounterVec // label: kind
+
 	// Oversized blobs the turn finaliser refused to stage (issue #131): a build
 	// artifact swept up by `git add -A` poisons the task branch for every later
 	// turn, and `--no-verify` bypasses the pre-commit size hook that would catch it.
@@ -181,7 +194,11 @@ func New(reg prometheus.Registerer) *Metrics {
 		BootstrapRenderTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_bootstrap_render_total", Help: "Bootstrap config-render steps by result (ok|fail)."}, []string{"result"}),
 		BootstrapReconcileTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ccw_bootstrap_reconcile_total", Help: "Resumed task-branch reconciliations against the repo base branch by result (up_to_date|merged|conflict|fetch_fail|base_unresolved)."}, []string{"result"}),
+			Name: "ccw_bootstrap_reconcile_total", Help: "Resumed task-branch reconciliations by result, against the repo base branch (up_to_date|merged|conflict|fetch_fail|base_unresolved) and against the branch's own remote counterpart (local_only|local_ahead|remote_ahead|local_remote_merged|local_remote_conflict)."}, []string{"result"}),
+		BootstrapLockCleared: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_bootstrap_lock_cleared_total", Help: "Stale git lock files removed from an inherited workspace, by lock (index.lock|shallow.lock|HEAD.lock|config.lock|packed-refs.lock|refs)."}, []string{"lock"}),
+		BootstrapWorkspaceRecovered: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_bootstrap_workspace_recovered_total", Help: "Repairs bootstrap made to a persistent workspace that outlived its pod, by kind."}, []string{"kind"}),
 		CommitOversizedBlobSkipped: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "ccw_commit_oversized_blob_skipped_total", Help: "Oversized files the turn finaliser refused to stage, keeping build artifacts out of the task branch."}),
 		TurnTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -220,7 +237,8 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.BootstrapHookInstall, m.LifecycleHookTotal, m.HookOutcome, m.MetricPushTotal,
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.HTTPInFlight, m.HTTPPanicsTotal,
 		m.AuthTotal, m.TurnResumes, m.TurnRefusals, m.OutcomeRepromptTotal, m.BootstrapRenderTotal,
-		m.BootstrapReconcileTotal, m.CommitOversizedBlobSkipped,
+		m.BootstrapReconcileTotal, m.BootstrapLockCleared, m.BootstrapWorkspaceRecovered,
+		m.CommitOversizedBlobSkipped,
 		m.TurnTokensTotal, m.TurnCostUSD, m.InternalIssueTotal, m.InternalIssueDrainTimeoutTotal,
 		m.ToolCallsTotal, m.QueueOpsTotal,
 		m.ProbesTotal, m.ProbeAnswerSeconds, m.ProbeOutcomesTotal,

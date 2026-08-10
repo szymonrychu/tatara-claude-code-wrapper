@@ -75,6 +75,13 @@ type Params struct {
 	FullClone bool
 	Repos     []RepoSpec
 
+	// TaskName and ProjectName identify the work this workspace belongs to
+	// (TATARA_TASK / TATARA_PROJECT). They are recorded in the workspace
+	// identity file so a resumed volume can prove it holds THIS Task's tree.
+	// Empty on either side means "cannot compare", and nothing is wiped.
+	TaskName    string
+	ProjectName string
+
 	// Lifecycle hook commands (operator-supplied via the Project CRD, delivered
 	// as HOOK_* env vars). Empty means the hook is disabled. preClone/postClone
 	// are fired by Render around each clone; the conversation/turn hooks are
@@ -101,52 +108,174 @@ type GitRunner func(dir string, args ...string) error
 
 // Reconcile results, reported on ccw_bootstrap_reconcile_total{result} and in
 // the bootstrap_reconcile log line.
+//
+// The first group is the task branch against its BASE branch (issue #131). The
+// second is the task branch against ITS OWN remote counterpart, which only a
+// persistent workspace can ever need: without a volume the local branch is
+// whatever the clone just produced, so there are no local commits to weigh
+// against origin. Both groups share the one counter deliberately - they are the
+// same business action ("what did bootstrap have to do to this branch") and a
+// second metric would only split the query.
 const (
 	reconcileUpToDate       = "up_to_date"
 	reconcileMerged         = "merged"
 	reconcileConflict       = "conflict"
 	reconcileFetchFail      = "fetch_fail"
 	reconcileBaseUnresolved = "base_unresolved"
+
+	// localOnly: the branch exists on this volume and nowhere else. It is
+	// checked out as-is and published, because one lost volume would otherwise
+	// lose every commit on it.
+	reconcileLocalOnly = "local_only"
+	// localAhead: local already contains the remote tip; nothing to merge.
+	reconcileLocalAhead = "local_ahead"
+	// remoteAhead: local is contained in the remote tip, so the remote can be
+	// taken with a fast-forward that adds commits and discards none.
+	reconcileRemoteAhead = "remote_ahead"
+	// localRemoteMerged / localRemoteConflict: genuine divergence, merged or
+	// aborted. Never a reset: local commits are authoritative and force-push is
+	// denied, so a reset would strand the branch permanently.
+	reconcileLocalRemoteMerged   = "local_remote_merged"
+	reconcileLocalRemoteConflict = "local_remote_conflict"
 )
 
-// checkoutTaskBranch checks out taskBranch in dir. If the branch already
-// exists on the remote (ls-remote --exit-code returns nil), it resumes:
-// unshallows the clone (best-effort), fetches the remote branch, then checks
-// out with -B <branch> FETCH_HEAD so the agent has its prior commits and a
-// full history to reconcile against. A resumed branch that the agent OWNS
-// (reconcile=true, i.e. TaskBranch is set) is then reconciled with the repo's
-// base branch - see reconcileWithBase for why that is mandatory and why it is
-// a merge. If the branch does not exist, it falls back to the fresh-task path:
-// plain "checkout -b <branch>" off the just-cloned base branch, which is
-// current by construction and needs no reconcile.
-// Returns (resumed=true, <reconcile result>, nil) on the resume path and
-// (false, "", nil) on the fresh path, so callers can set action="resume" and
-// report the reconcile outcome without a second ls-remote call.
-func checkoutTaskBranch(dir, taskBranch, baseBranch string, fullClone, reconcile bool, git GitRunner) (resumed bool, result string, err error) {
-	branchExists := git(dir, "ls-remote", "--exit-code", "--heads", "origin", taskBranch) == nil
-	if !branchExists {
-		return false, "", git(dir, "checkout", "-b", taskBranch)
-	}
-	// Unshallow so the merge against origin/<base> has a merge base. Only
-	// when the clone was shallow (FullClone=false): `git fetch --unshallow` on
-	// an already-complete repo fatals ("does not make sense"), so skip it for a
-	// full clone, which already has the full history.
-	if !fullClone {
-		if err := git(dir, "fetch", "--unshallow", "origin"); err != nil {
-			return false, "", fmt.Errorf("unshallow for resume of %s: %w", taskBranch, err)
+// checkoutTaskBranch checks out taskBranch in dir and reconciles it, first
+// against its own remote counterpart and then - when the agent OWNS the branch
+// (reconcile=true, i.e. TaskBranch is set) - against the repo's base branch.
+// Returns (resumed, <local-vs-remote result>, <base result>, err); resumed=true
+// means the branch was inherited rather than created, so callers can set
+// action="resume" and report both outcomes without a second probe.
+//
+// persistent says the checkout survived from an earlier pod (a mounted volume,
+// not a clone this Render just made). It is the ONLY reason the local half of
+// the probe below can be true, and it is passed rather than inferred so a fresh
+// clone keeps its exact previous behaviour: a just-cloned repo has no
+// refs/heads/<taskBranch> to find, and probing for one would only add a git
+// call whose answer is known.
+//
+// The four arms, and why each is what it is. The rule they all serve: local
+// commits are authoritative and are never discarded, the remote is
+// authoritative for nothing, and every operation is additive - merge, commit,
+// or merge --abort - because those are the only ones that cannot lose a side.
+// Force-push is denied by the settings deny list, so a branch whose history was
+// rewritten could never be published again; the merge is the only recoverable
+// option, not a stylistic preference.
+//
+//	local no,  remote no  -> `checkout -b`: a genuinely fresh task branch.
+//	local yes, remote no  -> plain `checkout`, then PUBLISH it. This is the
+//	    OOMKill case: the pod committed and died before anything reached
+//	    origin. `checkout -b` here is fatal ("a branch named X already
+//	    exists"), and with a persistent volume that fatality is permanent -
+//	    the pod crash-loops to the residency cap and no turn ever runs. The
+//	    push matters as much as the checkout: those commits exist on exactly
+//	    one disk until it happens.
+//	local no,  remote yes -> unchanged: unshallow, fetch, `checkout -B
+//	    FETCH_HEAD`. A reset is safe here precisely because there is nothing
+//	    local to lose.
+//	local yes, remote yes -> NEVER -B and never a reset, which would
+//	    hard-reset the branch onto the remote tip and destroy exactly the
+//	    unpushed commits the volume exists to preserve. Contained either way
+//	    is a no-op or a fast-forward; genuine divergence is merged, and a
+//	    conflicting merge is aborted and handed to the agent as a first job
+//	    rather than failing the boot (the same inversion issue #131 made for
+//	    the base merge).
+func checkoutTaskBranch(dir, taskBranch, baseBranch string, fullClone, reconcile, persistent bool, git GitRunner) (resumed bool, localResult, baseResult string, err error) {
+	localExists := persistent && git(dir, "rev-parse", "--verify", "--quiet", "refs/heads/"+taskBranch) == nil
+	remoteExists := git(dir, "ls-remote", "--exit-code", "--heads", "origin", taskBranch) == nil
+
+	switch {
+	case !localExists && !remoteExists:
+		return false, "", "", git(dir, "checkout", "-b", taskBranch)
+
+	case localExists && !remoteExists:
+		if err := git(dir, "checkout", taskBranch); err != nil {
+			return false, "", "", fmt.Errorf("checkout local task branch %s: %w", taskBranch, err)
 		}
+		localResult = reconcileLocalOnly
+		unshallowBestEffort(dir, fullClone, git)
+		if reconcile {
+			// Best-effort: an unreachable origin must not fail a boot whose
+			// checkout already succeeded, and the mid-turn safety net (PushOnly)
+			// retries every couple of minutes for the rest of the turn.
+			_ = git(dir, "push", "--no-verify", "-u", "origin", taskBranch)
+		}
+
+	case !localExists && remoteExists:
+		// Unshallow so the merge against origin/<base> has a merge base. Only
+		// when the clone was shallow (FullClone=false): `git fetch --unshallow` on
+		// an already-complete repo fatals ("does not make sense"), so skip it for a
+		// full clone, which already has the full history.
+		if !fullClone {
+			if err := git(dir, "fetch", "--unshallow", "origin"); err != nil {
+				return false, "", "", fmt.Errorf("unshallow for resume of %s: %w", taskBranch, err)
+			}
+		}
+		if err := git(dir, "fetch", "origin", taskBranch); err != nil {
+			return false, "", "", fmt.Errorf("fetch remote task branch %s: %w", taskBranch, err)
+		}
+		if err := git(dir, "checkout", "-B", taskBranch, "FETCH_HEAD"); err != nil {
+			return false, "", "", err
+		}
+
+	default:
+		if err := git(dir, "checkout", taskBranch); err != nil {
+			return false, "", "", fmt.Errorf("checkout local task branch %s: %w", taskBranch, err)
+		}
+		unshallowBestEffort(dir, fullClone, git)
+		if err := git(dir, "fetch", "origin", taskBranch); err != nil {
+			return false, "", "", fmt.Errorf("fetch remote task branch %s: %w", taskBranch, err)
+		}
+		localResult = mergeRemoteTaskBranch(dir, taskBranch, git)
 	}
-	if err := git(dir, "fetch", "origin", taskBranch); err != nil {
-		return false, "", fmt.Errorf("fetch remote task branch %s: %w", taskBranch, err)
-	}
-	if err := git(dir, "checkout", "-B", taskBranch, "FETCH_HEAD"); err != nil {
-		return false, "", err
-	}
+
 	if !reconcile {
-		return true, "", nil
+		return true, localResult, "", nil
 	}
-	result, err = reconcileWithBase(dir, taskBranch, baseBranch, git)
-	return true, result, err
+	baseResult, err = reconcileWithBase(dir, taskBranch, baseBranch, git)
+	return true, localResult, baseResult, err
+}
+
+// unshallowBestEffort completes a shallow clone so later merges have a merge
+// base. Unlike the fresh-clone resume path this one CANNOT treat a failure as
+// fatal: a persistent workspace may already carry the full history from an
+// earlier boot, and `git fetch --unshallow` on a complete repo fatals with
+// "does not make sense". The runner returns only an exit code (git's output is
+// dropped deliberately), so the two cases are indistinguishable here - and the
+// fetch that follows is the one whose failure is checked.
+func unshallowBestEffort(dir string, fullClone bool, git GitRunner) {
+	if fullClone {
+		return
+	}
+	_ = git(dir, "fetch", "--unshallow", "origin")
+}
+
+// mergeRemoteTaskBranch reconciles a task branch that exists BOTH locally and
+// on origin, having already fetched the remote tip into FETCH_HEAD. It never
+// resets: precedence is local commits over remote commits, and the only way to
+// honour that while still taking the remote's work is a merge.
+//
+// A conflict is not an error, for the same reason it is not one in
+// reconcileWithBase: it is exactly the work an agent exists to do, and failing
+// the boot instead turns one conflict into hundreds of dead pods. The merge is
+// aborted so the turn finaliser's `git add -A` can never publish conflict
+// markers, and the conflict travels out as a result the directive turns into
+// the agent's first job.
+func mergeRemoteTaskBranch(dir, taskBranch string, git GitRunner) string {
+	if git(dir, "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD") == nil {
+		return reconcileLocalAhead
+	}
+	if git(dir, "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD") == nil {
+		if err := git(dir, "merge", "--ff-only", "FETCH_HEAD"); err != nil {
+			return reconcileLocalRemoteConflict
+		}
+		return reconcileRemoteAhead
+	}
+	msg := "tatara bootstrap: reconcile local and remote " + taskBranch
+	if err := git(dir, "merge", "-m", msg, "FETCH_HEAD"); err != nil {
+		_ = git(dir, "merge", "--abort")
+		return reconcileLocalRemoteConflict
+	}
+	return reconcileLocalRemoteMerged
 }
 
 // reconcileWithBase brings a resumed task branch up to date with the repo's
@@ -230,7 +359,7 @@ func recordReconcile(p Params, repo, taskBranch, baseRef, result string) {
 	args := []any{"action", "bootstrap_reconcile", "repo", repo, "task_branch", taskBranch,
 		"base_ref", baseRef, "result", result}
 	switch result {
-	case reconcileConflict, reconcileFetchFail:
+	case reconcileConflict, reconcileFetchFail, reconcileLocalRemoteConflict:
 		p.Log.Error("resumed task branch could not be reconciled with its base branch", args...)
 	case reconcileBaseUnresolved:
 		p.Log.Warn("resumed task branch not reconciled: base branch could not be resolved", args...)
@@ -257,52 +386,146 @@ type resumedRepo struct {
 	dir        string
 	taskBranch string
 	baseRef    string
-	result     string
+	// result is the reconcile against the repo's BASE branch.
+	result string
+	// localResult is the reconcile of the task branch against its own remote
+	// counterpart, which only a persistent workspace can produce.
+	localResult string
+	// notes are the agent-visible repairs PrepareWorkspace made to this
+	// checkout before anything was checked out (an aborted operation, a rescue
+	// commit, a reattached HEAD). Platform noise - stale locks, a half-cloned
+	// .git - is deliberately absent: it is counted and logged, never surfaced.
+	notes []string
+	// required are repairs the agent must act on before anything else, rendered
+	// under the mandatory heading alongside the unfinished merges.
+	required []string
+}
+
+// reconciledCleanly reports whether either reconcile did visible, successful
+// work on this branch - the tier-one, informational case.
+func (r resumedRepo) reconciledCleanly() bool {
+	switch r.result {
+	case reconcileMerged, reconcileUpToDate:
+		return true
+	}
+	switch r.localResult {
+	case reconcileLocalOnly, reconcileLocalAhead, reconcileRemoteAhead, reconcileLocalRemoteMerged:
+		return true
+	}
+	return false
 }
 
 // resumeDirective renders the resumed-branch block appended to the agent's
-// global CLAUDE.md, in two tiers.
+// global CLAUDE.md, in three tiers.
 //
-// Tier one (merged / up to date) is informational: the branch is not empty and
-// the code the agent is about to read includes a previous session's work.
+// Tier one (merged / up to date / any clean local-vs-remote outcome) is
+// informational: the branch is not empty and the code the agent is about to
+// read includes a previous session's work.
+//
+// The middle tier reports what bootstrap had to REPAIR on a workspace volume
+// that outlived its pod - an aborted merge or rebase, uncommitted work rescued
+// into a commit, a reattached HEAD. It sits between the two because it is
+// neither pure background nor an instruction: nothing is required of the agent,
+// but the branch is not shaped the way it left it. Platform noise (stale lock
+// files, a half-cloned .git, a wrong-Task wipe) never reaches this tier - it is
+// counted and logged, because telling the agent about it would spend prompt
+// budget on something it cannot act on.
 //
 // Tier two (conflict / base unresolved) is a hard requirement. Bootstrap could
-// not bring the branch up to date with its base branch and had to abort, so
-// every file in that repo is stale by exactly the changes that conflicted.
-// base unresolved joins conflict rather than tier one because it is the same
-// epistemic state - we could not prove the branch is current - and the same
-// remedy applies; tier one is reserved for branches we KNOW carry the base tip.
+// not complete a merge and had to abort, so the tree the agent is about to read
+// is stale by exactly the changes that conflicted. base unresolved joins
+// conflict rather than tier one because it is the same epistemic state - we
+// could not prove the branch is current - and the same remedy applies; tier one
+// is reserved for branches we KNOW carry the tip.
 //
-// Repos whose result is empty are omitted: that is the read-only review
+// Inside tier two the LOCAL-versus-remote merge is always listed before the
+// base merge. That order is the point of it: the base merge is only meaningful
+// once the branch actually contains everything both sides of the task branch
+// committed, so resolving them the other way round means merging the base into
+// a branch that is still missing half its own work.
+//
+// Repos with no result and no notes are omitted: that is the read-only review
 // checkout path, where the branch belongs to someone else's pull request and
 // the agent must neither reconcile nor push it.
-func resumeDirective(repos []resumedRepo) string {
-	var clean, unreconciled []resumedRepo
+func resumeDirective(repos []resumedRepo, workspaceNotes []string) string {
+	var clean, recovered, mustInspect, localUnreconciled, baseUnreconciled []resumedRepo
 	for _, r := range repos {
+		if len(r.required) > 0 {
+			mustInspect = append(mustInspect, r)
+		}
+		if r.localResult == reconcileLocalRemoteConflict {
+			localUnreconciled = append(localUnreconciled, r)
+		}
 		switch r.result {
-		case reconcileMerged, reconcileUpToDate:
-			clean = append(clean, r)
 		case reconcileConflict, reconcileBaseUnresolved:
-			unreconciled = append(unreconciled, r)
+			baseUnreconciled = append(baseUnreconciled, r)
+		}
+		if len(r.notes) > 0 {
+			recovered = append(recovered, r)
+		}
+		if r.reconciledCleanly() {
+			clean = append(clean, r)
 		}
 	}
-	if len(clean) == 0 && len(unreconciled) == 0 {
+	listed := orderedRepoUnion(mustInspect, localUnreconciled, baseUnreconciled, recovered, clean)
+	if len(listed) == 0 && len(workspaceNotes) == 0 {
 		return ""
 	}
 	var b strings.Builder
 	b.WriteString(resumeHeader)
-	for _, r := range append(append([]resumedRepo{}, unreconciled...), clean...) {
+	for _, r := range listed {
 		fmt.Fprintf(&b, "- `%s` at `%s`: branch `%s`, base ref `%s`.\n", r.name, r.dir, r.taskBranch, r.baseRef)
 	}
-	if len(unreconciled) > 0 {
+	if len(recovered) > 0 || len(workspaceNotes) > 0 {
+		b.WriteString(resumeRecoveredHeader)
+		for _, n := range workspaceNotes {
+			fmt.Fprintf(&b, "- %s\n", n)
+		}
+		for _, r := range recovered {
+			for _, n := range r.notes {
+				fmt.Fprintf(&b, "- In `%s`: %s\n", r.dir, n)
+			}
+		}
+	}
+	if len(mustInspect) > 0 || len(localUnreconciled) > 0 || len(baseUnreconciled) > 0 {
 		b.WriteString(resumeConflictRequirement)
-		for _, r := range unreconciled {
+		// A tree bootstrap could not make sense of comes first: whatever it holds
+		// may change what the merges below are even supposed to produce.
+		for _, r := range mustInspect {
+			for _, n := range r.required {
+				fmt.Fprintf(&b, "- In `%s`: %s.\n", r.dir, n)
+			}
+		}
+		for _, r := range localUnreconciled {
+			fmt.Fprintf(&b, "- In `%s`: fetch origin, merge `origin/%s` into your local `%s`, resolve every conflict, commit the merge.\n",
+				r.dir, r.taskBranch, r.taskBranch)
+		}
+		for _, r := range baseUnreconciled {
 			fmt.Fprintf(&b, "- In `%s`: fetch origin, merge `%s` into `%s`, resolve every conflict, commit the merge.\n",
 				r.dir, r.baseRef, r.taskBranch)
 		}
 		b.WriteString(resumeConflictClosing)
 	}
 	return b.String()
+}
+
+// orderedRepoUnion concatenates the buckets in priority order, keeping the
+// first occurrence of each repo directory. A repo can land in several buckets
+// at once (a local conflict on a branch whose base merged cleanly is the
+// ordinary case), and the header must name it once.
+func orderedRepoUnion(buckets ...[]resumedRepo) []resumedRepo {
+	seen := map[string]bool{}
+	var out []resumedRepo
+	for _, bucket := range buckets {
+		for _, r := range bucket {
+			if seen[r.dir] {
+				continue
+			}
+			seen[r.dir] = true
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // resumeHeader / resumeConflictRequirement / resumeConflictClosing are the
@@ -317,24 +540,39 @@ const resumeHeader = `
 ## Resumed task branch
 
 You are not starting from an empty branch. In the repositories below the task
-branch already existed on origin and carries commits from an earlier session of
-this same task. It is checked out for you, so the work you find there is your
-own prior work; read it before you plan, and continue it rather than restarting
-it.
+branch already existed - on origin, on this workspace volume, or both - and
+carries commits from an earlier session of this same task. It is checked out for
+you, so the work you find there is your own prior work; read it before you plan,
+and continue it rather than restarting it.
+
+`
+
+const resumeRecoveredHeader = `
+### Workspace recovered from an interrupted session
+
+This workspace sits on a volume that outlived the pod using it, and the previous
+session was cut off rather than finished. Bootstrap repaired what it found
+before handing you the tree. Nothing was thrown away, but the branch is not
+shaped the way the last session left it, so read these before you plan:
 
 `
 
 const resumeConflictRequirement = `
-### Hard requirement: finish the interrupted merge first
+### Hard requirement: repair the interrupted session first
 
-Bootstrap tried to merge the base branch into the resumed branch and could not
-complete it, so it aborted the merge. The working tree is clean at the tip of
-the task branch and nothing you committed before is lost - but the branch is
-still behind its base branch, and the code you are about to read is stale by
-exactly the changes that could not be merged.
+The previous session was cut off part way through something bootstrap could not
+finish for you. Nothing you committed before is lost and the working tree is
+clean at the tip of the task branch - but the branch is missing exactly the
+changes that could not be applied, and the code you are about to read is stale
+by them.
 
 Resolving this is a hard requirement and your first action. Before you read or
-write any other code, before any planning, in each repository listed here:
+write any other code, before any planning, work through the list below IN THE
+ORDER GIVEN, which is the order in which the items depend on each other: a tree
+bootstrap could not make sense of is inspected first, because what it holds can
+change what the merges are supposed to produce; then the merge of your own
+branch against origin, because merging the base branch into a branch that is
+still missing half its own commits reconciles nothing; then the base branch.
 
 `
 
@@ -353,6 +591,12 @@ func Render(p Params, git GitRunner) error {
 	}
 	if err := os.MkdirAll(p.Workspace, 0o755); err != nil {
 		return fmt.Errorf("mkdir workspace: %w", err)
+	}
+	// Whose workspace is this? A per-Task volume can be rebound to another Task,
+	// and every phase below would otherwise treat that Task's tree as our own.
+	workspaceNotes, err := claimWorkspace(p, p.Log, p.M)
+	if err != nil {
+		return err
 	}
 	// Branch to check out after clone: the push branch (TaskBranch) when set, else
 	// a read-only CheckoutBranch (MR review on the PR head; never pushed because
@@ -399,8 +643,19 @@ func Render(p Params, git GitRunner) error {
 			}
 			RunHook("preClone", p.HookPreClone, p.Workspace, []string{r.URL}, []string{"TATARA_HOOK_REPO_URL=" + r.URL}, p.HookRun, p.Log, p.M)
 			cloneStart := time.Now()
-			// Skip clone when the repo is already present (pod restart with persistent workspace).
+			prep, prepErr := PrepareWorkspace(dest, git, p.Log, p.M)
+			if prepErr != nil {
+				if isPrimary {
+					return fmt.Errorf("prepare workspace for primary repo %s: %w", r.Name, prepErr)
+				}
+				continue // non-primary: same isolation the clone failure below uses
+			}
+			// Skip clone when the repo is already present (pod restart with a
+			// persistent workspace). persistent is what tells checkoutTaskBranch a
+			// local task branch is even possible - see its doc comment.
+			persistent := true
 			if _, statErr := os.Stat(filepath.Join(dest, ".git")); os.IsNotExist(statErr) {
+				persistent = false
 				args := []string{"clone"}
 				if !p.FullClone {
 					args = append(args, "--depth", "1")
@@ -425,7 +680,8 @@ func Render(p Params, git GitRunner) error {
 				// primary): a secondary repo silently left on the wrong branch
 				// would make the agent commit the wrong state. Fail loud so the
 				// operator retries the run.
-				resumed, result, err := checkoutTaskBranch(dest, checkoutBranch, r.Branch, p.FullClone, p.TaskBranch != "", git)
+				resumed, localResult, result, err := checkoutTaskBranch(dest, checkoutBranch, r.Branch, p.FullClone, p.TaskBranch != "", persistent, git)
+				recordReconcile(p, r.Name, checkoutBranch, baseRefName(r.Branch), localResult)
 				recordReconcile(p, r.Name, checkoutBranch, baseRefName(r.Branch), result)
 				if err != nil {
 					if p.M != nil {
@@ -433,11 +689,12 @@ func Render(p Params, git GitRunner) error {
 					}
 					return fmt.Errorf("checkout task branch in %s: %w", r.Name, err)
 				}
-				if resumed {
+				if resumed || len(prep.Notes) > 0 || len(prep.Required) > 0 {
 					action = "resume"
 					resumedRepos = append(resumedRepos, resumedRepo{
 						name: r.Name, dir: dest, taskBranch: checkoutBranch,
 						baseRef: baseRefName(r.Branch), result: result,
+						localResult: localResult, notes: prep.Notes, required: prep.Required,
 					})
 				}
 			}
@@ -468,7 +725,13 @@ func Render(p Params, git GitRunner) error {
 		}
 		RunHook("preClone", p.HookPreClone, p.Workspace, []string{p.RepoURL}, []string{"TATARA_HOOK_REPO_URL=" + p.RepoURL}, p.HookRun, p.Log, p.M)
 		cloneStart := time.Now()
+		prep, prepErr := PrepareWorkspace(repoDest, git, p.Log, p.M)
+		if prepErr != nil {
+			return fmt.Errorf("prepare workspace for repo %s: %w", p.RepoURL, prepErr)
+		}
+		persistent := true
 		if _, statErr := os.Stat(filepath.Join(repoDest, ".git")); os.IsNotExist(statErr) {
+			persistent = false
 			args := []string{"clone"}
 			if !p.FullClone {
 				args = append(args, "--depth", "1")
@@ -486,7 +749,8 @@ func Render(p Params, git GitRunner) error {
 		}
 		action := "clone"
 		if checkoutBranch != "" {
-			resumed, result, err := checkoutTaskBranch(repoDest, checkoutBranch, p.RepoBranch, p.FullClone, p.TaskBranch != "", git)
+			resumed, localResult, result, err := checkoutTaskBranch(repoDest, checkoutBranch, p.RepoBranch, p.FullClone, p.TaskBranch != "", persistent, git)
+			recordReconcile(p, p.RepoURL, checkoutBranch, baseRefName(p.RepoBranch), localResult)
 			recordReconcile(p, p.RepoURL, checkoutBranch, baseRefName(p.RepoBranch), result)
 			if err != nil {
 				if p.M != nil {
@@ -494,11 +758,12 @@ func Render(p Params, git GitRunner) error {
 				}
 				return err
 			}
-			if resumed {
+			if resumed || len(prep.Notes) > 0 || len(prep.Required) > 0 {
 				action = "resume"
 				resumedRepos = append(resumedRepos, resumedRepo{
 					name: p.RepoURL, dir: repoDest, taskBranch: checkoutBranch,
 					baseRef: baseRefName(p.RepoBranch), result: result,
+					localResult: localResult, notes: prep.Notes, required: prep.Required,
 				})
 			}
 		}
@@ -526,7 +791,7 @@ func Render(p Params, git GitRunner) error {
 	// ProjectClaudeMd, which would silently drop the requirement), and it stays
 	// in scope no matter which repo subdirectory the agent works from.
 	globalClaudeMd := strings.TrimLeft(p.GlobalClaudeMd+headlessDirective+delegationDirective+
-		autoPushDirective(p.TaskBranch, p.BranchPushInterval)+resumeDirective(resumedRepos), "\n")
+		autoPushDirective(p.TaskBranch, p.BranchPushInterval)+resumeDirective(resumedRepos, workspaceNotes), "\n")
 	if err := os.WriteFile(filepath.Join(claudeHome, "CLAUDE.md"), []byte(globalClaudeMd), 0o644); err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
@@ -565,6 +830,15 @@ func Render(p Params, git GitRunner) error {
 	// baked skill. Never errors Render.
 	_ = installExtraSkillSources(p, git)
 	if err := installAgents(p); err != nil {
+		if p.M != nil {
+			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
+		}
+		return err
+	}
+	// Stamped last, and only on success: an identity written before the clones
+	// completed would let the next boot read a half-built tree as proof this
+	// workspace is already this Task's own.
+	if err := writeWorkspaceIdentity(p); err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
 		}
