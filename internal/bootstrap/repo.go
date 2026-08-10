@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 )
@@ -94,6 +95,21 @@ var benignPushFailures = []string{
 	"everything up to date",
 	"non-fast-forward",
 	"fetch first",
+}
+
+// AutoPushEnabled is THE predicate for "this pod auto-pushes its task branch
+// mid-turn". Both consumers must call it and neither may re-derive it:
+// safetyPusher.Enabled decides whether the ticker runs, and autoPushDirective
+// decides whether the agent is told the ticker runs. Duplicating the condition
+// is how the two drift, and the drift is the bug - the pod then promises the
+// agent a push that never happens, and the agent skips an amend it was
+// actually free to make.
+//
+// taskBranch == "" is the read-only review checkout: the branch is someone
+// else's pull request head and must never be pushed. interval <= 0 is the
+// explicit off switch (BRANCH_PUSH_INTERVAL_SECONDS=0).
+func AutoPushEnabled(taskBranch string, interval time.Duration) bool {
+	return taskBranch != "" && interval > 0
 }
 
 // PushOnly pushes branch to origin and does nothing else. It is the mid-turn

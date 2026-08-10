@@ -63,6 +63,12 @@ type Params struct {
 	// TaskBranch is empty: an MR review agent works on the PR head but the turn
 	// finaliser only pushes when TaskBranch is set (issue #114 decision 4).
 	CheckoutBranch string
+	// BranchPushInterval is how often the wrapper's mid-turn safety net pushes
+	// TaskBranch to origin (BRANCH_PUSH_INTERVAL_SECONDS). Render does not push
+	// anything itself; it needs this solely to decide whether to TELL the agent
+	// the safety net is running - see autoPushDirective. 0 disables the net, and
+	// the directive with it.
+	BranchPushInterval time.Duration
 	// FullClone, when true, skips --depth 1 so the agent gets all history and all
 	// branches. Intended for project-scoped pods (brainstorm/incident/refine/
 	// healthCheck) that need cross-branch context. Default false = shallow clone.
@@ -520,7 +526,7 @@ func Render(p Params, git GitRunner) error {
 	// ProjectClaudeMd, which would silently drop the requirement), and it stays
 	// in scope no matter which repo subdirectory the agent works from.
 	globalClaudeMd := strings.TrimLeft(p.GlobalClaudeMd+headlessDirective+delegationDirective+
-		autoPushDirective(p.TaskBranch)+resumeDirective(resumedRepos), "\n")
+		autoPushDirective(p.TaskBranch, p.BranchPushInterval)+resumeDirective(resumedRepos), "\n")
 	if err := os.WriteFile(filepath.Join(claudeHome, "CLAUDE.md"), []byte(globalClaudeMd), 0o644); err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
@@ -635,17 +641,21 @@ mechanical legwork; do not delegate the thinking.
 `
 
 // autoPushDirective returns the mid-turn-push block for the agent's global
-// CLAUDE.md, or "" when this pod has no task branch. A read-only review
-// checkout (CheckoutBranch) never pushes, so the block would be a plain lie
-// there; the guard mirrors the wrapper's own `TaskBranch != ""` guard on both
-// the turn finaliser and the safety-net ticker.
+// CLAUDE.md, or "" when this pod does not actually auto-push.
+//
+// It gates on AutoPushEnabled - the SAME predicate safetyPusher.Enabled uses -
+// and must keep doing so rather than re-deriving the condition. Both ways of
+// disabling the net reach the same lie if the two drift: a read-only review
+// checkout (no TaskBranch) and BRANCH_PUSH_INTERVAL_SECONDS=0 both leave
+// nothing pushing, and an agent told otherwise will skip an amend it was free
+// to make.
 //
 // Like the resume block, this names no MCP tool and must keep naming none:
 // promptguard treats every snake-case token inside a prompt literal as a tool
 // name and fails the build when the live server does not advertise it. Write
 // "task branch", never the underscored form.
-func autoPushDirective(taskBranch string) string {
-	if taskBranch == "" {
+func autoPushDirective(taskBranch string, interval time.Duration) string {
+	if !AutoPushEnabled(taskBranch, interval) {
 		return ""
 	}
 	return autoPushBlock

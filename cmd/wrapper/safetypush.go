@@ -60,11 +60,14 @@ func newSafetyPusher(cfg config, git bootstrap.GitRunner, log *slog.Logger, m *m
 	}
 }
 
-// Enabled reports whether the safety net should run. A Review Task checks its
-// branch out read-only via CheckoutBranch and sets no TaskBranch: that branch
-// is someone else's pull request head and must never be pushed. A zero
-// interval is the explicit off switch.
-func (s *safetyPusher) Enabled() bool { return s.taskBranch != "" && s.interval > 0 }
+// Enabled reports whether the safety net should run. It defers to
+// bootstrap.AutoPushEnabled rather than spelling the condition out again,
+// because the injected CLAUDE.md gates its auto-push directive on the same
+// predicate: if these two ever disagree, the pod tells the agent one thing and
+// does another.
+func (s *safetyPusher) Enabled() bool {
+	return bootstrap.AutoPushEnabled(s.taskBranch, s.interval)
+}
 
 // Start launches the push loop. A no-op when the safety net is disabled.
 func (s *safetyPusher) Start() {

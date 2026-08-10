@@ -428,8 +428,11 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		GitUserEmail:      cfg.GitUserEmail,
 		TaskBranch:        cfg.TaskBranch,
 		CheckoutBranch:    cfg.CheckoutBranch,
-		FullClone:         cfg.FullClone,
-		Repos:             cfg.Repos,
+		// Render pushes nothing; it needs the interval only to decide whether to
+		// tell the agent the safety net is running (bootstrap.AutoPushEnabled).
+		BranchPushInterval: time.Duration(cfg.BranchPushIntervalSeconds) * time.Second,
+		FullClone:          cfg.FullClone,
+		Repos:              cfg.Repos,
 
 		HookPreClone:             cfg.HookPreClone,
 		HookPostClone:            cfg.HookPostClone,

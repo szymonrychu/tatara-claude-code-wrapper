@@ -198,6 +198,32 @@ func TestSafetyPusher_PushFailureIsNotFatal(t *testing.T) {
 	require.Equal(t, 2, n)
 }
 
+// The CLAUDE.md directive and the ticker must agree on every input, or the pod
+// tells the agent one thing and does another. Both sides call
+// bootstrap.AutoPushEnabled; this pins that they still do, through the real
+// buildBootstrapParams -> Render path rather than by inspection.
+func TestSafetyPusher_EnabledMatchesTheInjectedDirective(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		cfg      config
+		expected bool
+	}{
+		{"both set", config{TaskBranch: "tatara/feat-1", BranchPushIntervalSeconds: 120}, true},
+		{"interval disabled", config{TaskBranch: "tatara/feat-1", BranchPushIntervalSeconds: 0}, false},
+		{"read-only checkout", config{CheckoutBranch: "pr-head", BranchPushIntervalSeconds: 120}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sp := newTestSafetyPusher(tc.cfg, (&recordingGit{}).runner())
+			require.Equal(t, tc.expected, sp.Enabled())
+
+			p := buildBootstrapParams(tc.cfg, testLogger(), metrics.New(prometheus.NewRegistry()))
+			require.Equal(t, tc.expected,
+				bootstrap.AutoPushEnabled(p.TaskBranch, p.BranchPushInterval),
+				"buildBootstrapParams must carry the interval through so Render gates the directive the same way")
+		})
+	}
+}
+
 type errString string
 
 func (e errString) Error() string { return string(e) }
