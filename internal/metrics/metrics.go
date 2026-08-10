@@ -13,9 +13,13 @@ type Metrics struct {
 	StreamEventsTotal *prometheus.CounterVec
 
 	// Bootstrap metrics (rule 13: counters for everything that counts/can fail).
-	BootstrapCloneTotal  *prometheus.CounterVec // label: result=ok|fail
-	BootstrapDuration    prometheus.Histogram   // full Render() wall-clock time
-	CommitPushTotal      *prometheus.CounterVec // label: result=ok|fail
+	BootstrapCloneTotal *prometheus.CounterVec // label: result=ok|fail
+	BootstrapDuration   prometheus.Histogram   // full Render() wall-clock time
+	CommitPushTotal     *prometheus.CounterVec // label: result=ok|fail
+	// SafetyPushTotal counts the mid-turn push-only safety net's ticks, per repo
+	// pushed. Distinct from CommitPushTotal, which counts the turn finaliser:
+	// this one never commits, so a rising fail here is a push problem alone.
+	SafetyPushTotal      *prometheus.CounterVec // label: result=ok|fail
 	BootstrapHookInstall *prometheus.CounterVec // labels: result=ok|fail, tool=mise|pre-commit
 	LifecycleHookTotal   *prometheus.CounterVec // labels: result=ok|fail, hook=preClone|postClone|conversationStart|...
 	HookOutcome          *prometheus.CounterVec // labels: result=ok|bad_payload|rejected|store_error
@@ -145,6 +149,8 @@ func New(reg prometheus.Registerer) *Metrics {
 			Buckets: prometheus.ExponentialBuckets(0.5, 2, 8)}),
 		CommitPushTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_commit_push_total", Help: "CommitAndPush calls by result."}, []string{"result"}),
+		SafetyPushTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_safety_push_total", Help: "Mid-turn push-only safety-net pushes by result (ok|fail), counted per repo per tick."}, []string{"result"}),
 		BootstrapHookInstall: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_bootstrap_hook_install_total", Help: "Hook install attempts (mise/pre-commit) by result and tool."}, []string{"result", "tool"}),
 		LifecycleHookTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -210,7 +216,7 @@ func New(reg prometheus.Registerer) *Metrics {
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
 		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal,
-		m.BootstrapCloneTotal, m.BootstrapDuration, m.CommitPushTotal,
+		m.BootstrapCloneTotal, m.BootstrapDuration, m.CommitPushTotal, m.SafetyPushTotal,
 		m.BootstrapHookInstall, m.LifecycleHookTotal, m.HookOutcome, m.MetricPushTotal,
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.HTTPInFlight, m.HTTPPanicsTotal,
 		m.AuthTotal, m.TurnResumes, m.TurnRefusals, m.OutcomeRepromptTotal, m.BootstrapRenderTotal,

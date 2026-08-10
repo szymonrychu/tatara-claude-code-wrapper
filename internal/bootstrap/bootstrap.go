@@ -519,7 +519,8 @@ func Render(p Params, git GitRunner) error {
 	// CLAUDE.md write is skipped entirely when the Project ships no
 	// ProjectClaudeMd, which would silently drop the requirement), and it stays
 	// in scope no matter which repo subdirectory the agent works from.
-	globalClaudeMd := strings.TrimLeft(p.GlobalClaudeMd+headlessDirective+delegationDirective+resumeDirective(resumedRepos), "\n")
+	globalClaudeMd := strings.TrimLeft(p.GlobalClaudeMd+headlessDirective+delegationDirective+
+		autoPushDirective(p.TaskBranch)+resumeDirective(resumedRepos), "\n")
 	if err := os.WriteFile(filepath.Join(claudeHome, "CLAUDE.md"), []byte(globalClaudeMd), 0o644); err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
@@ -631,6 +632,46 @@ work yourself.
 
 Keep planning, design, review, and merge decisions on yourself. Delegate the
 mechanical legwork; do not delegate the thinking.
+`
+
+// autoPushDirective returns the mid-turn-push block for the agent's global
+// CLAUDE.md, or "" when this pod has no task branch. A read-only review
+// checkout (CheckoutBranch) never pushes, so the block would be a plain lie
+// there; the guard mirrors the wrapper's own `TaskBranch != ""` guard on both
+// the turn finaliser and the safety-net ticker.
+//
+// Like the resume block, this names no MCP tool and must keep naming none:
+// promptguard treats every snake-case token inside a prompt literal as a tool
+// name and fails the build when the live server does not advertise it. Write
+// "task branch", never the underscored form.
+func autoPushDirective(taskBranch string) string {
+	if taskBranch == "" {
+		return ""
+	}
+	return autoPushBlock
+}
+
+const autoPushBlock = `
+
+---
+
+## Your task branch is pushed for you, mid-turn
+
+The wrapper pushes your task branch to origin every couple of minutes, not only
+when the turn ends. It is a safety net: this pod's disk does not survive the
+pod, so a commit that has not reached origin is lost if the pod is killed. The
+wrapper only ever pushes - it never stages and never commits on your behalf, so
+what reaches origin is exactly the commits you chose to make.
+
+The consequence for you is that a commit is public the moment you make it. Do
+not plan to amend, reword, squash, or otherwise rewrite a commit once it
+exists: publishing a rewritten commit needs a force-push, and force-push is
+denied in this pod. If you need to change something you have already committed,
+make a new commit on top of it.
+
+Commit when your work reaches a sensible point, and commit more often than you
+otherwise would. Every commit you make is durable; everything you have not
+committed is not.
 `
 
 func writeIfSet(path, content string) error {

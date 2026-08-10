@@ -57,20 +57,29 @@ type config struct {
 	// wrapper refuses to START an ordinary turn (410 Gone) and admits only the
 	// operator's one handoff turn. 0 disables the bound: a workstation has no
 	// operator to stop it.
-	PodTTLSeconds       int
-	BootTimeoutSeconds  int
+	PodTTLSeconds      int
+	BootTimeoutSeconds int
+	// PushIntervalSeconds is the METRICS push period (internal/pushclient), not
+	// a git push. See BranchPushIntervalSeconds for the git one.
 	PushIntervalSeconds int
-	WebhookRetries      int
-	Workspace           string
-	HomeDir             string
-	ClaudePath          string
-	HookPath            string
-	GlobalClaudeMdPath  string
-	ProjectClaudeMdPath string
-	MCPBasePath         string
-	MCPOverlayDir       string
-	GrafanaMCPURL       string
-	SerenaMCPURL        string
+	// BranchPushIntervalSeconds is how often the mid-turn safety net pushes the
+	// task branch to origin. Push only: it never stages and never commits, so it
+	// cannot contend for .git/index.lock with the agent's own git calls. The
+	// turn finaliser's commit+push is too coarse on its own - a 42-minute turn
+	// left six minutes of committed work undurable when the pod was OOMKilled,
+	// and /workspace is the container writable layer with no volume. 0 disables.
+	BranchPushIntervalSeconds int
+	WebhookRetries            int
+	Workspace                 string
+	HomeDir                   string
+	ClaudePath                string
+	HookPath                  string
+	GlobalClaudeMdPath        string
+	ProjectClaudeMdPath       string
+	MCPBasePath               string
+	MCPOverlayDir             string
+	GrafanaMCPURL             string
+	SerenaMCPURL              string
 	// ExtraMCPServers carries TATARA_EXTRA_MCP_SERVERS (Phase 2 contract): a
 	// compact JSON array [{"name","url","type"}] of Project-scoped MCP
 	// servers, passed through opaque to bootstrap.mergeMCP.
@@ -123,6 +132,10 @@ func loadConfig(args []string) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	bpi, err := envIntOr("BRANCH_PUSH_INTERVAL_SECONDS", 120)
+	if err != nil {
+		return config{}, err
+	}
 	fc, err := envBoolOr("TATARA_WORKSPACE_FULL_CLONE", false)
 	if err != nil {
 		return config{}, err
@@ -156,6 +169,11 @@ func loadConfig(args []string) (config, error) {
 		PodTTLSeconds:       pttl,
 		BootTimeoutSeconds:  bt,
 		PushIntervalSeconds: pi,
+
+		// Own alignment group: the field name is long enough that folding it in
+		// would reflow every key around it for no reason.
+		BranchPushIntervalSeconds: bpi,
+
 		WebhookRetries:      wr,
 		Workspace:           envOr("WORKSPACE", "/workspace"),
 		HomeDir:             envOr("HOME_DIR", os.Getenv("HOME")),

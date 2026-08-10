@@ -87,3 +87,49 @@ func TestRender_AppendsWorkerDelegationDirective(t *testing.T) {
 	require.Contains(t, got, "architect")
 	require.Contains(t, got, "planning")
 }
+
+// The mid-turn push safety net auto-pushes the task branch, so a commit is
+// public the moment it is made and "commit then amend" is no longer a
+// supported workflow (force-push is in the settings deny list). The agent has
+// to be told, or it will plan a rewrite it cannot publish.
+func TestRender_AppendsAutoPushDirective(t *testing.T) {
+	home := t.TempDir()
+	ws := t.TempDir()
+
+	p := bootstrap.Params{
+		HomeDir:     home,
+		Workspace:   ws,
+		HookCommand: "/usr/local/bin/cc-stop-hook",
+		RepoURL:     "https://github.com/owner/repo",
+		TaskBranch:  "tatara/feat-37-decks",
+	}
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { return nil }))
+
+	b, err := os.ReadFile(filepath.Join(home, ".claude", "CLAUDE.md"))
+	require.NoError(t, err)
+	got := string(b)
+	require.Contains(t, got, "pushed")
+	require.Contains(t, got, "amend")
+	require.Contains(t, got, "force-push")
+	require.Contains(t, got, "make a new commit")
+}
+
+// A read-only review checkout (CheckoutBranch, no TaskBranch) never pushes, so
+// telling that agent its branch is auto-pushed would be a plain lie.
+func TestRender_NoAutoPushDirectiveWithoutTaskBranch(t *testing.T) {
+	home := t.TempDir()
+	ws := t.TempDir()
+
+	p := bootstrap.Params{
+		HomeDir:        home,
+		Workspace:      ws,
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		RepoURL:        "https://github.com/owner/repo",
+		CheckoutBranch: "pr-head",
+	}
+	require.NoError(t, bootstrap.Render(p, func(dir string, a ...string) error { return nil }))
+
+	b, err := os.ReadFile(filepath.Join(home, ".claude", "CLAUDE.md"))
+	require.NoError(t, err)
+	require.NotContains(t, string(b), "force-push")
+}

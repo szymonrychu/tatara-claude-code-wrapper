@@ -30,7 +30,7 @@ var configEnvKeys = []string{
 	"HOOK_PRE_CLONE", "HOOK_POST_CLONE", "HOOK_CONVERSATION_START",
 	"HOOK_CONVERSATION_RESTART", "HOOK_AGENT_TURN_FINISHED",
 	"HOOK_CONVERSATION_FINISHED", "TATARA_WORKSPACE_FULL_CLONE",
-	"TATARA_REPOS", "AGENT_POD_TTL_SECONDS",
+	"TATARA_REPOS", "AGENT_POD_TTL_SECONDS", "BRANCH_PUSH_INTERVAL_SECONDS",
 }
 
 func TestMain(m *testing.M) {
@@ -178,6 +178,27 @@ func TestConfig_PodTTLSecondsDefaultsToDisabled(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, cfg.PodTTLSeconds,
 		"0 = no TTL. A workstation has no operator to stop it; the operator always sets this in-cluster (contract G.9)")
+}
+
+func TestConfig_BranchPushIntervalSecondsDefault(t *testing.T) {
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, 120, cfg.BranchPushIntervalSeconds,
+		"the mid-turn push safety net is on by default; a pod OOMKilled 6 minutes after a commit lost it")
+}
+
+func TestConfig_BranchPushIntervalSecondsFromEnv(t *testing.T) {
+	t.Setenv("BRANCH_PUSH_INTERVAL_SECONDS", "30")
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, 30, cfg.BranchPushIntervalSeconds)
+}
+
+func TestConfig_BranchPushIntervalSecondsZeroDisables(t *testing.T) {
+	t.Setenv("BRANCH_PUSH_INTERVAL_SECONDS", "0")
+	cfg, err := loadConfig(nil)
+	require.NoError(t, err)
+	require.Equal(t, 0, cfg.BranchPushIntervalSeconds)
 }
 
 func TestConfig_PodTTLSecondsRejectsGarbage(t *testing.T) {
