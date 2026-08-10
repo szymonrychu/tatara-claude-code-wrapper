@@ -406,3 +406,83 @@ func jsonContentString(raw json.RawMessage) string {
 	}
 	return string(raw)
 }
+
+// httpStatusMarkers are the tokens an operator/MCP error text puts immediately
+// before the numeric status. Anchoring on them is what keeps a bare number that
+// happens to fall in [400,599] - an issue number like "#578", a line number, a
+// port - from being read as a status.
+var httpStatusMarkers = []string{"http/1.1", "http", "status code", "status", "code", "->", "returned"}
+
+// OutcomeErrorStatus extracts the HTTP status an outcome tool_result error text
+// reports, if it reports one at all (issue tatara-operator#578).
+//
+// IT EXISTS TO SEPARATE RETRYABLE FROM NON-RETRYABLE. A 4xx is a CLIENT error:
+// the identical call can never succeed, so re-prompting the agent to "call it
+// again until it succeeds" converts one bad response into a turn loop and,
+// through the operator's pod-recreation budget, into a burned Task. A 5xx or a
+// transport failure genuinely does succeed on retry. Nothing downstream of the
+// tool call can tell the two apart except this text.
+//
+// It recognises the status only where an HTTP status actually appears:
+//   - at the very START of the text ("400: reason is required", "400")
+//   - immediately after an httpStatusMarkers token ("status 502", "-> 400 {...}")
+//
+// ok is false when no status is present, which callers MUST treat as
+// retryable/unknown rather than as a client error: an unparsed transport failure
+// must not be silently downgraded to "do not retry".
+func OutcomeErrorStatus(errText string) (int, bool) {
+	s := strings.ToLower(strings.TrimSpace(errText))
+	if code, ok := leadingStatus(s); ok {
+		return code, true
+	}
+	for i := 0; i < len(s); i++ {
+		// THE MARKER MUST START A WORD. Without this, "code" and "returned" match
+		// as SUFFIXES of ordinary words - "scanned barcode 404 not found",
+		// "failed to decode 500 bytes", "unreturned 502 after retry" - and each
+		// one is read as an HTTP status. That false positive is this fix's own
+		// failure mode running backwards: a bogus 4xx strips the mandatory retry
+		// directive off a failure that was genuinely retryable.
+		if i > 0 && isWordByte(s[i-1]) {
+			continue
+		}
+		for _, marker := range httpStatusMarkers {
+			if !strings.HasPrefix(s[i:], marker) {
+				continue
+			}
+			rest := strings.TrimLeft(s[i+len(marker):], " :=\t")
+			if code, ok := leadingStatus(rest); ok {
+				return code, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// isWordByte reports whether b can be part of a word, for the boundary check
+// above. ASCII is enough: every marker is ASCII, so only an ASCII byte can be
+// the tail of a word that swallows one.
+func isWordByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_'
+}
+
+// leadingStatus reads a standalone 3-digit status in [400,599] off the front of
+// s. The digits must not run on into a fourth (so "4001" and a token like
+// "5000ms" are refused) and must be exactly three long.
+func leadingStatus(s string) (int, bool) {
+	if len(s) < 3 {
+		return 0, false
+	}
+	for i := range 3 {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+	}
+	if len(s) > 3 && s[3] >= '0' && s[3] <= '9' {
+		return 0, false
+	}
+	code := int(s[0]-'0')*100 + int(s[1]-'0')*10 + int(s[2]-'0')
+	if code < 400 || code > 599 {
+		return 0, false
+	}
+	return code, true
+}
