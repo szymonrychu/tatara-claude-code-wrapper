@@ -433,6 +433,11 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		BranchPushInterval: time.Duration(cfg.BranchPushIntervalSeconds) * time.Second,
 		FullClone:          cfg.FullClone,
 		Repos:              cfg.Repos,
+		// Identity of the work this workspace belongs to. With a per-Task volume
+		// mounted at /workspace, this is what lets bootstrap tell "my own tree
+		// from last session" from "a volume rebound to some other Task".
+		TaskName:    cfg.TaskName,
+		ProjectName: cfg.Project,
 
 		HookPreClone:             cfg.HookPreClone,
 		HookPostClone:            cfg.HookPostClone,
