@@ -161,8 +161,23 @@ func checkoutTaskBranch(dir, taskBranch, baseBranch string, fullClone, reconcile
 //
 // The reconcile is skipped entirely when the branch already contains the base
 // tip, so a healthy resume does not accrue an empty merge commit per turn.
-// A genuine conflict is a hard error: resuming on a tree we know is stale is
-// the bug, so bootstrap fails loudly instead.
+//
+// A genuine conflict is NOT an error. It used to be, and that made every
+// conflicting task branch a permanent boot failure: Render failed, the wrapper
+// exited non-zero, the pod never became Ready, and the operator respawned it
+// every few minutes until the 24h residency cap - hundreds of pods, not one
+// turn. A conflict is exactly the kind of work an agent exists to do, so the
+// result is reported (counted, logged at ERROR) and handed to the agent as a
+// mandatory first job via the injected CLAUDE.md; see resumeDirective.
+//
+// The merge is still aborted. CommitAndPush stages the whole tree with
+// `git add -A` and commits with --no-verify, so leaving the conflicted tree in
+// place would publish `<<<<<<<` markers to the branch on the first turn that
+// ends. Aborting keeps the worst case "the agent did nothing" instead of "the
+// agent pushed conflict markers".
+//
+// A failed fetch stays fatal: unlike a conflict it leaves us with no view of
+// the remote at all, so there is no truthful state to describe to the agent.
 func reconcileWithBase(dir, taskBranch, baseBranch string, git GitRunner) (string, error) {
 	if err := git(dir, "fetch", "origin"); err != nil {
 		return reconcileFetchFail, fmt.Errorf("fetch origin to reconcile resumed branch %s: %w", taskBranch, err)
@@ -184,9 +199,11 @@ func reconcileWithBase(dir, taskBranch, baseBranch string, git GitRunner) (strin
 	msg := "tatara bootstrap: reconcile " + taskBranch + " with " + baseRef
 	if err := git(dir, "merge", "-m", msg, baseRef); err != nil {
 		// Abort restores the pre-merge HEAD, index and working tree; no commit
-		// the agent made is lost. Then fail loud rather than resume stale.
+		// the agent made is lost, and no conflict marker can be committed by
+		// the turn finaliser. The conflict then travels out as a result with a
+		// NIL error, and becomes the agent's first job instead of a boot failure.
 		_ = git(dir, "merge", "--abort")
-		return reconcileConflict, fmt.Errorf("reconcile resumed branch %s with %s (merge aborted, no committed work lost): %w", taskBranch, baseRef, err)
+		return reconcileConflict, nil
 	}
 	return reconcileMerged, nil
 }
@@ -225,6 +242,103 @@ func baseRefName(baseBranch string) string {
 	return "origin/" + baseBranch
 }
 
+// resumedRepo records one repo whose task branch already existed on origin and
+// was resumed rather than created. Collected during the clone loop so the
+// post-loop config render can tell the agent what it inherited, and - when the
+// base merge could not be completed - that finishing it is its first job.
+type resumedRepo struct {
+	name       string
+	dir        string
+	taskBranch string
+	baseRef    string
+	result     string
+}
+
+// resumeDirective renders the resumed-branch block appended to the agent's
+// global CLAUDE.md, in two tiers.
+//
+// Tier one (merged / up to date) is informational: the branch is not empty and
+// the code the agent is about to read includes a previous session's work.
+//
+// Tier two (conflict / base unresolved) is a hard requirement. Bootstrap could
+// not bring the branch up to date with its base branch and had to abort, so
+// every file in that repo is stale by exactly the changes that conflicted.
+// base unresolved joins conflict rather than tier one because it is the same
+// epistemic state - we could not prove the branch is current - and the same
+// remedy applies; tier one is reserved for branches we KNOW carry the base tip.
+//
+// Repos whose result is empty are omitted: that is the read-only review
+// checkout path, where the branch belongs to someone else's pull request and
+// the agent must neither reconcile nor push it.
+func resumeDirective(repos []resumedRepo) string {
+	var clean, unreconciled []resumedRepo
+	for _, r := range repos {
+		switch r.result {
+		case reconcileMerged, reconcileUpToDate:
+			clean = append(clean, r)
+		case reconcileConflict, reconcileBaseUnresolved:
+			unreconciled = append(unreconciled, r)
+		}
+	}
+	if len(clean) == 0 && len(unreconciled) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(resumeHeader)
+	for _, r := range append(append([]resumedRepo{}, unreconciled...), clean...) {
+		fmt.Fprintf(&b, "- `%s` at `%s`: branch `%s`, base ref `%s`.\n", r.name, r.dir, r.taskBranch, r.baseRef)
+	}
+	if len(unreconciled) > 0 {
+		b.WriteString(resumeConflictRequirement)
+		for _, r := range unreconciled {
+			fmt.Fprintf(&b, "- In `%s`: fetch origin, merge `%s` into `%s`, resolve every conflict, commit the merge.\n",
+				r.dir, r.baseRef, r.taskBranch)
+		}
+		b.WriteString(resumeConflictClosing)
+	}
+	return b.String()
+}
+
+// resumeHeader / resumeConflictRequirement / resumeConflictClosing are the
+// static prose of the resumed-branch block. They name no MCP tool, and must
+// keep naming none: promptguard treats every snake-case token inside a prompt
+// literal as a tool name and fails the build when it is not advertised by the
+// live server. Write "task branch", never the underscored form.
+const resumeHeader = `
+
+---
+
+## Resumed task branch
+
+You are not starting from an empty branch. In the repositories below the task
+branch already existed on origin and carries commits from an earlier session of
+this same task. It is checked out for you, so the work you find there is your
+own prior work; read it before you plan, and continue it rather than restarting
+it.
+
+`
+
+const resumeConflictRequirement = `
+### Hard requirement: finish the interrupted merge first
+
+Bootstrap tried to merge the base branch into the resumed branch and could not
+complete it, so it aborted the merge. The working tree is clean at the tip of
+the task branch and nothing you committed before is lost - but the branch is
+still behind its base branch, and the code you are about to read is stale by
+exactly the changes that could not be merged.
+
+Resolving this is a hard requirement and your first action. Before you read or
+write any other code, before any planning, in each repository listed here:
+
+`
+
+const resumeConflictClosing = `
+Do not begin any other work until every merge above is committed. Do not
+resolve a conflict by blindly taking one side; read both and keep the intent of
+each. If a merge genuinely cannot be resolved, say so in the outcome you submit
+rather than continuing on a stale tree.
+`
+
 func Render(p Params, git GitRunner) error {
 	renderStart := time.Now()
 	claudeHome := filepath.Join(p.HomeDir, ".claude")
@@ -241,6 +355,9 @@ func Render(p Params, git GitRunner) error {
 	if checkoutBranch == "" {
 		checkoutBranch = p.CheckoutBranch
 	}
+	// Every repo whose branch was RESUMED, carried out of the clone loop so the
+	// post-loop CLAUDE.md render can state it to the agent (see resumeDirective).
+	var resumedRepos []resumedRepo
 	if len(p.Repos) > 0 {
 		if err := configureGit(p, git); err != nil {
 			return err
@@ -312,6 +429,10 @@ func Render(p Params, git GitRunner) error {
 				}
 				if resumed {
 					action = "resume"
+					resumedRepos = append(resumedRepos, resumedRepo{
+						name: r.Name, dir: dest, taskBranch: checkoutBranch,
+						baseRef: baseRefName(r.Branch), result: result,
+					})
 				}
 			}
 			if p.M != nil {
@@ -369,6 +490,10 @@ func Render(p Params, git GitRunner) error {
 			}
 			if resumed {
 				action = "resume"
+				resumedRepos = append(resumedRepos, resumedRepo{
+					name: p.RepoURL, dir: repoDest, taskBranch: checkoutBranch,
+					baseRef: baseRefName(p.RepoBranch), result: result,
+				})
 			}
 		}
 		if p.M != nil {
@@ -387,7 +512,14 @@ func Render(p Params, git GitRunner) error {
 		}
 		return err
 	}
-	globalClaudeMd := strings.TrimLeft(p.GlobalClaudeMd+headlessDirective+delegationDirective, "\n")
+	// The resumed-branch block goes on the GLOBAL CLAUDE.md, alongside the
+	// headless and delegation directives, not on the workspace one: this repo
+	// already treats the global file as the agent's highest-priority
+	// instruction surface, it is written unconditionally (the workspace
+	// CLAUDE.md write is skipped entirely when the Project ships no
+	// ProjectClaudeMd, which would silently drop the requirement), and it stays
+	// in scope no matter which repo subdirectory the agent works from.
+	globalClaudeMd := strings.TrimLeft(p.GlobalClaudeMd+headlessDirective+delegationDirective+resumeDirective(resumedRepos), "\n")
 	if err := os.WriteFile(filepath.Join(claudeHome, "CLAUDE.md"), []byte(globalClaudeMd), 0o644); err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()

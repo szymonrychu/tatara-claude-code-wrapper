@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -12,6 +14,15 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 )
+
+// injectedGlobalClaudeMd reads the global CLAUDE.md Render writes into the
+// agent's home, which is the surface the resumed-branch directive lands on.
+func injectedGlobalClaudeMd(t *testing.T, p bootstrap.Params) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(p.HomeDir, ".claude", "CLAUDE.md"))
+	require.NoError(t, err)
+	return string(b)
+}
 
 // script appends a scripted git outcome. Mirrors the anonymous struct literal
 // the existing bootstrap tests build inline, so both styles interoperate.
@@ -141,11 +152,17 @@ func TestResume_UpToDateBranch_NoMerge(t *testing.T) {
 	require.Equal(t, float64(1), counterValue(t, reg, "ccw_bootstrap_reconcile_total", "up_to_date"))
 }
 
-// TestResume_UnreconcilableBranch_FailsLoud asserts sub-problem B: a resumed
-// branch that cannot be reconciled (genuine merge conflict) aborts the merge,
-// increments the reconcile counter with result=conflict, logs at ERROR, and
-// fails Render - it never falls through to a silent stale resume.
-func TestResume_UnreconcilableBranch_FailsLoud(t *testing.T) {
+// TestResume_UnreconcilableBranch_BecomesTheAgentsFirstJob is the inverse of
+// the original contract. A genuine merge conflict on a resumed branch used to
+// fail Render, which exited the wrapper non-zero, kept the pod from ever
+// becoming Ready and had the operator respawn it every few minutes until the
+// residency cap - roughly 288 dead pods per task, and never a single turn.
+// A conflict is now a task for the agent, not a boot failure: the merge is
+// still aborted (a clean tree at the branch tip, never conflict markers that
+// the turn finaliser's `git add -A` would commit), the conflict is still
+// counted and still logged at ERROR, Render still succeeds, and the injected
+// global CLAUDE.md carries the resolution as the agent's first, mandatory job.
+func TestResume_UnreconcilableBranch_BecomesTheAgentsFirstJob(t *testing.T) {
 	sg := &scriptedGit{}
 	sg.script(argsContainAll("ls-remote", "--exit-code"), nil)
 	sg.script(argsContainAll("merge-base", "--is-ancestor"), fmt.Errorf("exit status 1"))
@@ -157,15 +174,76 @@ func TestResume_UnreconcilableBranch_FailsLoud(t *testing.T) {
 	p.Log = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	p.M = metrics.New(reg)
 
-	err := bootstrap.Render(p, sg.run)
-	require.Error(t, err, "an unreconcilable resumed branch must fail bootstrap, not resume silently")
-	require.Contains(t, err.Error(), "reconcile")
+	require.NoError(t, bootstrap.Render(p, sg.run),
+		"a merge conflict on a resumed branch must never fail the pod boot")
 
 	require.NotEmpty(t, callsEqual(sg.Calls, "merge", "--abort"),
 		"a conflicting merge must be aborted so the agent's committed work and working tree are restored")
 	require.Equal(t, float64(1), counterValue(t, reg, "ccw_bootstrap_reconcile_total", "conflict"))
 	require.Contains(t, logBuf.String(), "bootstrap_reconcile")
 	require.Contains(t, logBuf.String(), `"level":"ERROR"`)
+
+	md := injectedGlobalClaudeMd(t, p)
+	require.Contains(t, md, "Resumed task branch", "the agent must be told the branch was resumed")
+	require.Contains(t, md, "hard requirement",
+		"an unresolved base merge must reach the agent as a hard requirement, not a hint")
+	require.Contains(t, md, "tatara/task-abc", "the directive must name the branch to reconcile")
+	require.Contains(t, md, "origin/main", "the directive must name the base ref to merge")
+}
+
+// TestResume_MultiRepo_ConflictDoesNotStopRemainingRepos is the regression that
+// matters most in the inversion: the old code returned from Render on the first
+// conflict, so every repo after it went uncloned and the whole post-loop config
+// render (CLAUDE.md, .mcp.json, settings, skills) never ran. A conflict in one
+// repo must now cost that repo's merge and nothing else.
+func TestResume_MultiRepo_ConflictDoesNotStopRemainingRepos(t *testing.T) {
+	sg := &scriptedGit{}
+	sg.script(argsContainAll("ls-remote", "--exit-code"), nil)
+	sg.script(argsContainAll("merge-base", "--is-ancestor"), fmt.Errorf("exit status 1"))
+	// Only repo "a" (base origin/main) conflicts; repo "b" (base origin/trunk) merges cleanly.
+	sg.script(func(a []string) bool { return notAbortMerge(a) && argsContainAll("origin/main")(a) },
+		fmt.Errorf("CONFLICT (content): Merge conflict in README.md"))
+
+	var logBuf bytes.Buffer
+	reg := prometheus.NewRegistry()
+	p := resumeParams(t, "tatara/task-abc")
+	p.RepoURL = ""
+	p.RepoBranch = ""
+	p.Log = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	p.M = metrics.New(reg)
+	p.ProjectClaudeMd = "project rules"
+	p.Repos = []bootstrap.RepoSpec{
+		{Name: "a", URL: "https://github.com/o/a", Branch: "main"},
+		{Name: "b", URL: "https://github.com/o/b", Branch: "trunk"},
+	}
+
+	require.NoError(t, bootstrap.Render(p, sg.run))
+
+	// Repo b is still cloned, still checked out, still reconciled.
+	require.NotEmpty(t, callsContainingAll(sg.Calls, "clone", "https://github.com/o/b"),
+		"a conflict in the primary repo must not skip the remaining clones")
+	require.Len(t, callsContainingAll(sg.Calls, "checkout", "-B", "tatara/task-abc", "FETCH_HEAD"), 2,
+		"both repos must have the task branch checked out")
+	require.NotEmpty(t, callsContainingAll(sg.Calls, "merge", "origin/trunk"))
+	require.Len(t, callsEqual(sg.Calls, "merge", "--abort"), 1,
+		"only the conflicting repo's merge is aborted")
+	require.Equal(t, float64(1), counterValue(t, reg, "ccw_bootstrap_reconcile_total", "conflict"))
+	require.Equal(t, float64(1), counterValue(t, reg, "ccw_bootstrap_reconcile_total", "merged"))
+
+	// The whole post-loop config render still runs.
+	require.FileExists(t, filepath.Join(p.Workspace, "CLAUDE.md"))
+	require.FileExists(t, filepath.Join(p.Workspace, ".mcp.json"))
+	require.FileExists(t, filepath.Join(p.HomeDir, ".claude", "settings.json"))
+	require.Contains(t, logBuf.String(), "bootstrap_render")
+
+	// Both tiers are rendered, each naming its own repo directory and base ref.
+	md := injectedGlobalClaudeMd(t, p)
+	require.Contains(t, md, "hard requirement")
+	require.Contains(t, md, filepath.Join(p.Workspace, "o", "a"),
+		"the conflicting repo's on-disk directory must be named")
+	require.Contains(t, md, "origin/main")
+	require.Contains(t, md, filepath.Join(p.Workspace, "o", "b"),
+		"the cleanly resumed repo must be reported too")
 }
 
 // TestResume_MergedResult_LogsAndCounts asserts the successful-but-stale case
@@ -187,6 +265,14 @@ func TestResume_MergedResult_LogsAndCounts(t *testing.T) {
 	require.Contains(t, logBuf.String(), "bootstrap_reconcile")
 	require.Contains(t, logBuf.String(), `"result":"merged"`)
 	require.Contains(t, logBuf.String(), `"base_ref":"origin/main"`)
+
+	// Tier one: a clean resume still tells the agent the branch is not fresh,
+	// but states no requirement - there is nothing left to reconcile.
+	md := injectedGlobalClaudeMd(t, p)
+	require.Contains(t, md, "Resumed task branch")
+	require.Contains(t, md, "tatara/task-abc")
+	require.NotContains(t, md, "hard requirement",
+		"a cleanly merged resume must not manufacture a mandatory first job")
 }
 
 // TestFreshBranch_NotReconciled asserts the fresh-task path (branch absent on
@@ -286,10 +372,13 @@ func TestResume_BaseBranchUnresolvable_WarnsAndCounts(t *testing.T) {
 	require.Contains(t, logBuf.String(), "bootstrap_reconcile")
 }
 
-// TestResume_FetchFailure_FailsLoud asserts a reconcile whose fetch fails is a
-// hard error: without a fresh view of the remote we cannot claim the tree is
-// current, which is the exact silent failure #131 reported.
-func TestResume_FetchFailure_FailsLoud(t *testing.T) {
+// TestResume_FetchFailure_StaysFatal pins the arm that did NOT invert. A
+// conflict is now the agent's job, but a failed fetch still fails Render: a
+// conflict is a known, describable state the agent can be handed, whereas a
+// failed fetch means we never saw the remote at all - the resumed branch may
+// not even be the branch the operator meant, and there is nothing truthful to
+// tell the agent about it. Asserted explicitly so the two arms cannot drift.
+func TestResume_FetchFailure_StaysFatal(t *testing.T) {
 	sg := &scriptedGit{}
 	sg.script(argsContainAll("ls-remote", "--exit-code"), nil)
 	sg.script(func(a []string) bool { return len(a) == 2 && a[0] == "fetch" && a[1] == "origin" },
@@ -300,7 +389,9 @@ func TestResume_FetchFailure_FailsLoud(t *testing.T) {
 	p.M = metrics.New(reg)
 
 	err := bootstrap.Render(p, sg.run)
-	require.Error(t, err)
+	require.Error(t, err, "a reconcile whose fetch failed must still fail bootstrap")
 	require.Contains(t, err.Error(), "reconcile")
 	require.Equal(t, float64(1), counterValue(t, reg, "ccw_bootstrap_reconcile_total", "fetch_fail"))
+	require.NoFileExists(t, filepath.Join(p.HomeDir, ".claude", "CLAUDE.md"),
+		"Render aborts on a fetch failure, so no agent directive is rendered at all")
 }
