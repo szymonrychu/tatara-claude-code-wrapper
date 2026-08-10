@@ -31,6 +31,9 @@ type SessionController interface {
 	// only situation in which it is worth calling.
 	Probe(text string) (string, error)
 	ProbeStatus(probeID string) (session.ProbeStatus, bool)
+	// Interrupt writes an ESC into the PTY, cancelling the turn in flight
+	// without killing the pod, and returns that turn's id ("" when idle).
+	Interrupt() (string, error)
 	TranscriptPath() string
 	Alive() bool
 	Shutdown(context.Context) error
@@ -177,6 +180,7 @@ func (a *API) mountV1(r chi.Router) {
 	r.Get("/v1/transcript", a.getTranscript)
 	r.Post("/v1/probe", a.postProbe)
 	r.Get("/v1/probe/{probeId}", a.getProbe)
+	r.Post("/v1/interrupt", a.postInterrupt)
 	r.Delete("/v1/session", a.deleteSession)
 }
 

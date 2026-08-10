@@ -43,7 +43,8 @@ cmd/cc-stop-hook/    the Stop-hook binary claude runs at end-of-turn
 internal/session/    THE CORE: supervises the claude process + turn state machine
   pty.go               spawn claude under a PTY (ptyWriter seam for tests)
   ring.go              thread-safe ring buffer of PTY output (+ ANSI/whitespace-normalized match)
-  session.go           boot navigation, submit, complete, timeout, snapshot
+  session.go           boot navigation, submit, complete, stall report, snapshot
+  interrupt.go         POST /v1/interrupt: ESC, then resolve the ESC'd turn
 internal/bootstrap/  renders every file claude reads at startup
   bootstrap.go         orchestrates: repo clone, CLAUDE.md, MCP, settings, claude.json, skills
   claudejson.go        seeds ~/.claude.json for a no-dialog fresh-HOME boot
@@ -113,7 +114,7 @@ POST /v1/messages {text, callbackUrl?}
     WRITE 1 to PTY: ESC[200~ <text> ESC[201~        (bracketed paste)
     sleep SubmitDelay (~400ms)                       <-- one write does NOT submit
     WRITE 2 to PTY: \r                               (carriage return submits)
-    state = busy; start TurnTimeout timer
+    state = busy; start the TurnTimeout INACTIVITY timer
   -> 202 {turnId}
 
 ...claude runs the turn: reads CLAUDE.md, calls MCP tools, edits /workspace...
@@ -128,8 +129,12 @@ end of turn -> claude runs the Stop hook (cc-stop-hook):
   POSTs it to http://127.0.0.1:<INTERNAL_ADDR>/internal/turn-complete
   ALWAYS exits 0 (a hook must never block or alter claude)
 
+  ...the timer no longer fails the turn when it fires: markStallSuspected
+     stamps stallSuspectedSince, counts ccw_turn_stall_suspected_total, and
+     re-arms. Only admit()/PodTTL still bounds a turn wrapper-side.
+
 httpapi.turnComplete -> session.Complete:
-  stop the timeout timer
+  stop the inactivity timer
   record transcriptPath (for GET /v1/transcript)
   store.Complete(turnId, finalText, resultJson, usage, ...)
   state = ready; metrics (turns_total, turn_duration, hook_received)
@@ -167,6 +172,7 @@ Public surface (`Router()`), all `/v1/*` require a valid Keycloak JWT
 | GET | `/v1/transcript` | full JSONL transcript; `404` before the first turn |
 | POST | `/v1/probe` | `{text?}` written mid-turn into the PTY -> `202 ProbeStatus`. **Never `409`** - working while a turn is in flight is the point; `503` when there is no live PTY |
 | GET | `/v1/probe/{probeId}` | `200 ProbeStatus` (`pending`\|`delivered`\|`answered`); `404` if unknown or superseded |
+| POST | `/v1/interrupt` | one ESC byte written to the PTY -> `202 {turnId}`. **Never `409`**; `503` when there is no live PTY. Cancels mid-tool-call; the turn resolves `state=failed`, `stopReason=interrupted` once the marker reaches the transcript |
 | DELETE | `/v1/session` | graceful shutdown -> pod exits |
 
 Operator surface (open, not ingress-exposed): `/healthz` (always 200 while the

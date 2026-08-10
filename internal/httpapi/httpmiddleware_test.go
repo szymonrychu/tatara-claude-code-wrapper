@@ -27,6 +27,7 @@ func (a *aliveCtl) Probe(_ string) (string, error)             { return "probe-1
 func (a *aliveCtl) ProbeStatus(_ string) (session.ProbeStatus, bool) {
 	return session.ProbeStatus{}, false
 }
+func (a *aliveCtl) Interrupt() (string, error)       { return "turn-1", nil }
 func (a *aliveCtl) TranscriptPath() string           { return "" }
 func (a *aliveCtl) Alive() bool                      { return true }
 func (a *aliveCtl) Shutdown(_ context.Context) error { return nil }

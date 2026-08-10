@@ -39,6 +39,20 @@ type fakeCtl struct {
 	probedTexts []string
 	probeStatus session.ProbeStatus
 	probeFound  bool
+
+	// Interrupt seam. interrupts counts calls so a test can assert exactly one
+	// ESC per request; interruptTurnID/interruptErr drive the response.
+	interrupts      int
+	interruptTurnID string
+	interruptErr    error
+}
+
+func (f *fakeCtl) Interrupt() (string, error) {
+	f.interrupts++
+	if f.interruptErr != nil {
+		return "", f.interruptErr
+	}
+	return f.interruptTurnID, nil
 }
 
 func (f *fakeCtl) Probe(text string) (string, error) {

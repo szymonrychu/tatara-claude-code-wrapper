@@ -176,13 +176,18 @@ func TestProbe_DoesNotResetTurnTimer(t *testing.T) {
 		}
 	}
 
+	// Since W4 tripping the deadline reports rather than kills, so the
+	// observable is the stall stamp: if probe activity reset the timer it would
+	// never be set, and the operator would never escalate on a turn it was
+	// actively investigating.
+	require.False(t, m.Snapshot().StallSuspectedSince.IsZero(),
+		"probing kept the turn looking alive: the inactivity timer was reset by probe activity")
 	select {
 	case r := <-done:
-		require.Equal(t, turn.Failed, r.State,
-			"a turn probed to death must still time out on its own inactivity deadline")
-	case <-time.After(time.Second):
-		t.Fatal("probing kept the turn alive: the inactivity timer was reset by probe activity")
+		t.Fatalf("the inactivity timer resolved the turn (state=%s); it may only report", r.State)
+	default:
 	}
+	_ = turnID
 }
 
 // TestProbeActivity_DoesNotAdvanceLastActivityAt: the exclusion covers

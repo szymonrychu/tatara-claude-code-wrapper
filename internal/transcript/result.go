@@ -69,6 +69,99 @@ func LastMessage(path string) (role, stopReason string, err error) {
 	return role, stopReason, nil
 }
 
+// InterruptMarkerPrefix is the common prefix of the two literals Claude Code
+// writes into the transcript when a turn is interrupted with ESC. Verified
+// against real transcripts on CLI 2.1.226; both variants appear as a `user`
+// line whose message.content is an array carrying a single `text` block:
+//
+//	[Request interrupted by user for tool use]   ESC during a tool call
+//	[Request interrupted by user]                ESC while the model streamed text
+//
+// Matching on the shared prefix covers both. The line also carries a
+// top-level `interruptedMessageId`, which is NOT used as the signal: it is an
+// undocumented envelope field, whereas the text block is the content the model
+// itself is shown and is therefore the stable half of the pair.
+const InterruptMarkerPrefix = "[Request interrupted by user"
+
+// interruptLine is the view of a transcript line needed to spot the interrupt
+// marker. content is raw because a genuine typed user prompt carries a string
+// while tool results and the marker carry an array; only the array shape can
+// hold the marker, so a string simply fails to decode and is skipped.
+type interruptLine struct {
+	Type    string `json:"type"`
+	Message *struct {
+		Content json.RawMessage `json:"content"`
+	} `json:"message"`
+}
+
+// WasInterrupted reports whether the JSONL transcript at path ENDS in an
+// ESC interruption.
+//
+// This is the terminal condition for a turn the operator cut short, and it
+// exists because an interrupted turn produces no `end_turn` assistant message
+// at all. The transcript's last two entries are a rejected tool_result ("The
+// user doesn't want to proceed with this tool use...") followed by the marker
+// below; nothing the Stop hook keys on ever fires, and no stop_reason is
+// written. Without this check the wrapper's completion logic (LastMessage /
+// LastAssistant, which both look for a terminal assistant line) never treats
+// the turn as finished, and the session sits Busy forever - so the interrupt
+// that was supposed to free the pod for a handoff turn is exactly what makes a
+// handoff impossible.
+//
+// Only the LAST conversation entry counts. An interrupt earlier in the session
+// followed by a new prompt is ordinary history, not a live interruption, and
+// must not resolve the turn now in flight. Non-message envelopes (system,
+// summary, attachment, file-history-snapshot) are skipped, because Claude Code
+// writes a file-history-snapshot and an attachment between the marker and the
+// next real message.
+//
+// Returns false, never an error: a missing or unreadable transcript is an
+// absence of evidence, and the caller (a poll loop that re-reads the file) has
+// nothing useful to do with a read error beyond trying again.
+func WasInterrupted(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+
+	interrupted := false
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1024*1024), maxPartialBytes)
+	for sc.Scan() {
+		var il interruptLine
+		if jerr := json.Unmarshal(sc.Bytes(), &il); jerr != nil {
+			continue
+		}
+		if il.Type != "user" && il.Type != "assistant" {
+			continue
+		}
+		// Every conversation entry resets the verdict; only the final one
+		// decides.
+		interrupted = false
+		if il.Type != "user" || il.Message == nil {
+			continue
+		}
+		var blocks []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(il.Message.Content, &blocks) != nil {
+			continue
+		}
+		for _, b := range blocks {
+			if b.Type == "text" && strings.HasPrefix(b.Text, InterruptMarkerPrefix) {
+				interrupted = true
+				break
+			}
+		}
+	}
+	if sc.Err() != nil {
+		return false
+	}
+	return interrupted
+}
+
 type assistantLine struct {
 	Type    string `json:"type"`
 	Message struct {

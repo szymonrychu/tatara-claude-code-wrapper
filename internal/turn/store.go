@@ -74,6 +74,25 @@ func (s *Store) Complete(id, finalText string, resultJSON, usage json.RawMessage
 	return nil
 }
 
+// Interrupt resolves a turn that an operator ESC cut short. It is neither
+// Complete nor a plain Fail: the turn is terminal and unsuccessful (State
+// Failed, so nothing downstream mistakes it for finished work), but the
+// partial output the agent had already produced is preserved in FinalText and
+// StopReason names the cause. Complete followed by Fail would express the same
+// thing and is exactly the kind of two-step that leaves a window where the
+// record claims success.
+func (s *Store) Interrupt(id, finalText string, usage json.RawMessage, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.byID[id]
+	if !ok {
+		return ErrNotFound
+	}
+	r.State, r.FinalText, r.Usage = Failed, finalText, usage
+	r.StopReason, r.Error, r.CompletedAt = StopReasonInterrupted, ErrInterrupted, &now
+	return nil
+}
+
 func (s *Store) Fail(id, msg string, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

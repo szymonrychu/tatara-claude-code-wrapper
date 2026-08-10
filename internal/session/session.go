@@ -119,11 +119,18 @@ type Snapshot struct {
 	// parent transcript with no matching tool_result: subagents believed to be
 	// running right now.
 	OutstandingSubagentCalls int64 `json:"outstandingSubagentCalls"`
-	// ProbePendingSince and StallSuspectedSince are part of the stall-detection
-	// contract and are reported so the operator side has a stable shape from
-	// the first release. They are always zero in this phase: nothing probes
-	// and nothing marks a stall yet.
-	ProbePendingSince   time.Time `json:"probePendingSince"`
+	// ProbePendingSince is the time a liveness probe was written to the PTY
+	// and has not yet been handed to the model.
+	ProbePendingSince time.Time `json:"probePendingSince"`
+	// StallSuspectedSince is when the in-flight turn first went a full
+	// TurnTimeout without transcript activity, and has produced none since.
+	// Zero when idle, when the turn is streaming normally, or when a suspected
+	// stall resolved itself (any genuine transcript line clears it).
+	//
+	// It is a REPORT, not a verdict: the wrapper no longer fails turns on
+	// inactivity. Deciding what to do about a stall - probe, wait, ESC, stop
+	// the pod - belongs to the operator, which can see the Task, the queue and
+	// the rest of the fleet, none of which a wrapper inside one pod can.
 	StallSuspectedSince time.Time `json:"stallSuspectedSince"`
 }
 
@@ -186,11 +193,17 @@ type Manager struct {
 	lastCompleted    string
 	currentStarted   time.Time // original Submit time; basis for TurnDuration metric
 	currentSessionID string    // claude's sessionId for the current turn (from hook); used for correlation
-	timer            *time.Timer
-	turnsCompleted   int // all terminal turns (success + failed + timed-out)
-	turnsSucceeded   int // successful turns only (Complete path)
-	transcriptPath   string
-	restarts         int // consecutive crash-relaunches; reset on Complete
+	// stallSuspectedSince is when the in-flight turn's inactivity timer first
+	// fired without any transcript activity since. Stamped once per stall (not
+	// re-stamped on each re-arm, so it measures how long the silence has
+	// lasted), cleared by onTailerActivity and by clearCurrentLocked. Reported
+	// through Snapshot; the wrapper itself takes no action on it.
+	stallSuspectedSince time.Time
+	timer               *time.Timer
+	turnsCompleted      int // all terminal turns (success + failed + timed-out)
+	turnsSucceeded      int // successful turns only (Complete path)
+	transcriptPath      string
+	restarts            int // consecutive crash-relaunches; reset on Complete
 
 	// wg tracks lifecycle goroutines (readPTY, watch, tailer Follow) so
 	// Shutdown can wait for them to drain after cancellation.
@@ -296,9 +309,14 @@ func (mgr *Manager) currentTurnID() string {
 // agent_stream event of the in-flight turn it advances LastActivityAt and resets
 // the turn deadline, turning the AfterFunc(TurnTimeout) into an inactivity timer:
 // a turn that keeps streaming runs as long as it makes progress, while a silent
-// (hung) turn still fails after TurnTimeout of no transcript output. Events for a
-// stale or already-cleared turn are ignored so a late event cannot extend or
-// resurrect a turn the timeout path has finished.
+// turn trips markStallSuspected after TurnTimeout of no transcript output.
+// Events for a stale or already-cleared turn are ignored so a late event cannot
+// extend or resurrect a turn another terminal path has finished.
+//
+// Genuine activity also CLEARS stallSuspectedSince. A turn that went quiet and
+// then resumed streaming is not stalled, and leaving the stamp set would report
+// it as stalled for the rest of its life - the operator anchors its escalation
+// on that field, so a sticky stamp is a false positive it cannot recover from.
 //
 // probeOriginated lines are the one exception, and they are excluded from BOTH
 // the deadline reset and LastActivityAt. The turn deadline is an inactivity
@@ -319,7 +337,61 @@ func (mgr *Manager) onTailerActivity(turnID string, probeOriginated bool) {
 		return
 	}
 	mgr.store.Touch(turnID, mgr.now())
+	mgr.stallSuspectedSince = time.Time{}
 	mgr.timer.Reset(mgr.cfg.TurnTimeout)
+}
+
+// markStallSuspected is what the per-turn inactivity timer does now: it
+// RECORDS that a turn has been silent for a full TurnTimeout, and re-arms.
+//
+// It replaces failTimeout, which killed the turn outright. That was the wrong
+// call from inside the pod, and measurably so. The wrapper's idea of
+// "inactivity" was the parent transcript going quiet, and a single subagent run
+// silenced that file for 2095 seconds while the pod worked flat out - so the
+// timer's most common firing was not a hang at all. Worse, the wrapper cannot
+// tell a hang from productive-but-quiet work even in principle: it has no view
+// of the Task, no way to ask the agent anything (that is what POST /v1/probe is
+// for, and it lives one layer up), and no way to hand the work off. Killing on
+// that evidence destroyed real turns to protect against a condition it could
+// not actually detect.
+//
+// So the wrapper now reports and the operator decides. The operator probes
+// first, grants a grace period, re-probes, escalates to POST /v1/interrupt, and
+// only then stops the pod - a sequence that needs the Task, the fleet and a
+// stop mechanism, none of which exist in here.
+//
+// THE WRAPPER THEREFORE NO LONGER BOUNDS A TURN BY TIME AT ALL. The only
+// remaining wrapper-side bound is admit()/PodTTL, which refuses to START new
+// work past the pod deadline and does not touch a turn already in flight.
+// Deploying this image against an operator that has not yet learned to
+// escalate leaves a hung turn with no killer anywhere.
+func (mgr *Manager) markStallSuspected(id string) {
+	mgr.mu.Lock()
+	if mgr.current != id || mgr.timer == nil {
+		mgr.mu.Unlock()
+		return
+	}
+	// Stamped once and left alone across re-arms: the field answers "how long
+	// has this been silent", so re-stamping every window would make a turn
+	// silent for an hour look as fresh as one silent for a minute.
+	if mgr.stallSuspectedSince.IsZero() {
+		mgr.stallSuspectedSince = mgr.now()
+	}
+	since := mgr.stallSuspectedSince
+	started := mgr.currentStarted
+	now := mgr.now()
+	// Re-arm. Without this the timer fires exactly once and a turn that stays
+	// silent stops being reported at all after the first window, which is
+	// precisely when the report starts to matter.
+	mgr.timer.Reset(mgr.cfg.TurnTimeout)
+	mgr.mu.Unlock()
+
+	mgr.m.TurnStallSuspected.Inc()
+	mgr.log.Warn("turn inactive for a full TurnTimeout; stall suspected (the wrapper does not fail turns on inactivity - the operator decides)",
+		"action", "turn_stall_suspected", "turn_id", id,
+		"stall_suspected_since", since,
+		"silent_ms", now.Sub(since).Milliseconds(),
+		"turn_age_ms", now.Sub(started).Milliseconds())
 }
 
 // onSubagentActivity is the liveness hook for a subagent transcript
@@ -970,7 +1042,8 @@ func (mgr *Manager) installResumeTimer(id string, started time.Time, mode string
 	// relative AfterFunc, so the fresh budget needs no separate anchor field;
 	// crucially we do NOT touch currentStarted, so TurnDuration still reflects
 	// the full wall-clock including pre-crash time (audit finding 3).
-	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.failTimeout(id) })
+	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.markStallSuspected(id) })
+	mgr.stallSuspectedSince = time.Time{}
 	mgr.state = Busy
 	now := mgr.now()
 	mgr.mu.Unlock()
@@ -1144,9 +1217,10 @@ func (mgr *Manager) Submit(text, callbackURL string, handoff bool) (string, erro
 	}
 	mgr.ptyMu.Unlock()
 
-	// Install the timeout timer and log only after writes succeed.
+	// Install the inactivity timer and log only after writes succeed.
 	mgr.mu.Lock()
-	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.failTimeout(id) })
+	mgr.timer = time.AfterFunc(mgr.cfg.TurnTimeout, func() { mgr.markStallSuspected(id) })
+	mgr.stallSuspectedSince = time.Time{}
 	mgr.mu.Unlock()
 	// The timer just installed is an INACTIVITY timer, and the only thing that
 	// resets it is onTailerActivity. Start following the transcript now, not at
@@ -1599,37 +1673,17 @@ func (mgr *Manager) meterTokens(r HookResult) {
 // the metric-label wiring can be asserted without driving a full turn.
 func (mgr *Manager) MeterTokensForTest(r HookResult) { mgr.meterTokens(r) }
 
-func (mgr *Manager) failTimeout(id string) {
-	mgr.mu.Lock()
-	if mgr.current != id {
-		mgr.mu.Unlock()
-		return
-	}
-	now := mgr.now()
-	started := mgr.currentStarted
-	if err := mgr.store.Fail(id, "turn timed out", now); err != nil {
-		// Correlation bug: record missing. Do not bump metrics or fire a phantom
-		// callback (finding 6).
-		mgr.mu.Unlock()
-		mgr.log.Error("store.Fail returned error in failTimeout; skipping metrics and callback",
-			"action", "turn_timeout", "turn_id", id, "err", err)
-		return
-	}
-	mgr.clearCurrentLocked(Ready)
-	mgr.currentSessionID = ""
-	mgr.m.TurnsTotal.WithLabelValues("failed").Inc()
-	mgr.m.TurnDuration.Observe(now.Sub(started).Seconds())
-	rec, _ := mgr.store.Get(id)
-	mgr.mu.Unlock()
-	mgr.log.Warn("turn timed out", "action", "turn_timeout", "turn_id", id, "duration_ms", now.Sub(started).Milliseconds())
-	mgr.fireDone(rec)
-}
+// failTimeout was deleted in phase W4. It was the AfterFunc(TurnTimeout)
+// callback and failed the in-flight turn outright; markStallSuspected now
+// takes its place and merely reports. See that function for why, and note the
+// consequence: no wrapper-side path fails a turn on elapsed time any more.
 
 func (mgr *Manager) clearCurrentLocked(next State) {
 	mgr.lastCompleted = mgr.current
 	mgr.current = ""
-	mgr.turnsCompleted++ // all terminal turns (success + failed + timed-out)
+	mgr.turnsCompleted++ // all terminal turns (success + failed + interrupted)
 	mgr.state = next
+	mgr.stallSuspectedSince = time.Time{}
 	mgr.m.TurnInFlight.Set(0)
 }
 
@@ -1702,8 +1756,7 @@ func (mgr *Manager) Snapshot() Snapshot {
 		LastSubagentActivityAt:   lastSubagent,
 		OutstandingSubagentCalls: outstandingSubagents,
 		ProbePendingSince:        probePendingSince,
-		// StallSuspectedSince is intentionally left zero: the stall marker
-		// lands in phase W4.
+		StallSuspectedSince:      mgr.stallSuspectedSince,
 	}
 }
 
