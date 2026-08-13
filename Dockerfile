@@ -4,7 +4,14 @@
 # builder sets GOTOOLCHAIN=local, so a builder older than go.mod fails
 # `go mod download` outright rather than fetching a newer toolchain.
 ARG GO_VERSION=1.26.3
-ARG NODE_VERSION=22
+# Renovate 44.25.0 (below) requires node ^24.11.0 and hard-refuses anything
+# older with "Unsupported node environment detected" - and does it SILENTLY:
+# extraction still exits 0 but every repo's packageFiles comes back {}, which
+# reads exactly like "nothing to upgrade" (see the npm --engine-strict guard
+# on the renovate install below, which turns that silent failure into a build
+# break instead). 22 does not satisfy the range either, so this must move to
+# 24, not just off 22.
+ARG NODE_VERSION=24
 # Pinned for reproducible builds. Bumped by .github/workflows/refresh-claude-code.yml
 # (daily npm check -> semver:patch auto-merge PR -> release rebuilds this layer).
 ARG CLAUDE_CODE_VERSION=2.1.201
@@ -18,6 +25,17 @@ ARG TATARA_CLI_VERSION=v2.1.0
 ARG TATARA_SKILLS_REF=v2.1.0
 # renovate: repository=jdx/mise
 ARG MISE_VERSION=v2026.6.3
+# Read-only dependency discovery for the `upgrade` agent kind (shelled out to,
+# never trusted for anything but a candidate hint). Pinned to the same version
+# ~/Documents/infrastructure/code/containers/mirrors/renovate mirrors to
+# harbor.szymonrichert.pl/containers/renovate, so a dry run in a pod and the
+# spike that validated the report shape agree. Never `npx renovate` at
+# runtime instead of this pinned global install: it resolves whatever happens
+# to be cached in a pod with no npm cache (observed serving a stale 37.440.7,
+# which rejects these repos' real renovate.json outright) and would otherwise
+# download ~200MB on every turn.
+# renovate: repository=renovatebot/renovate
+ARG RENOVATE_VERSION=44.25.0
 
 # Stage 1: build the Go binaries (cached independently of the claude layer).
 FROM golang:${GO_VERSION}-alpine AS go-build
@@ -86,6 +104,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # claude lives in its OWN layer: bumping CLAUDE_CODE_VERSION rebuilds only this.
 ARG CLAUDE_CODE_VERSION
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} && npm cache clean --force
+
+# renovate lives in its OWN layer too, pinned exactly, never resolved at
+# runtime (see the ARG comment above for why `npx renovate` is unsafe here).
+# --engine-strict IS the build-time assertion the upgrade-agent-kind plan
+# requires: npm reads the installed renovate's own package.json engines.node
+# range and fails this RUN (so the image build fails) if NODE_VERSION above
+# does not satisfy it, instead of letting the mismatch through to silently
+# empty `packageFiles` at agent runtime. Hand-rolled semver parsing would
+# only re-implement what npm already does correctly.
+ARG RENOVATE_VERSION
+RUN npm install -g renovate@${RENOVATE_VERSION} --engine-strict && npm cache clean --force
 
 COPY --from=tatara-cli /usr/local/bin/tatara /usr/local/bin/tatara
 COPY --from=go-build /out/wrapper /usr/local/bin/wrapper

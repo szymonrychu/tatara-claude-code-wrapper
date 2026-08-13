@@ -35,7 +35,7 @@ TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-v2.1.0}"
 # the skills->wrapper cd-release bump - which rewrites the DOCKERFILE only, so
 # this default drifts unless moved by hand (it sat at v0.1.0 while the
 # Dockerfile was on v1.7.0). v1.8.0 ships the agent-judged approval gate.
-TATARA_SKILLS_REF="${TATARA_SKILLS_REF:-v1.8.0}"
+TATARA_SKILLS_REF="${TATARA_SKILLS_REF:-v2.1.0}"
 DEST="harbor.szymonrichert.pl/containers/${REPO}"
 
 : "${GITHUB_TOKEN:?GITHUB_TOKEN required}"
