@@ -11,7 +11,7 @@ CLAUDE_CODE_VERSION ?= latest
 # cd-release bumps TATARA_CLI_VERSION here and in the Dockerfile; the skills
 # bump rewrites the Dockerfile ONLY, so TATARA_SKILLS_REF drifts here unless
 # it is moved by hand (it sat at v0.1.0 while the Dockerfile was on v1.7.0).
-TATARA_CLI_VERSION ?= v2.0.1
+TATARA_CLI_VERSION ?= v2.1.0
 TATARA_SKILLS_REF ?= v1.8.0
 IMAGE_REF := $(REGISTRY)/$(IMAGE_NAME):$(VERSION)
 MODPATH := github.com/szymonrychu/tatara-claude-code-wrapper
