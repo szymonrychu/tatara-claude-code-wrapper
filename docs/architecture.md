@@ -79,8 +79,11 @@ either stateless (httpapi, webhook, bootstrap) or a plain store (turn).
    - `~/.claude.json` (0600): the no-dialog seed - `hasCompletedOnboarding`,
      `customApiKeyResponses.approved: ["<last 20 chars of ANTHROPIC_API_KEY>"]`,
      `projects["/workspace"].hasTrustDialogAccepted: true`;
-   - skills: baked (`/templates/skills`) + custom (`/etc/wrapper/skills`) copied
-     into `/workspace/.claude/skills`.
+   - skills: `tatara-agent-skills`, boot-cloned to `/etc/wrapper/skills` and
+     copied into `/workspace/.claude/skills`. Nothing is baked into the image
+     (the 20 baked skills under `/templates/skills` went away in 2026-06-28), so
+     the clone is the sole source and a boot that installs zero skills fails
+     rather than handing the agent an empty `.claude/skills`.
 3. **`session.Start`** spawns interactive `claude` under a PTY (no permission
    flag), starts a goroutine reading the PTY into the ring buffer, a goroutine
    `Wait`-ing on the process, and then runs `bootWait`.
@@ -199,7 +202,7 @@ Scalar env (defaults in parentheses): `HTTP_ADDR` (`:8080`), `INTERNAL_ADDR`
 `PERMISSION_MODE` (`bypassPermissions`), `REPO_URL`/`REPO_BRANCH` (empty),
 `DEFAULT_CALLBACK_URL` (empty), `TURN_TIMEOUT_SECONDS` (1800),
 `BOOT_TIMEOUT_SECONDS` (60), `WEBHOOK_RETRIES` (3), plus the `*_PATH` /
-`*_DIR` pointers into `/etc/wrapper` and `/templates/skills`.
+`*_DIR` pointers into `/etc/wrapper` (`/templates/skills` no longer exists).
 
 Mounted files (chart values -> file): `globalClaudeMd`, `projectClaudeMd`,
 `baseMcp`, `extraMcpServers` (map -> `mcp.d/<name>.json`), `allowedTools`
