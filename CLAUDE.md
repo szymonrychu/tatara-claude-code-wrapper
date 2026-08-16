@@ -200,7 +200,6 @@ is local to this repo and is never touched by the sync, which is where a repo
 records how these rules apply to it.
 <!-- END tatara-shared-contract -->
 
-
 ## Local notes
 
 - `internal/bootstrap` writes the pod's global and project `CLAUDE.md`. It does
