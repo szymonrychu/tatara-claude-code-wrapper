@@ -134,14 +134,15 @@ func cloneSkillsRepo(p Params, git GitRunner) error {
 	// The retry loop below clears the target with os.RemoveAll, and the target
 	// is not a fixed path: it is filepath.Dir of the first SKILLS_SRC_DIRS
 	// entry, which a Project can override through ExtraEnvs. Bound the delete
-	// to a directory that is plausibly ours before the loop can run, so a value
-	// like SKILLS_SRC_DIRS=/etc/wrapper/skills - which resolves the clone dir to
-	// the wrapper's own mounted /etc/wrapper - cannot wipe the pod's config.
+	// to a directory that is demonstrably ours before the loop can run, so
+	// neither SKILLS_SRC_DIRS=/etc/wrapper/skills (clone dir = the wrapper's
+	// own mounted config) nor SKILLS_SRC_DIRS=/workspace/<owner>/<repo>/skills
+	// (clone dir = a work repo Render already cloned and resumed) can be wiped.
 	// Fail-open by design: the zero-skill check in Render is what turns a
 	// refused clone into a boot failure, and it keys on the installed count.
 	if !clonableDir(p.SkillsCloneDir) {
 		if p.Log != nil {
-			p.Log.Warn("skills clone target is not empty and carries no clone marker; refusing to clear it",
+			p.Log.Warn("skills clone target is not ours (not empty, no sentinel, not a bare .git); refusing to clear it",
 				"action", "skills_clone", "dir", p.SkillsCloneDir)
 		}
 		if p.M != nil {
