@@ -1,8 +1,10 @@
 package bootstrap_test
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -165,4 +167,33 @@ func hasCall(calls [][]string, dir string, args ...string) bool {
 		}
 	}
 	return false
+}
+
+// A REPO THE LOOP SKIPS ENTIRELY MUST NOT BE SILENT.
+//
+// TATARA_REPOS is json.Unmarshalled with no validation, so a spec whose URL has
+// no derivable namespace is possible. That repo is skipped here AND was skipped
+// by the clone path for the same reason, so it appears in neither pushed nor
+// failed - correctly, since nothing was ever cloned and no work exists to lose.
+// What was missing is that nobody was told: the whole point of reporting the
+// failed set is that a short pushed list must not read as a complete turn, and a
+// repo that silently vanishes from the fan-out is that same blind spot one step
+// earlier. It stays out of failed on purpose - a failed entry makes the
+// operator's handoff note assert lost work in a repo that was never on disk.
+func TestCommitAndPushAll_WarnsAboutARepoItSkipsEntirely(t *testing.T) {
+	var logBuf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	repos := []bootstrap.RepoSpec{
+		{Name: "ok", URL: "https://github.com/szymonrychu/ok.git"},
+		{Name: "unnameable", URL: "::not a url::"},
+	}
+	git := dirtyGitFailingPushIn(new([][]string))
+
+	pushed, failed, err := bootstrap.CommitAndPushAll("/ws", repos, "tatara/task-x", "msg", git, log, nil)
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"ok"}, pushed)
+	require.Empty(t, failed)
+	require.Contains(t, logBuf.String(), "repo_skipped")
+	require.Contains(t, logBuf.String(), "unnameable")
 }

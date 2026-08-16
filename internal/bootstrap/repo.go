@@ -231,7 +231,18 @@ func CommitAndPushAll(workspace string, repos []RepoSpec, branch, message string
 	for _, r := range repos {
 		ns := namespacePath(r.URL)
 		if ns == "" || filepath.Clean(filepath.Join(workspace, ns)) == filepath.Clean(workspace) {
-			continue // no valid namespace: skip to avoid operating on the workspace root
+			// No valid namespace: skip, or we would operate on the workspace root.
+			// Say so. The clone path skipped this same spec for this same reason,
+			// so there is no tree here and nothing to lose - which is why it does
+			// NOT join failed: a failed entry makes the operator's handoff note
+			// assert lost work in a repo that was never on disk. But a repo that
+			// drops out of a nine-wide fan-out in silence is the same blind spot
+			// this reporting exists to close, one step earlier.
+			if log != nil {
+				log.Warn("skipping repo with no derivable namespace: it was never cloned and is in neither the pushed nor the failed list",
+					"action", "repo_skipped", "repo", r.Name, "url", r.URL)
+			}
+			continue
 		}
 		dir := filepath.Join(workspace, ns)
 		// TATARA_REPOS is unmarshalled with no validation, so a RepoSpec can carry
