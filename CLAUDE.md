@@ -15,8 +15,11 @@ empirical claude-binary behavior the design rests on.
 
 - Not the orchestrator. It runs one session; `tatara-operator` decides that
   there should be one.
-- Not the skills. It clones `tatara-agent-skills` at the `TATARA_SKILLS_REF`
-  Dockerfile pin, which the skills release workflow moves.
+- Not the skills. It clones `tatara-agent-skills` at `TATARA_SKILLS_REF`. The
+  Dockerfile ARG only seeds that as a runtime ENV default and reaches no agent
+  pod: `tatara-operator internal/agent/pod.go` sets the same variable from
+  `Project.spec.agent.skillsRef` unconditionally, so the Project pin always
+  wins. The skills release moves both since tatara-helmfile#397.
 
 <!-- BEGIN tatara-shared-contract (generated from tatara-agent-skills/template/CLAUDE-shared.md - do not edit below this line) -->
 ## The tatara platform
