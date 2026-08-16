@@ -69,6 +69,46 @@ func TestDisabledWhenUnconfigured(t *testing.T) {
 	require.False(t, p2.Enabled(), "URL without run_id stays disabled")
 }
 
+// PushOnce is the fatal-boot-path escape (issue #173, review round 1):
+// bootstrap.Render runs inside newApp before the push loop is ever built, so a
+// boot that dies there would take ccw_skills_clone_failures_total and
+// ccw_bootstrap_render_total{fail} with it. An agent pod has no scrape target,
+// so a synchronous push before the process exits is the only route out.
+func TestPushOnceSendsSynchronously(t *testing.T) {
+	cap := &capture{}
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+
+	p := pushclient.New(pushclient.Config{
+		URL:      srv.URL + "/internal/metrics/push",
+		RunID:    "run-boot-fail",
+		Pod:      "pod-a",
+		Interval: time.Hour,
+	}, testRegistry(t), discardLog())
+
+	p.PushOnce(context.Background()) // no Start(); must have arrived on return
+
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	require.Equal(t, 1, cap.hits, "PushOnce must complete the push before it returns")
+	require.Contains(t, cap.query, "run_id=run-boot-fail")
+	require.Contains(t, cap.body, "ccw_turns_total")
+}
+
+func TestPushOnceDisabledIsNoOp(t *testing.T) {
+	cap := &capture{}
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+
+	// No RunID: push is not configured, so PushOnce must not reach the server.
+	p := pushclient.New(pushclient.Config{URL: srv.URL}, testRegistry(t), discardLog())
+	p.PushOnce(context.Background())
+
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	require.Zero(t, cap.hits)
+}
+
 func TestPushPostsTextWithIdentity(t *testing.T) {
 	cap := &capture{}
 	srv := httptest.NewServer(cap.handler())

@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/auth"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/httpapi"
@@ -95,7 +97,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	reg := obs.PromRegistry()
 	m := metrics.New(reg)
 
-	if err := bootstrap.Render(buildBootstrapParams(cfg, log, m), gitRunner()); err != nil {
+	if err := renderAndPushOnFailure(ctx, cfg, reg, log, m, gitRunner()); err != nil {
 		return nil, err
 	}
 	setGitHubTokenEnv(cfg.GitToken)
@@ -199,12 +201,7 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	// Push-metrics client: this Pod is too short-lived to be reliably scraped,
 	// so it pushes its /metrics to the operator's push-receiver. A no-op unless
 	// the operator wired OPERATOR_PUSH_URL + RUN_ID.
-	a.pusher = pushclient.New(pushclient.Config{
-		URL:      cfg.OperatorPushURL,
-		RunID:    cfg.RunID,
-		Pod:      cfg.PodName,
-		Interval: time.Duration(cfg.PushIntervalSeconds) * time.Second,
-	}, reg, log, m)
+	a.pusher = newPusher(cfg, reg, log, m)
 
 	// Mid-turn git push safety net: the turn finaliser's commit+push only runs
 	// at turn end, which on a 42-minute turn leaves committed work undurable for
@@ -395,6 +392,37 @@ func fireLifecycleHookBounded(ctx context.Context, cfg config, m *metrics.Metric
 	case <-ctx.Done():
 		log.Warn("lifecycle hook aborted by shutdown context", "hook", name)
 	}
+}
+
+// newPusher builds the push-metrics client from the operator-injected env.
+// Pushing is a no-op unless OPERATOR_PUSH_URL and RUN_ID are both set.
+func newPusher(cfg config, g prometheus.Gatherer, log *slog.Logger, m *metrics.Metrics) *pushclient.Pusher {
+	return pushclient.New(pushclient.Config{
+		URL:      cfg.OperatorPushURL,
+		RunID:    cfg.RunID,
+		Pod:      cfg.PodName,
+		Interval: time.Duration(cfg.PushIntervalSeconds) * time.Second,
+	}, g, log, m)
+}
+
+// renderAndPushOnFailure runs bootstrap.Render and, when it fails, performs one
+// synchronous best-effort push before returning the error.
+//
+// Render runs inside newApp, before the app's own Pusher exists and long before
+// run() starts its loop, so a Render failure would otherwise take the families
+// that witness it - ccw_bootstrap_render_total{result="fail"},
+// ccw_skills_installed_total at 0, ccw_skills_clone_failures_total - out with
+// the process. An agent pod has no scrape target, so those series would never
+// reach Prometheus by any route, leaving the FATAL case invisible: the exact
+// blackout issue #173 renamed them to end. The success path pushes nothing out
+// of band; the normal loop owns it from there.
+func renderAndPushOnFailure(ctx context.Context, cfg config, reg *prometheus.Registry,
+	log *slog.Logger, m *metrics.Metrics, git bootstrap.GitRunner) error {
+	err := bootstrap.Render(buildBootstrapParams(cfg, log, m), git)
+	if err != nil {
+		newPusher(cfg, reg, log, m).PushOnce(ctx)
+	}
+	return err
 }
 
 func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) bootstrap.Params {

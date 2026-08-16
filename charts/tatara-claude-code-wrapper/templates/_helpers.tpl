@@ -86,9 +86,12 @@ PROJECT_CLAUDE_MD_PATH: "/etc/wrapper/project-claude.md"
 MCP_BASE_PATH: "/etc/wrapper/mcp-base.json"
 MCP_OVERLAY_DIR: "/etc/wrapper/mcp.d"
 {{- /* skillsCloneDir takes filepath.Dir of the FIRST entry as the boot-clone
-target, so this must keep the parent-of-skills shape and match
-cmd/wrapper/config.go's default. The old leading /templates/skills was deleted
-from the image in 2026-06-28 and derived a clone target of /templates. */}}
+target, so this must keep the parent-of-skills shape, must match
+cmd/wrapper/config.go's defaultSkillsSrcDirs, and the derived parent
+(/etc/wrapper/skills) must be a WRITABLE mount - it sits inside the read-only
+`files` ConfigMap projection, so deployment.yaml nests an emptyDir there.
+Both halves are asserted by cmd/wrapper/guard_chart_skills_dir_test.go; this
+value has already been wrong twice in opposite directions without failing CI. */}}
 SKILLS_SRC_DIRS: "/etc/wrapper/skills/skills"
 ALLOWED_TOOLS_PATH: "/etc/wrapper/allowed-tools.txt"
 {{- end -}}

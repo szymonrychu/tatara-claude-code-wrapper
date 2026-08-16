@@ -10,6 +10,14 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
 )
 
+// defaultSkillsSrcDirs is the SKILLS_SRC_DIRS fallback. skillsCloneDir takes
+// filepath.Dir of the first entry as the boot-clone target, so the parent of
+// the leading entry - here /etc/wrapper/skills - must be WRITABLE in every
+// deployment that does not override this. The operator's pod builder sets no
+// SKILLS_SRC_DIRS, so production agent pods run on exactly this value.
+// TestChartSkillsSrcDirsMatchesCodeDefault keeps the chart from drifting off it.
+const defaultSkillsSrcDirs = "/etc/wrapper/skills/skills"
+
 type config struct {
 	HTTPAddr       string
 	InternalAddr   string
@@ -187,7 +195,7 @@ func loadConfig(args []string) (config, error) {
 		SerenaMCPURL:        os.Getenv("TATARA_SERENA_URL"),
 		ExtraMCPServers:     []byte(os.Getenv("TATARA_EXTRA_MCP_SERVERS")),
 		ExtraSkillSources:   []byte(os.Getenv("TATARA_EXTRA_SKILL_SOURCES")),
-		SkillsSrcDirs:       envOr("SKILLS_SRC_DIRS", "/etc/wrapper/skills/skills"),
+		SkillsSrcDirs:       envOr("SKILLS_SRC_DIRS", defaultSkillsSrcDirs),
 		SkillProfile:        os.Getenv("TATARA_SKILL_PROFILE"),
 		SkillsRepo:          envOr("TATARA_SKILLS_REPO", "https://github.com/szymonrychu/tatara-agent-skills"),
 		SkillsRef:           envOr("TATARA_SKILLS_REF", "main"),

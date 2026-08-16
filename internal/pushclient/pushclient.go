@@ -114,6 +114,27 @@ func (p *Pusher) pushWithTimeout() {
 	p.pushOnce(ctx)
 }
 
+// PushOnce performs a single SYNCHRONOUS best-effort push and returns when it
+// has completed, bounded by the configured Interval. It is a no-op when push is
+// not configured, and it neither starts nor requires the push loop.
+//
+// It exists for fatal boot paths: bootstrap.Render runs before the Pusher the
+// app eventually owns is built, so a boot that dies there would take the very
+// families that witness it - ccw_skills_clone_failures_total,
+// ccw_skills_installed_total at 0, ccw_bootstrap_render_total{fail} - out with
+// the process. An agent pod has no scrape target, so an unpushed metric is a
+// lost one (issue #173). Deliberately does NOT delete the series afterwards:
+// the operator TTL is the backstop, and the series must outlive the pod long
+// enough to be scraped.
+func (p *Pusher) PushOnce(ctx context.Context) {
+	if !p.Enabled() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, p.cfg.Interval)
+	defer cancel()
+	p.pushOnce(ctx)
+}
+
 // Shutdown stops the loop and best-effort deletes this run's series so they are
 // gone immediately rather than waiting for the operator TTL.
 func (p *Pusher) Shutdown(ctx context.Context) {

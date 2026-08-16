@@ -64,6 +64,12 @@ spec:
           volumeMounts:
             - name: files
               mountPath: /etc/wrapper
+            # The boot clone writes the skills tree to the parent of the first
+            # SKILLS_SRC_DIRS entry, which is inside the read-only `files`
+            # ConfigMap projection above. Nesting a writable emptyDir under it
+            # is what makes "git init" possible at all.
+            - name: skills
+              mountPath: /etc/wrapper/skills
             - name: workspace
               mountPath: /workspace
           resources:
@@ -85,6 +91,8 @@ spec:
               - key: "mcp.d__{{ $name }}.json"
                 path: "mcp.d/{{ $name }}.json"
               {{- end }}
+        - name: skills
+          emptyDir: {}
         - name: workspace
           {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:

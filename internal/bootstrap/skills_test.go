@@ -438,6 +438,74 @@ func TestCloneSkillsRepo_SentinelDifferentRef_ReClones(t *testing.T) {
 	require.Equal(t, "main", readSentinel(t, cloneDir), "sentinel must be rewritten to the new ref")
 }
 
+// ---- the retry loop's os.RemoveAll is bounded (issue #173, review round 1) ----
+//
+// SkillsCloneDir is filepath.Dir of the first SKILLS_SRC_DIRS entry, which a
+// Project can override via ExtraEnvs. SKILLS_SRC_DIRS=/etc/wrapper/skills - a
+// plausible value, and the shape the chart once used as a SOURCE dir - resolves
+// the clone dir to /etc/wrapper, the wrapper's own mounted config.
+
+func TestCloneSkillsRepo_NonCloneDir_RefusesToClear(t *testing.T) {
+	dir := t.TempDir() // stands in for a mounted /etc/wrapper
+	mustWriteFile(t, filepath.Join(dir, "global-claude.md"), "not ours\n")
+	mustMkdir(t, filepath.Join(dir, "mcp.d"))
+
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	var cmds []string
+	stubGit := func(_ string, args ...string) error {
+		cmds = append(cmds, strings.Join(args, " "))
+		return nil
+	}
+
+	require.NoError(t, cloneSkillsRepo(Params{
+		SkillsRepo: "https://github.com/example/repo", SkillsRef: "main",
+		SkillsCloneDir: dir, M: m,
+	}, stubGit))
+
+	require.FileExists(t, filepath.Join(dir, "global-claude.md"),
+		"a clone target that is not empty and carries no clone marker must never be cleared")
+	require.DirExists(t, filepath.Join(dir, "mcp.d"))
+	require.Empty(t, cmds, "no git command may run against a directory we refused to clear")
+	require.Equal(t, float64(1),
+		sumCounter(t, reg, "ccw_skills_clone_failures_total",
+			map[string]string{"source": skillsCloneSourceRepo}),
+		"refusing to clear the target is a clone failure and must be counted")
+}
+
+func TestCloneSkillsRepo_EmptyDir_Clones(t *testing.T) {
+	dir := t.TempDir() // exists, empty: nothing to destroy
+	var cmds []string
+	stubGit := func(_ string, args ...string) error {
+		cmds = append(cmds, strings.Join(args, " "))
+		return nil
+	}
+	require.NoError(t, cloneSkillsRepo(Params{
+		SkillsRepo: "https://github.com/example/repo", SkillsRef: "main", SkillsCloneDir: dir,
+	}, stubGit))
+	require.NotEmpty(t, cmds, "an empty clone target is clonable")
+	require.Equal(t, "main", readSentinel(t, dir))
+}
+
+func TestCloneSkillsRepo_SentinelOnlyDir_Clones(t *testing.T) {
+	// A completed clone whose tree was emptied but whose sentinel survives:
+	// the marker vouches for the directory being ours, so a ref change clears it.
+	dir := filepath.Join(t.TempDir(), "skills-clone")
+	mustMkdir(t, dir)
+	mustWriteFile(t, filepath.Join(dir, skillsCloneSentinel), "v1.2.3\n")
+
+	var cmds []string
+	stubGit := func(_ string, args ...string) error {
+		cmds = append(cmds, strings.Join(args, " "))
+		return nil
+	}
+	require.NoError(t, cloneSkillsRepo(Params{
+		SkillsRepo: "https://github.com/example/repo", SkillsRef: "main", SkillsCloneDir: dir,
+	}, stubGit))
+	require.NotEmpty(t, cmds)
+	require.Equal(t, "main", readSentinel(t, dir))
+}
+
 func TestCloneSkillsRepo_WritesSentinelOnlyAfterCheckout(t *testing.T) {
 	orig := SkillsCloneRetryDelay
 	SkillsCloneRetryDelay = func(int) {}
@@ -558,12 +626,32 @@ func readSentinel(t *testing.T, dir string) string {
 	return strings.TrimSpace(string(b))
 }
 
-func TestRender_SkillsCloneFailure_BootContinues(t *testing.T) {
+// A clone failure with NO SkillsSrc configured hits the escape hatch, not the
+// fail-open: the zero-skill check is skipped because the deployment asked for
+// no skills at all. This is NOT the production shape - see the test below.
+func TestRender_SkillsCloneFailure_NoSkillsSrc_BootContinues(t *testing.T) {
+	require.NoError(t, renderWithFailingClone(t, nil),
+		"with no SkillsSrc configured the zero-skill check is skipped")
+}
+
+// Production shape: SkillsSrc points into the clone that never materialised, so
+// the clone failure installs zero skills and the boot is fatal (B1).
+func TestRender_SkillsCloneFailure_WithSkillsSrc_Fails(t *testing.T) {
+	err := renderWithFailingClone(t, func(p *Params) {
+		p.SkillsSrc = []string{filepath.Join(p.SkillsCloneDir, "skills")}
+	})
+	require.Error(t, err, "a clone failure under production config must fail the boot")
+	require.Contains(t, err.Error(), "0 skills installed")
+}
+
+// renderWithFailingClone runs Render against a git stub whose "fetch" always
+// fails - the step that breaks for SHA refs, and the one a network outage hits.
+func renderWithFailingClone(t *testing.T, tweak func(*Params)) error {
+	t.Helper()
 	orig := SkillsCloneRetryDelay
 	SkillsCloneRetryDelay = func(int) {}
 	defer func() { SkillsCloneRetryDelay = orig }()
 
-	cloneDir := filepath.Join(t.TempDir(), "skills-clone")
 	p := Params{
 		HomeDir:        t.TempDir(),
 		Workspace:      t.TempDir(),
@@ -571,16 +659,18 @@ func TestRender_SkillsCloneFailure_BootContinues(t *testing.T) {
 		HookCommand:    "/usr/local/bin/cc-stop-hook",
 		PermissionMode: "bypassPermissions",
 		SkillsRepo:     "https://github.com/szymonrychu/tatara-agent-skills",
-		SkillsCloneDir: cloneDir,
+		SkillsCloneDir: filepath.Join(t.TempDir(), "skills-clone"),
 	}
-	// Fail on "fetch" (the step that breaks for SHA refs), not "clone".
+	if tweak != nil {
+		tweak(&p)
+	}
 	stubGit := func(_ string, args ...string) error {
 		if len(args) > 0 && args[0] == "fetch" {
 			return fmt.Errorf("network down")
 		}
 		return nil
 	}
-	require.NoError(t, Render(p, stubGit), "Render must succeed even when skills clone fails")
+	return Render(p, stubGit)
 }
 
 // ---- metrics counter via dto ----

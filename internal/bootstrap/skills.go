@@ -131,12 +131,32 @@ func cloneSkillsRepo(p Params, git GitRunner) error {
 		return nil
 	}
 
+	// The retry loop below clears the target with os.RemoveAll, and the target
+	// is not a fixed path: it is filepath.Dir of the first SKILLS_SRC_DIRS
+	// entry, which a Project can override through ExtraEnvs. Bound the delete
+	// to a directory that is plausibly ours before the loop can run, so a value
+	// like SKILLS_SRC_DIRS=/etc/wrapper/skills - which resolves the clone dir to
+	// the wrapper's own mounted /etc/wrapper - cannot wipe the pod's config.
+	// Fail-open by design: the zero-skill check in Render is what turns a
+	// refused clone into a boot failure, and it keys on the installed count.
+	if !clonableDir(p.SkillsCloneDir) {
+		if p.Log != nil {
+			p.Log.Warn("skills clone target is not empty and carries no clone marker; refusing to clear it",
+				"action", "skills_clone", "dir", p.SkillsCloneDir)
+		}
+		if p.M != nil {
+			p.M.SkillsCloneFailures.WithLabelValues(skillsCloneSourceRepo).Inc()
+		}
+		return nil
+	}
+
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		// The directory contents are untrusted on every attempt: we only get
 		// here when the sentinel did not vouch for them, so they may be a
 		// half-initialised clone from a killed boot or a checkout of a
-		// different ref. Clear it so "git init"/"remote add" start clean.
+		// different ref. Clear it so "git init"/"remote add" start clean. The
+		// clonableDir guard above is what makes this safe to do unconditionally.
 		_ = os.RemoveAll(p.SkillsCloneDir)
 		// SHA-ref-safe fetch sequence. "git clone -b <ref>" rejects raw commit
 		// SHAs ("Remote branch <sha> not found"); "git fetch origin <ref>" accepts
@@ -185,6 +205,25 @@ func cloneSkillsRepo(p Params, git GitRunner) error {
 		p.M.SkillsCloneFailures.WithLabelValues(skillsCloneSourceRepo).Inc()
 	}
 	return nil
+}
+
+// clonableDir reports whether dir is safe for the retry loop's os.RemoveAll:
+// absent (we create it), empty, or already carrying a clone marker - a .git
+// from a completed or half-initialised clone, or the completion sentinel.
+// Anything else is somebody else's directory and is left alone. An unreadable
+// path (including a non-directory) is not clonable either: we do not delete
+// what we cannot inspect.
+func clonableDir(dir string) bool {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return os.IsNotExist(err)
+	}
+	for _, e := range ents {
+		if e.Name() == ".git" || e.Name() == skillsCloneSentinel {
+			return true
+		}
+	}
+	return len(ents) == 0
 }
 
 func writeSkillsCloneSentinel(dir, ref string) error {
