@@ -249,15 +249,16 @@ func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log
 			}
 			// One repo, so the failed set is the whole of it. Derived here rather
 			// than in bootstrap because this branch has no RepoSpec to take a Name
-			// from - including on the repoDir=="" error, where naming the repo the
-			// pod is bound to is still the most useful thing we can report.
+			// from.
 			//
-			// Unless there is nothing to name: primaryRepoName falls back to
-			// cfg.RepoURL, which is empty on a project-scoped pod (the operator
-			// omits REPO_URL when the Task has no Repository). A [""] would report
-			// no repo while still counting as a non-empty list on the operator
-			// side, which is enough to make a content-free turn look like it
-			// carried something.
+			// Unless there is nothing to name: primaryRepoName returns "" when
+			// REPO_URL is absent (a project-scoped pod, where the operator omits
+			// REPO_URL because the Task has no Repository) or too malformed for
+			// RepoDir to derive a namespace from - which is also the repoDir==""
+			// error above, so that arm reports the failure and names no repo. A [""]
+			// would report no repo while still counting as a non-empty list on the
+			// operator side, which is enough to make a content-free turn look like
+			// it carried something.
 			if name := primaryRepoName(cfg); err != nil && name != "" {
 				rec.FailedRepos = []string{name}
 			}
@@ -694,9 +695,12 @@ func (a *app) reprompt(tool, errText, callbackURL string) bool {
 // primaryRepoName is the human-facing name of the single repo a non-cross-repo
 // pod is bound to, derived from the namespace path of REPO_URL ("owner/repo").
 // Used to populate PushedRepos in single-repo mode where there is no RepoSpec.
+// Returns "" when REPO_URL is absent or too malformed for RepoDir to derive a
+// namespace from - callers must treat that as nothing to report, never as a
+// raw URL standing in for a repo name.
 func primaryRepoName(cfg config) string {
 	if dir := bootstrap.RepoDir(cfg.Workspace, cfg.RepoURL); dir != "" {
 		return filepath.Base(dir)
 	}
-	return cfg.RepoURL
+	return ""
 }

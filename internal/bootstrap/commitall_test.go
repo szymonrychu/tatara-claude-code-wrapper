@@ -104,6 +104,38 @@ func TestCommitAndPushAll_CleanRepoIsNeitherPushedNorFailed(t *testing.T) {
 	require.Empty(t, failed)
 }
 
+// A BLANK NAME IS NOT A REPORT.
+//
+// TATARA_REPOS is json.Unmarshal'ed with no validation, so a RepoSpec that
+// carries a URL but omits "name" puts an empty r.Name on the wire. The
+// namespace derived from r.URL is already computed in the loop and known
+// non-empty by the time failed/pushed is appended to, so falling back to its
+// last path element costs nothing and keeps both lists free of "".
+func TestCommitAndPushAll_FallsBackToURLDerivedNameWhenSpecNameIsBlank(t *testing.T) {
+	repos := []bootstrap.RepoSpec{{Name: "", URL: "https://github.com/szymonrychu/tatara-cli.git"}}
+
+	t.Run("failed push", func(t *testing.T) {
+		git := dirtyGitFailingPushIn(new([][]string), "/tatara-cli")
+		pushed, failed, err := bootstrap.CommitAndPushAll("/ws", repos, "tatara/task-x", "msg", git, nil, nil)
+
+		require.Error(t, err)
+		require.Equal(t, []string{"tatara-cli"}, failed,
+			"a blank RepoSpec.Name must not surface as an empty string in failed")
+		require.Empty(t, pushed)
+	})
+
+	t.Run("successful push", func(t *testing.T) {
+		var calls [][]string
+		git := dirtyGitFailingPushIn(&calls) // no failDirs: every push succeeds
+		pushed, failed, err := bootstrap.CommitAndPushAll("/ws", repos, "tatara/task-x", "msg", git, nil, nil)
+
+		require.NoError(t, err)
+		require.Equal(t, []string{"tatara-cli"}, pushed,
+			"a blank RepoSpec.Name must not surface as an empty string in pushed")
+		require.Empty(t, failed)
+	})
+}
+
 func hasCall(calls [][]string, dir string, args ...string) bool {
 	for _, c := range calls {
 		if c[0] != dir || len(c) < len(args)+1 {

@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/bootstrap"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
@@ -91,11 +92,12 @@ func newTestSession(t *testing.T) *session.Manager {
 
 // A BLANK NAME IS NOT A REPORT, AND ONE BLANK ELEMENT DOES REAL DAMAGE.
 //
-// primaryRepoName falls back to cfg.RepoURL, which is unvalidated and empty on a
-// project-scoped pod (the operator omits REPO_URL when the Task has no
-// Repository). A `failedRepos: [""]` would name nothing while still being
-// len()==1 on the operator side, which is enough to make a content-free turn
-// compute contentFree=false - suppressing the placeholder note and the
+// primaryRepoName returns "" when it has nothing to name, rather than falling
+// back to cfg.RepoURL (unvalidated, and empty on a project-scoped pod: the
+// operator omits REPO_URL when the Task has no Repository). A
+// `failedRepos: [""]` would name nothing while still being len()==1 on the
+// operator side, which is enough to make a content-free turn compute
+// contentFree=false - suppressing the placeholder note and the
 // empty-synthetic counter that exist to catch exactly that loss.
 func TestFinalizeTurn_NeverReportsABlankFailedRepoName(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -113,4 +115,23 @@ func TestFinalizeTurn_NeverReportsABlankFailedRepoName(t *testing.T) {
 
 	require.Empty(t, rec.FailedRepos,
 		"an unnameable repo must report nothing rather than an empty string")
+}
+
+// primaryRepoName must never hand a raw URL to a caller expecting a repo
+// name: a malformed REPO_URL is exactly the case bootstrap.RepoDir already
+// signals with "", and the old cfg.RepoURL fallback defeated that signal by
+// reporting the URL itself instead of nothing.
+func TestPrimaryRepoName(t *testing.T) {
+	t.Run("malformed REPO_URL yields no name", func(t *testing.T) {
+		cfg := config{Workspace: t.TempDir(), RepoURL: "https://github.com/"}
+		require.Empty(t, bootstrap.RepoDir(cfg.Workspace, cfg.RepoURL),
+			"test premise: RepoDir must genuinely fail to derive a namespace for this URL")
+		require.Empty(t, primaryRepoName(cfg),
+			"a malformed REPO_URL must report nothing, not the raw URL")
+	})
+
+	t.Run("normal URL yields the base name", func(t *testing.T) {
+		cfg := config{Workspace: t.TempDir(), RepoURL: "https://github.com/szymonrychu/tatara-cli.git"}
+		require.Equal(t, "tatara-cli", primaryRepoName(cfg))
+	})
 }

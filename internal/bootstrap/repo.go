@@ -234,14 +234,21 @@ func CommitAndPushAll(workspace string, repos []RepoSpec, branch, message string
 			continue // no valid namespace: skip to avoid operating on the workspace root
 		}
 		dir := filepath.Join(workspace, ns)
+		// TATARA_REPOS is unmarshalled with no validation, so a RepoSpec can carry
+		// a URL with no Name. Fall back to the last segment of the namespace we
+		// just derived from that same URL rather than ever appending "".
+		name := r.Name
+		if name == "" {
+			name = ns[strings.LastIndex(ns, "/")+1:]
+		}
 		ok, perr := CommitAndPush(dir, branch, message, git, log, m)
 		if perr != nil {
-			failed = append(failed, r.Name)
-			err = errors.Join(err, fmt.Errorf("commit/push %s: %w", r.Name, perr))
+			failed = append(failed, name)
+			err = errors.Join(err, fmt.Errorf("commit/push %s: %w", name, perr))
 			continue
 		}
 		if ok {
-			pushed = append(pushed, r.Name)
+			pushed = append(pushed, name)
 		}
 	}
 	return pushed, failed, err
