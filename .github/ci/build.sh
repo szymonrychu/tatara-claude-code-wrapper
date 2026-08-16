@@ -30,12 +30,13 @@ BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # Dockerfile ARG default and Makefile default.  Use the short SHA published by
 # tatara-cli CI (both SHORT_SHA and VERSION tags are pushed on every main merge).
 TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-v2.2.0}"
-# TATARA_SKILLS_REF pins the skills plugin ref baked as the runtime ENV default;
-# keep in sync with the Dockerfile ARG default and Makefile default. Rewritten by
-# the skills->wrapper cd-release bump - which rewrites the DOCKERFILE only, so
-# this default drifts unless moved by hand (it sat at v0.1.0 while the
-# Dockerfile was on v1.7.0). v1.8.0 ships the agent-judged approval gate.
-TATARA_SKILLS_REF="${TATARA_SKILLS_REF:-v2.1.0}"
+# There is deliberately NO TATARA_SKILLS_REF default here, and the build below
+# passes no build-arg for it (tatara-helmfile#397). The skills->wrapper
+# cd-release bump rewrites the DOCKERFILE ARG only, so a default here could
+# only drift - and it did: this file's literal v2.1.0 was forwarded
+# unconditionally and OVERRODE the CD-written Dockerfile pin on every release
+# build, making that whole CD edge inert. The Dockerfile ARG default is now the
+# single build-time source.
 DEST="harbor.szymonrichert.pl/containers/${REPO}"
 
 : "${GITHUB_TOKEN:?GITHUB_TOKEN required}"
@@ -90,7 +91,6 @@ buildctl --addr "$BUILDKITD_ADDR" build \
   --opt build-arg:COMMIT="${SHORT_SHA}" \
   --opt build-arg:DATE="${BUILD_DATE}" \
   --opt build-arg:TATARA_CLI_VERSION="${TATARA_CLI_VERSION}" \
-  --opt build-arg:TATARA_SKILLS_REF="${TATARA_SKILLS_REF}" \
   --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN \
   --output "type=image,\"name=${DEST}:${SHORT_SHA},${DEST}:${VERSION}\",push=true"
 
