@@ -7,12 +7,15 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 CLAUDE_CODE_VERSION ?= latest
-# Keep both in step with the Dockerfile ARG defaults. The cli->wrapper
-# cd-release bumps TATARA_CLI_VERSION here and in the Dockerfile; the skills
-# bump rewrites the Dockerfile ONLY, so TATARA_SKILLS_REF drifts here unless
-# it is moved by hand (it sat at v0.1.0 while the Dockerfile was on v1.7.0).
+# Keep in step with the Dockerfile ARG default; the cli->wrapper cd-release
+# bumps TATARA_CLI_VERSION here and in the Dockerfile.
+#
+# There is deliberately NO TATARA_SKILLS_REF here (tatara-helmfile#397). The
+# skills bump rewrites the Dockerfile ARG only, so a second copy could only
+# drift - and it did, sitting at v2.1.0 while the Dockerfile was on v2.3.0,
+# overriding the CD-written value on every build. The `image` target below
+# passes no --build-arg for it, so the Dockerfile ARG default applies.
 TATARA_CLI_VERSION ?= v2.1.0
-TATARA_SKILLS_REF ?= v2.1.0
 IMAGE_REF := $(REGISTRY)/$(IMAGE_NAME):$(VERSION)
 MODPATH := github.com/szymonrychu/tatara-claude-code-wrapper
 
@@ -34,7 +37,6 @@ image:
 	docker buildx build --platform=linux/amd64 \
 	  --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) \
 	  --build-arg CLAUDE_CODE_VERSION=$(CLAUDE_CODE_VERSION) --build-arg TATARA_CLI_VERSION=$(TATARA_CLI_VERSION) \
-	  --build-arg TATARA_SKILLS_REF=$(TATARA_SKILLS_REF) \
 	  -t $(IMAGE_REF) --load .
 push: image ; docker push $(IMAGE_REF)
 chart-test: ; helm unittest charts/tatara-claude-code-wrapper

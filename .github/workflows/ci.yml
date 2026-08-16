@@ -31,6 +31,13 @@ jobs:
             exit 1
           fi
 
+      # tatara-helmfile#397: the skills cd-release bump rewrites the Dockerfile
+      # ARG and nothing else, so a second copy anywhere can only drift - and a
+      # forwarded --build-arg makes the CD write inert outright, which is what
+      # shipped for months. Cheap, offline, and in the repo that owns the value.
+      - name: guard TATARA_SKILLS_REF's single build-time source
+        run: bash .github/ci/check-skills-pin-single-source.sh
+
   ci:
     needs: [pin-guard]
     uses: szymonrychu/tatara-operator/.github/workflows/ci-shared.yml@v1.36.1
