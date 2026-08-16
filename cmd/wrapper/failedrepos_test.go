@@ -88,3 +88,29 @@ func newTestSession(t *testing.T) *session.Manager {
 	return session.New(session.Config{}, turn.NewStore(), metrics.New(prometheus.NewRegistry()),
 		testLogger(), time.Now, func() string { return "turn-1" })
 }
+
+// A BLANK NAME IS NOT A REPORT, AND ONE BLANK ELEMENT DOES REAL DAMAGE.
+//
+// primaryRepoName falls back to cfg.RepoURL, which is unvalidated and empty on a
+// project-scoped pod (the operator omits REPO_URL when the Task has no
+// Repository). A `failedRepos: [""]` would name nothing while still being
+// len()==1 on the operator side, which is enough to make a content-free turn
+// compute contentFree=false - suppressing the placeholder note and the
+// empty-synthetic counter that exist to catch exactly that loss.
+func TestFinalizeTurn_NeverReportsABlankFailedRepoName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// No RepoURL and no Repos: RepoDir returns "", so the single-repo path errors
+	// before it can name anything.
+	cfg := config{Workspace: t.TempDir(), TaskBranch: "tatara/task-x"}
+	rec := &turn.Record{ID: "turn-1", CallbackURL: srv.URL}
+	a := &app{log: testLogger(), sess: newTestSession(t)}
+	a.finalizeTurn(rec, cfg, metrics.New(prometheus.NewRegistry()), testLogger(),
+		webhook.New(webhook.Config{Retries: 1}, metrics.New(prometheus.NewRegistry()), testLogger()), "")
+
+	require.Empty(t, rec.FailedRepos,
+		"an unnameable repo must report nothing rather than an empty string")
+}

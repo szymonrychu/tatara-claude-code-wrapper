@@ -251,8 +251,15 @@ func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log
 			// than in bootstrap because this branch has no RepoSpec to take a Name
 			// from - including on the repoDir=="" error, where naming the repo the
 			// pod is bound to is still the most useful thing we can report.
-			if err != nil {
-				rec.FailedRepos = []string{primaryRepoName(cfg)}
+			//
+			// Unless there is nothing to name: primaryRepoName falls back to
+			// cfg.RepoURL, which is empty on a project-scoped pod (the operator
+			// omits REPO_URL when the Task has no Repository). A [""] would report
+			// no repo while still counting as a non-empty list on the operator
+			// side, which is enough to make a content-free turn look like it
+			// carried something.
+			if name := primaryRepoName(cfg); err != nil && name != "" {
+				rec.FailedRepos = []string{name}
 			}
 		}
 		if err != nil {
