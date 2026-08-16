@@ -237,9 +237,15 @@ func CommitAndPushAll(workspace string, repos []RepoSpec, branch, message string
 		// TATARA_REPOS is unmarshalled with no validation, so a RepoSpec can carry
 		// a URL with no Name. Fall back to the last segment of the namespace we
 		// just derived from that same URL rather than ever appending "".
+		//
+		// filepath.Base, not a slice at the last "/": namespacePath trims a ".git"
+		// suffix AFTER joining, so a URL ending "/.git" yields "owner/repo/" and
+		// the slice would hand back the "" this exists to prevent. It is also how
+		// primaryRepoName derives the single-repo name, and the two must not
+		// disagree about the same URL.
 		name := r.Name
 		if name == "" {
-			name = ns[strings.LastIndex(ns, "/")+1:]
+			name = filepath.Base(ns)
 		}
 		ok, perr := CommitAndPush(dir, branch, message, git, log, m)
 		if perr != nil {

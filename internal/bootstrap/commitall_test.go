@@ -134,6 +134,18 @@ func TestCommitAndPushAll_FallsBackToURLDerivedNameWhenSpecNameIsBlank(t *testin
 			"a blank RepoSpec.Name must not surface as an empty string in pushed")
 		require.Empty(t, failed)
 	})
+
+	// namespacePath trims the ".git" suffix AFTER joining, so this URL derives
+	// "szymonrychu/tatara-cli/". A fallback that sliced at the last "/" would
+	// hand back exactly the blank name it exists to prevent.
+	t.Run("url whose last segment is .git", func(t *testing.T) {
+		dotGit := []bootstrap.RepoSpec{{Name: "", URL: "https://github.com/szymonrychu/tatara-cli/.git"}}
+		git := dirtyGitFailingPushIn(new([][]string), "/tatara-cli")
+		_, failed, err := bootstrap.CommitAndPushAll("/ws", dotGit, "tatara/task-x", "msg", git, nil, nil)
+
+		require.Error(t, err)
+		require.Equal(t, []string{"tatara-cli"}, failed)
+	})
 }
 
 func hasCall(calls [][]string, dir string, args ...string) bool {
