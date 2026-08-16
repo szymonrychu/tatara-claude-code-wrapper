@@ -473,6 +473,44 @@ func TestCloneSkillsRepo_NonCloneDir_RefusesToClear(t *testing.T) {
 		"refusing to clear the target is a clone failure and must be counted")
 }
 
+// ---- .git alone is the marker, not .git anywhere (issue #173, review round 2) ----
+//
+// A checked-out work repo has a .git too. SKILLS_SRC_DIRS=/workspace/<owner>/<repo>/skills
+// derives the clone dir to /workspace/<owner>/<repo>, which Render has already
+// cloned, resumed and rescued by the time cloneSkillsRepo runs. Our own
+// half-initialised clone is .git-ONLY: init/remote/fetch write nothing into the
+// worktree and the sentinel lands immediately after checkout.
+
+func TestCloneSkillsRepo_CheckedOutWorkRepo_RefusesToClear(t *testing.T) {
+	dir := t.TempDir() // stands in for /workspace/<owner>/<repo>
+	mustMkdir(t, filepath.Join(dir, ".git"))
+	mustWriteFile(t, filepath.Join(dir, "README.md"), "the task branch\n")
+	mustMkdir(t, filepath.Join(dir, "internal"))
+
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	var cmds []string
+	stubGit := func(_ string, args ...string) error {
+		cmds = append(cmds, strings.Join(args, " "))
+		return nil
+	}
+
+	require.NoError(t, cloneSkillsRepo(Params{
+		SkillsRepo: "https://github.com/example/repo", SkillsRef: "main",
+		SkillsCloneDir: dir, M: m,
+	}, stubGit))
+
+	require.FileExists(t, filepath.Join(dir, "README.md"),
+		"a populated git worktree is somebody else's repo and must never be cleared")
+	require.DirExists(t, filepath.Join(dir, "internal"))
+	require.DirExists(t, filepath.Join(dir, ".git"))
+	require.Empty(t, cmds, "no git command may run against a directory we refused to clear")
+	require.Equal(t, float64(1),
+		sumCounter(t, reg, "ccw_skills_clone_failures_total",
+			map[string]string{"source": skillsCloneSourceRepo}),
+		"refusing to clear the target is a clone failure and must be counted")
+}
+
 func TestCloneSkillsRepo_EmptyDir_Clones(t *testing.T) {
 	dir := t.TempDir() // exists, empty: nothing to destroy
 	var cmds []string
@@ -503,6 +541,28 @@ func TestCloneSkillsRepo_SentinelOnlyDir_Clones(t *testing.T) {
 		SkillsRepo: "https://github.com/example/repo", SkillsRef: "main", SkillsCloneDir: dir,
 	}, stubGit))
 	require.NotEmpty(t, cmds)
+	require.Equal(t, "main", readSentinel(t, dir))
+}
+
+func TestCloneSkillsRepo_PopulatedOwnCloneStaleRef_ReClones(t *testing.T) {
+	// The realistic reuse path: a completed clone - sentinel, .git and a
+	// worktree - whose ref moved. The sentinel is what distinguishes it from
+	// the work repo above, so a populated directory carrying it stays clonable.
+	dir := filepath.Join(t.TempDir(), "skills-clone")
+	mustMkdir(t, filepath.Join(dir, ".git"))
+	mustMkdir(t, filepath.Join(dir, "skills"))
+	mustWriteFile(t, filepath.Join(dir, skillsCloneSentinel), "v1.2.3\n")
+
+	var cmds []string
+	stubGit := func(_ string, args ...string) error {
+		cmds = append(cmds, strings.Join(args, " "))
+		return nil
+	}
+	require.NoError(t, cloneSkillsRepo(Params{
+		SkillsRepo: "https://github.com/example/repo", SkillsRef: "main", SkillsCloneDir: dir,
+	}, stubGit))
+	require.NotEmpty(t, cmds, "our own clone at a stale ref must be re-cloned")
+	require.NoDirExists(t, filepath.Join(dir, "skills"), "the stale tree must be cleared first")
 	require.Equal(t, "main", readSentinel(t, dir))
 }
 

@@ -208,22 +208,38 @@ func cloneSkillsRepo(p Params, git GitRunner) error {
 }
 
 // clonableDir reports whether dir is safe for the retry loop's os.RemoveAll:
-// absent (we create it), empty, or already carrying a clone marker - a .git
-// from a completed or half-initialised clone, or the completion sentinel.
-// Anything else is somebody else's directory and is left alone. An unreadable
-// path (including a non-directory) is not clonable either: we do not delete
-// what we cannot inspect.
+// absent (we create it), empty, carrying our completion sentinel, or holding
+// exactly ".git" and nothing else. Anything else is somebody else's directory
+// and is left alone. An unreadable path (including a non-directory) is not
+// clonable either: we do not delete what we cannot inspect.
+//
+// ".git" ALONE, never ".git" among other entries: a checked-out repo has a
+// .git too, and SKILLS_SRC_DIRS=/workspace/<owner>/<repo>/skills derives the
+// clone dir to a work repo Render has already cloned and resumed - clearing it
+// would destroy the unpushed commits resume.go exists to rescue. Our own
+// half-initialised clone is .git-only by construction: git init, remote add
+// and fetch --depth 1 write nothing into the worktree, and the sentinel lands
+// immediately after checkout --detach. So the narrow rule still covers
+// pre-mortem 4's kill-between-init-and-checkout case.
 func clonableDir(dir string) bool {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return os.IsNotExist(err)
 	}
-	for _, e := range ents {
-		if e.Name() == ".git" || e.Name() == skillsCloneSentinel {
+	switch len(ents) {
+	case 0:
+		return true
+	case 1:
+		if ents[0].Name() == ".git" {
 			return true
 		}
 	}
-	return len(ents) == 0
+	for _, e := range ents {
+		if e.Name() == skillsCloneSentinel {
+			return true
+		}
+	}
+	return false
 }
 
 func writeSkillsCloneSentinel(dir, ref string) error {
