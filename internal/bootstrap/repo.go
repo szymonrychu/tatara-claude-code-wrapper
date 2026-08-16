@@ -217,6 +217,16 @@ func unstageOversizedBlobs(dir string, git GitRunner, log *slog.Logger, m *metri
 // stopped costing the other repos their commits. failed is the same information
 // in a form the operator can act on: a short pushed list is indistinguishable
 // from a turn with nothing to push, and the difference is whether work was lost.
+//
+// KNOWN LIMITATION, deliberate: failed describes THIS turn, like pushed does. A
+// repo that committed and then failed to push has a clean index on the next
+// turn, so CommitAndPush short-circuits, the repo appears in neither list, and
+// the operator's status field is cleared while the commit is still local. The
+// mid-turn safety net covers the common case - PushOnly pushes every repo each
+// interval regardless of tree state, so a transient rejection self-heals - but a
+// persistent one (auth, branch protection) does not. Retrying an unpushed commit
+// from the turn-end path means comparing against the remote-tracking ref, which
+// is a different change from this one and belongs with reconcileWithBase.
 func CommitAndPushAll(workspace string, repos []RepoSpec, branch, message string, git GitRunner, log *slog.Logger, m *metrics.Metrics) (pushed []string, failed []string, err error) {
 	for _, r := range repos {
 		ns := namespacePath(r.URL)
