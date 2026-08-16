@@ -95,17 +95,9 @@ func TestInstallAgents_MetricCounted(t *testing.T) {
 	ws := t.TempDir()
 	require.NoError(t, installAgents(Params{Workspace: ws, AgentsSrc: []string{src}, M: m}))
 
-	mf, err := reg.Gather()
-	require.NoError(t, err)
-	var total float64
-	for _, fam := range mf {
-		if fam.GetName() == "wrapper_agents_installed_total" {
-			for _, mm := range fam.GetMetric() {
-				total += mm.GetCounter().GetValue()
-			}
-		}
-	}
-	require.Equal(t, float64(2), total, "installed counter must count both agent files")
+	require.Equal(t, float64(2),
+		sumCounter(t, reg, "ccw_agents_installed_total", nil),
+		"installed counter must count both agent files")
 }
 
 func TestInstallAgents_LogsShadowedAgent(t *testing.T) {

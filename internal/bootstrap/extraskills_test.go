@@ -122,17 +122,15 @@ func TestInstallExtraSkillSources_PerSourceFailureIsolation(t *testing.T) {
 	require.FileExists(t, filepath.Join(ws, ".claude", "skills", "good-skill", "SKILL.md"))
 	require.Contains(t, logBuf.String(), "bad-source")
 
-	mf, err := reg.Gather()
-	require.NoError(t, err)
-	var failCount float64
-	for _, fam := range mf {
-		if fam.GetName() == "wrapper_skills_clone_failures_total" {
-			for _, mm := range fam.GetMetric() {
-				failCount += mm.GetCounter().GetValue()
-			}
-		}
-	}
-	require.Equal(t, float64(1), failCount, "bad-source clone failure must be counted once")
+	// source="extra" keeps a per-project config error off the fleet-wide
+	// skills-repo series, so an alert on skills_repo cannot fire on a bad
+	// TATARA_EXTRA_SKILL_SOURCES entry.
+	require.Equal(t, float64(1),
+		sumCounter(t, reg, "ccw_skills_clone_failures_total", map[string]string{"source": "extra"}),
+		"bad-source clone failure must be counted once under source=extra")
+	require.Equal(t, float64(0),
+		sumCounter(t, reg, "ccw_skills_clone_failures_total", map[string]string{"source": "skills_repo"}),
+		"an extra-source failure must not land on the skills-repo series")
 }
 
 // TestInstallExtraSkillSources_RejectsTraversalName asserts that a Name

@@ -819,11 +819,29 @@ func Render(p Params, git GitRunner) error {
 	// cloneSkillsRepo is fail-open (always returns nil); discard the error
 	// explicitly so the intent is clear and errcheck linters are satisfied.
 	_ = cloneSkillsRepo(p, git)
-	if err := installSkills(p); err != nil {
+	installed, err := installSkills(p)
+	if err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
 		}
 		return err
+	}
+	// A pod with no skills is a different agent, not a degraded one: no council
+	// harness, no guardrails, no TDD skill, no .claude/agents palette. Fail the
+	// boot rather than run a turn against the skill names the operator wrote
+	// into the job text but that do not exist on disk. The predicate is the
+	// installed count and never cloneSkillsRepo's return, which is nil on every
+	// fail-open path (issue #173). Skipped when no skill source is configured at
+	// all, so a deliberately skill-less deployment is unaffected. The count is
+	// installSkills's alone: a project extra source cannot stand in for the
+	// harness skills.
+	if installed == 0 && hasSkillsSrc(p) {
+		if p.M != nil {
+			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
+		}
+		return fmt.Errorf("install skills: 0 skills installed from %v (profile %q): "+
+			"the skills clone is missing or empty, or no skill matches this profile",
+			p.SkillsSrc, p.SkillProfile)
 	}
 	// Extra project skill sources (fail-open, per-source isolation): installed
 	// after the baked skills so a project source can override a same-named

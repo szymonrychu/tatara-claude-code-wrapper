@@ -26,6 +26,23 @@ var SkillsCloneRetryDelay = func(attempt int) {
 	time.Sleep(time.Duration(attempt) * 2 * time.Second)
 }
 
+// skillsCloneSentinel marks a skills clone as COMPLETE and records the ref it
+// holds. It is written only after "checkout --detach" succeeds, so its presence
+// is proof of a finished tree in a way a bare .git is not: a kill between "git
+// init" and the checkout leaves .git behind with an empty tree, and with a
+// persistent clone dir a .git-keyed skip would make every later boot in that
+// container install zero skills - silently, since cloneSkillsRepo would return
+// nil and never touch the failure counter (issue #173).
+const skillsCloneSentinel = ".tatara-skills-ref"
+
+// Label values for Metrics.SkillsCloneFailures. Splitting the two keeps a bad
+// TATARA_EXTRA_SKILL_SOURCES entry, which is a per-project config error, off
+// the series that means the fleet-wide harness clone is failing.
+const (
+	skillsCloneSourceRepo  = "skills_repo"
+	skillsCloneSourceExtra = "extra"
+)
+
 // skillFrontmatter is the minimal YAML shape we care about in a SKILL.md header.
 type skillFrontmatter struct {
 	Profiles []string `yaml:"profiles"`
@@ -102,23 +119,25 @@ func cloneSkillsRepo(p Params, git GitRunner) error {
 		}
 	}
 
-	// Skip when already cloned (pod restart with persistent clone dir).
-	if _, err := os.Stat(filepath.Join(p.SkillsCloneDir, ".git")); err == nil {
+	// Reuse an existing clone only when the completion sentinel says the tree is
+	// finished AND holds the ref we were asked for. Anything else - no sentinel,
+	// a stale ref, an unreadable file - is re-cloned from scratch below.
+	if b, err := os.ReadFile(filepath.Join(p.SkillsCloneDir, skillsCloneSentinel)); err == nil &&
+		strings.TrimSpace(string(b)) == ref {
 		if p.Log != nil {
-			p.Log.Info("skills repo already cloned, skipping",
-				"action", "skills_clone", "dir", p.SkillsCloneDir)
+			p.Log.Info("skills repo already cloned at requested ref, skipping",
+				"action", "skills_clone", "dir", p.SkillsCloneDir, "ref", ref)
 		}
 		return nil
 	}
 
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		// Remove any partial state from a previous failed attempt so that
-		// "git init" does not see a pre-existing .git and so the .git stat
-		// guard above cannot be tripped by a half-initialised directory.
-		if attempt > 1 {
-			_ = os.RemoveAll(p.SkillsCloneDir)
-		}
+		// The directory contents are untrusted on every attempt: we only get
+		// here when the sentinel did not vouch for them, so they may be a
+		// half-initialised clone from a killed boot or a checkout of a
+		// different ref. Clear it so "git init"/"remote add" start clean.
+		_ = os.RemoveAll(p.SkillsCloneDir)
 		// SHA-ref-safe fetch sequence. "git clone -b <ref>" rejects raw commit
 		// SHAs ("Remote branch <sha> not found"); "git fetch origin <ref>" accepts
 		// branches, tags, and reachable commit SHAs uniformly (GitHub allows
@@ -135,6 +154,13 @@ func cloneSkillsRepo(p Params, git GitRunner) error {
 			}
 		}
 		if stepErr == nil {
+			// Sentinel last: it is the only thing a later boot trusts. A failure
+			// to write it costs a redundant re-clone, never a skipped one, so it
+			// warns rather than failing the boot.
+			if err := writeSkillsCloneSentinel(p.SkillsCloneDir, ref); err != nil && p.Log != nil {
+				p.Log.Warn("skills clone: sentinel write failed; next boot will re-clone",
+					"action", "skills_clone", "error", err)
+			}
 			if p.Log != nil {
 				p.Log.Info("skills repo cloned", "action", "skills_clone",
 					"repo", repo, "ref", ref, "dir", p.SkillsCloneDir)
@@ -156,9 +182,16 @@ func cloneSkillsRepo(p Params, git GitRunner) error {
 			"action", "skills_clone", "error", lastErr)
 	}
 	if p.M != nil {
-		p.M.SkillsCloneFailures.Inc()
+		p.M.SkillsCloneFailures.WithLabelValues(skillsCloneSourceRepo).Inc()
 	}
 	return nil
+}
+
+func writeSkillsCloneSentinel(dir, ref string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, skillsCloneSentinel), []byte(ref+"\n"), 0o644)
 }
 
 // extraSkillSource is one entry of TATARA_EXTRA_SKILL_SOURCES: a Project-scoped
@@ -286,7 +319,7 @@ func installExtraSkillSources(p Params, git GitRunner) error {
 					"action", "extra_skills", "source", s.Name, "error", err)
 			}
 			if p.M != nil {
-				p.M.SkillsCloneFailures.Inc()
+				p.M.SkillsCloneFailures.WithLabelValues(skillsCloneSourceExtra).Inc()
 			}
 			continue
 		}
@@ -320,10 +353,15 @@ func installExtraSkillSources(p Params, git GitRunner) error {
 // collision (custom overrides baked). An empty SkillProfile installs all skills
 // (fail-open). Skills whose profiles frontmatter field does not include the
 // active profile are skipped.
-func installSkills(p Params) error {
+//
+// Returns the number of skills installed. Render treats zero as fatal: it is
+// the only predicate that survives every way the harness skills can go missing
+// (clone failure, half-initialised clone dir, empty tree, profile matching
+// nothing) - notably including the ones where cloneSkillsRepo still returns nil.
+func installSkills(p Params) (int, error) {
 	dst := filepath.Join(p.Workspace, ".claude", "skills")
 	if err := os.MkdirAll(dst, 0o755); err != nil {
-		return fmt.Errorf("mkdir skills: %w", err)
+		return 0, fmt.Errorf("mkdir skills: %w", err)
 	}
 	total := 0
 	for _, src := range p.SkillsSrc {
@@ -335,7 +373,7 @@ func installSkills(p Params) error {
 		}
 		n, err := installSkillsFromSrc(src, dst, p)
 		if err != nil {
-			return fmt.Errorf("install skills from %s: %w", src, err)
+			return total, fmt.Errorf("install skills from %s: %w", src, err)
 		}
 		total += n
 	}
@@ -346,7 +384,19 @@ func installSkills(p Params) error {
 	if p.M != nil {
 		p.M.SkillsInstalled.WithLabelValues(p.SkillProfile).Add(float64(total))
 	}
-	return nil
+	return total, nil
+}
+
+// hasSkillsSrc reports whether any skill source is configured at all. When none
+// is, the zero-skill check is skipped: a deployment that deliberately runs
+// skill-less is not a broken boot.
+func hasSkillsSrc(p Params) bool {
+	for _, src := range p.SkillsSrc {
+		if src != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // installSkillsFromSrc walks src looking for skill dirs (dirs that directly

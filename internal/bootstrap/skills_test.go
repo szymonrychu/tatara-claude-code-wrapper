@@ -143,7 +143,7 @@ func TestInstallSkills_FiltersByProfile(t *testing.T) {
 		"---\nname: skill-d\n---\n# body")
 
 	ws := t.TempDir()
-	err := installSkills(Params{
+	_, err := installSkills(Params{
 		Workspace:    ws,
 		SkillsSrc:    []string{src},
 		SkillProfile: "implement",
@@ -165,7 +165,7 @@ func TestInstallSkills_EmptyProfile_InstallsAll(t *testing.T) {
 			fmt.Sprintf("---\nname: %s\nprofiles: [\"implement\"]\n---\n# body", name))
 	}
 	ws := t.TempDir()
-	err := installSkills(Params{
+	_, err := installSkills(Params{
 		Workspace:    ws,
 		SkillsSrc:    []string{src},
 		SkillProfile: "", // empty = fail-open, install all
@@ -194,7 +194,7 @@ func TestInstallSkills_CategoryLayout_FiltersCorrectly(t *testing.T) {
 		"---\nname: tatara-guardrails\nprofiles: [\"brainstorm\"]\n---\n# body")
 
 	ws := t.TempDir()
-	err := installSkills(Params{
+	_, err := installSkills(Params{
 		Workspace:    ws,
 		SkillsSrc:    []string{src},
 		SkillProfile: "implement",
@@ -226,7 +226,7 @@ func TestInstallSkills_PreservesExecutableBit(t *testing.T) {
 	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755))
 
 	ws := t.TempDir()
-	require.NoError(t, installSkills(Params{Workspace: ws, SkillsSrc: []string{src}}))
+	mustInstallSkills(t, Params{Workspace: ws, SkillsSrc: []string{src}})
 
 	dst := filepath.Join(ws, ".claude", "skills", "my-skill", "start-server.sh")
 	info, err := os.Stat(dst)
@@ -249,7 +249,7 @@ func TestInstallSkills_LogsShadowedSkill(t *testing.T) {
 	ws := t.TempDir()
 	var logBuf strings.Builder
 	log := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	require.NoError(t, installSkills(Params{Workspace: ws, SkillsSrc: []string{src1, src2}, Log: log}))
+	mustInstallSkills(t, Params{Workspace: ws, SkillsSrc: []string{src1, src2}, Log: log})
 	require.Contains(t, logBuf.String(), "my-skill")
 }
 
@@ -262,7 +262,7 @@ func TestInstallSkills_CopiesDeployHarness(t *testing.T) {
 	mustWriteFile(t, filepath.Join(skillDir, "SKILL.md"), "---\nname: tatara-deploy-harness\n---\n")
 
 	ws := t.TempDir()
-	require.NoError(t, installSkills(Params{Workspace: ws, SkillsSrc: []string{src}}))
+	mustInstallSkills(t, Params{Workspace: ws, SkillsSrc: []string{src}})
 
 	got := filepath.Join(ws, ".claude", "skills", "tatara-deploy-harness", "SKILL.md")
 	require.FileExists(t, got)
@@ -294,18 +294,13 @@ func TestCloneSkillsRepo_FailOpen(t *testing.T) {
 	err := cloneSkillsRepo(p, stubGit)
 	require.NoError(t, err, "cloneSkillsRepo must be fail-open")
 
-	// Verify failure counter incremented once.
-	mf, err := reg.Gather()
-	require.NoError(t, err)
-	var failCount float64
-	for _, fam := range mf {
-		if fam.GetName() == "wrapper_skills_clone_failures_total" {
-			for _, mm := range fam.GetMetric() {
-				failCount += mm.GetCounter().GetValue()
-			}
-		}
-	}
-	require.Equal(t, float64(1), failCount, "clone failure counter must be 1")
+	// Verify failure counter incremented once, under the skills-repo source.
+	require.Equal(t, float64(1),
+		sumCounter(t, reg, "ccw_skills_clone_failures_total", map[string]string{"source": "skills_repo"}),
+		"clone failure counter must be 1 for source=skills_repo")
+	require.Equal(t, float64(0),
+		sumCounter(t, reg, "ccw_skills_clone_failures_total", map[string]string{"source": "extra"}),
+		"a skills-repo clone failure must not land on the extra-source series")
 }
 
 // TestCloneSkillsRepo_UsesFetchNotCloneB asserts that the git command sequence
@@ -374,16 +369,9 @@ func TestCloneSkillsRepo_SHARef_RetryOnFetchFailure(t *testing.T) {
 	require.Equal(t, 3, fetchCalls, "must have attempted fetch exactly 3 times")
 
 	// No failure counter since it ultimately succeeded.
-	mf, err := reg.Gather()
-	require.NoError(t, err)
-	for _, fam := range mf {
-		if fam.GetName() == "wrapper_skills_clone_failures_total" {
-			for _, mm := range fam.GetMetric() {
-				require.Equal(t, float64(0), mm.GetCounter().GetValue(),
-					"no failure counter when retries succeed")
-			}
-		}
-	}
+	require.Equal(t, float64(0),
+		sumCounter(t, reg, "ccw_skills_clone_failures_total", nil),
+		"no failure counter when retries succeed")
 }
 
 func TestCloneSkillsRepo_NoRepo_NoOp(t *testing.T) {
@@ -392,6 +380,182 @@ func TestCloneSkillsRepo_NoRepo_NoOp(t *testing.T) {
 	err := cloneSkillsRepo(Params{SkillsRepo: "", SkillsCloneDir: t.TempDir()}, stubGit)
 	require.NoError(t, err)
 	require.False(t, called, "no git calls when SkillsRepo is empty")
+}
+
+// ---- clone completion sentinel (issue #173, pre-mortem 4) ----
+//
+// A bare .git is not proof of a finished clone: a kill between "git init" and
+// "checkout --detach" leaves one behind, and with a persistent clone dir every
+// later boot in that container would skip the clone and install zero skills -
+// with cloneSkillsRepo returning nil and the failure counter never moving.
+// Reuse is now keyed on a sentinel written only after checkout succeeds.
+
+func TestCloneSkillsRepo_BareGitWithoutSentinel_ReClones(t *testing.T) {
+	cloneDir := filepath.Join(t.TempDir(), "skills-clone")
+	mustMkdir(t, filepath.Join(cloneDir, ".git"))
+
+	var cmds []string
+	stubGit := func(_ string, args ...string) error {
+		cmds = append(cmds, strings.Join(args, " "))
+		return nil
+	}
+	p := Params{SkillsRepo: "https://github.com/example/repo", SkillsRef: "main", SkillsCloneDir: cloneDir}
+	require.NoError(t, cloneSkillsRepo(p, stubGit))
+
+	require.NotEmpty(t, cmds, "a half-initialised clone dir must be re-cloned, not skipped")
+	require.NoDirExists(t, filepath.Join(cloneDir, ".git"),
+		"the stale .git must be removed before git init runs")
+}
+
+func TestCloneSkillsRepo_SentinelMatchingRef_Skips(t *testing.T) {
+	cloneDir := filepath.Join(t.TempDir(), "skills-clone")
+	mustMkdir(t, cloneDir)
+	mustWriteFile(t, filepath.Join(cloneDir, skillsCloneSentinel), "main\n")
+
+	var cmds []string
+	stubGit := func(_ string, args ...string) error {
+		cmds = append(cmds, strings.Join(args, " "))
+		return nil
+	}
+	p := Params{SkillsRepo: "https://github.com/example/repo", SkillsRef: "main", SkillsCloneDir: cloneDir}
+	require.NoError(t, cloneSkillsRepo(p, stubGit))
+	require.Empty(t, cmds, "a completed clone at the requested ref must be reused")
+}
+
+func TestCloneSkillsRepo_SentinelDifferentRef_ReClones(t *testing.T) {
+	cloneDir := filepath.Join(t.TempDir(), "skills-clone")
+	mustMkdir(t, cloneDir)
+	mustWriteFile(t, filepath.Join(cloneDir, skillsCloneSentinel), "v1.2.3")
+
+	var cmds []string
+	stubGit := func(_ string, args ...string) error {
+		cmds = append(cmds, strings.Join(args, " "))
+		return nil
+	}
+	p := Params{SkillsRepo: "https://github.com/example/repo", SkillsRef: "main", SkillsCloneDir: cloneDir}
+	require.NoError(t, cloneSkillsRepo(p, stubGit))
+	require.NotEmpty(t, cmds, "a ref change between restarts must re-clone")
+	require.Equal(t, "main", readSentinel(t, cloneDir), "sentinel must be rewritten to the new ref")
+}
+
+func TestCloneSkillsRepo_WritesSentinelOnlyAfterCheckout(t *testing.T) {
+	orig := SkillsCloneRetryDelay
+	SkillsCloneRetryDelay = func(int) {}
+	defer func() { SkillsCloneRetryDelay = orig }()
+
+	// Checkout always fails: the clone never completes, so no sentinel.
+	failDir := filepath.Join(t.TempDir(), "skills-clone")
+	failGit := func(_ string, args ...string) error {
+		if len(args) > 0 && args[0] == "checkout" {
+			return fmt.Errorf("simulated checkout failure")
+		}
+		return nil
+	}
+	require.NoError(t, cloneSkillsRepo(Params{
+		SkillsRepo: "https://github.com/example/repo", SkillsRef: "main", SkillsCloneDir: failDir,
+	}, failGit))
+	require.NoFileExists(t, filepath.Join(failDir, skillsCloneSentinel),
+		"a clone that never reached checkout must not be marked complete")
+
+	okDir := filepath.Join(t.TempDir(), "skills-clone")
+	okGit := func(_ string, _ ...string) error { return nil }
+	require.NoError(t, cloneSkillsRepo(Params{
+		SkillsRepo: "https://github.com/example/repo", SkillsRef: "abc1234", SkillsCloneDir: okDir,
+	}, okGit))
+	require.Equal(t, "abc1234", readSentinel(t, okDir))
+}
+
+// ---- zero-skill boot is fatal (issue #173, B1) ----
+
+// renderParams is a minimal Render input; each test sets the skills fields.
+func renderParams(t *testing.T) Params {
+	t.Helper()
+	return Params{
+		HomeDir:        t.TempDir(),
+		Workspace:      t.TempDir(),
+		BaseMCP:        []byte(`{"mcpServers":{}}`),
+		HookCommand:    "/usr/local/bin/cc-stop-hook",
+		PermissionMode: "bypassPermissions",
+	}
+}
+
+func noopGit(_ string, _ ...string) error { return nil }
+
+// TestRender_ZeroSkillsWithSkillsSrc_Fails is the fail-open fix: a boot that
+// installed no skills is a different agent, not a degraded one (no council
+// harness, no guardrails, no TDD skill), and must not be stamped ok.
+func TestRender_ZeroSkillsWithSkillsSrc_Fails(t *testing.T) {
+	p := renderParams(t)
+	src := t.TempDir() // exists, contains no skill dirs
+	p.SkillsSrc = []string{src}
+
+	err := Render(p, noopGit)
+	require.Error(t, err, "Render must fail when SkillsSrc is configured but nothing installed")
+	require.Contains(t, err.Error(), "skills")
+	require.NoFileExists(t, filepath.Join(p.Workspace, workspaceIdentityFile),
+		"workspace identity must not be stamped for a zero-skill boot")
+}
+
+// The predicate is the installed count, never cloneSkillsRepo's return: a
+// profile that matches no skill installs zero and is equally fatal.
+func TestRender_ProfileMatchesNoSkill_Fails(t *testing.T) {
+	p := renderParams(t)
+	src := t.TempDir()
+	mustMkdir(t, filepath.Join(src, "brainstorm-only"))
+	mustWriteFile(t, filepath.Join(src, "brainstorm-only", "SKILL.md"),
+		"---\nname: brainstorm-only\nprofiles: [\"brainstorm\"]\n---\n")
+	p.SkillsSrc = []string{src}
+	p.SkillProfile = "implement"
+
+	require.Error(t, Render(p, noopGit))
+}
+
+func TestRender_SkillsInstalled_Succeeds(t *testing.T) {
+	p := renderParams(t)
+	src := t.TempDir()
+	mustMkdir(t, filepath.Join(src, "my-skill"))
+	mustWriteFile(t, filepath.Join(src, "my-skill", "SKILL.md"),
+		"---\nname: my-skill\nprofiles: [\"implement\"]\n---\n")
+	p.SkillsSrc = []string{src}
+	p.SkillProfile = "implement"
+
+	require.NoError(t, Render(p, noopGit))
+	require.FileExists(t, filepath.Join(p.Workspace, ".claude", "skills", "my-skill", "SKILL.md"))
+}
+
+// Escape hatch: a deployment that deliberately configures no skill source is
+// unaffected by the zero-skill check.
+func TestRender_NoSkillsSrc_SkipsZeroSkillCheck(t *testing.T) {
+	p := renderParams(t)
+	p.SkillsSrc = []string{"", ""}
+	require.NoError(t, Render(p, noopGit))
+}
+
+// An extra project source cannot substitute for the harness skills: the
+// predicate counts installSkills alone.
+func TestRender_OnlyExtraSkillSources_StillFails(t *testing.T) {
+	p := renderParams(t)
+	src := t.TempDir()
+	p.SkillsSrc = []string{src}
+	p.ExtraSkillSources = []byte(`[{"name":"proj","url":"https://example.com/proj","ref":"main"}]`)
+
+	extraGit := func(dir string, args ...string) error {
+		// Materialise a skill in the extra source's checkout.
+		if len(args) > 0 && args[0] == "checkout" {
+			mustMkdir(t, filepath.Join(dir, "proj-skill"))
+			mustWriteFile(t, filepath.Join(dir, "proj-skill", "SKILL.md"), "---\nname: proj-skill\n---\n")
+		}
+		return nil
+	}
+	require.Error(t, Render(p, extraGit),
+		"a project extra source must not satisfy the harness-skills floor")
+}
+
+func readSentinel(t *testing.T, dir string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, skillsCloneSentinel))
+	require.NoError(t, err)
+	return strings.TrimSpace(string(b))
 }
 
 func TestRender_SkillsCloneFailure_BootContinues(t *testing.T) {
@@ -428,32 +592,61 @@ func TestInstallSkills_MetricCounted(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	m := metrics.New(reg)
-	err := installSkills(Params{
+	n, err := installSkills(Params{
 		Workspace:    t.TempDir(),
 		SkillsSrc:    []string{src},
 		SkillProfile: "implement",
 		M:            m,
 	})
 	require.NoError(t, err)
+	require.Equal(t, 1, n, "installSkills must return the installed count")
 
+	require.Equal(t, float64(1),
+		sumCounter(t, reg, "ccw_skills_installed_total", map[string]string{"profile": "implement"}),
+		"installed counter for profile=implement must be 1")
+}
+
+// ---- helpers ----
+
+func mustInstallSkills(t *testing.T, p Params) int {
+	t.Helper()
+	n, err := installSkills(p)
+	require.NoError(t, err)
+	return n
+}
+
+// sumCounter sums every counter in family name whose labels match want. A
+// family with no children at all sums to 0 rather than failing, so it reads
+// the same whether the CounterVec was never touched or was touched with other
+// label values.
+func sumCounter(t *testing.T, reg *prometheus.Registry, name string, want map[string]string) float64 {
+	t.Helper()
 	mf, err := reg.Gather()
 	require.NoError(t, err)
 	var total float64
 	for _, fam := range mf {
-		if fam.GetName() == "wrapper_skills_installed_total" {
-			for _, mm := range fam.GetMetric() {
-				for _, l := range mm.GetLabel() {
-					if l.GetName() == "profile" && l.GetValue() == "implement" {
-						total += mm.GetCounter().GetValue()
-					}
+		if fam.GetName() != name {
+			continue
+		}
+		for _, mm := range fam.GetMetric() {
+			got := make(map[string]string, len(mm.GetLabel()))
+			for _, l := range mm.GetLabel() {
+				got[l.GetName()] = l.GetValue()
+			}
+			match := true
+			for k, v := range want {
+				if got[k] != v {
+					match = false
+					break
 				}
+			}
+			if match {
+				total += mm.GetCounter().GetValue()
 			}
 		}
 	}
-	require.Equal(t, float64(1), total, "installed counter for profile=implement must be 1")
+	return total
 }
-
-// ---- helpers ----
 
 func mustMkdir(t *testing.T, path string) {
 	t.Helper()

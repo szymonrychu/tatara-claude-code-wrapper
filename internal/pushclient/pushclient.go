@@ -192,8 +192,19 @@ func (p *Pusher) endpoint() string {
 	return p.cfg.URL + sep + q.Encode()
 }
 
-// pushAllowedPrefixes are the wrapper-owned metric-name prefixes the operator's
-// push-receiver accepts. The wrapper's registry also carries the Go and process
+// pushAllowedPrefixes are the metric-name prefixes this wrapper pushes. It is
+// deliberately NARROWER than the operator's receiver allowlist, which also
+// admits wrapper_/agent_ - it is not a mirror of it, and the two are not
+// reconciled anywhere. That asymmetry is only safe because nothing the wrapper
+// registers may fall outside this list: an agent pod has no scrape target, so a
+// family this filter drops never reaches Prometheus by any route, and because
+// allowlisted() runs ahead of the wire the operator's
+// operator_push_series_dropped_total cannot witness the drop either. Three
+// families shipped outside it and stayed dark until issue #173.
+// TestEveryRegisteredFamilyIsPushAllowed enforces the invariant; keep it green
+// rather than widening this list ad hoc.
+//
+// The wrapper's registry also carries the Go and process
 // runtime collectors (shared with the /metrics endpoint), but the operator drops
 // those families as reserved_name - they would collide with its own collectors on
 // the shared registry - so pushing them is pure waste and pollutes
