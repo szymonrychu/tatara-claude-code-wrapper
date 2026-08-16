@@ -23,6 +23,7 @@ type callbackPayload struct {
 	DurationSeconds float64                    `json:"durationSeconds"`
 	Usage           json.RawMessage            `json:"usage,omitempty"`
 	PushedRepos     []string                   `json:"pushedRepos,omitempty"`
+	FailedRepos     []string                   `json:"failedRepos,omitempty"`
 	InternalIssues  []turn.InternalIssueReport `json:"internalIssues,omitempty"`
 }
 
@@ -45,6 +46,7 @@ func newCallbackPayload(rec *turn.Record, taskName string) callbackPayload {
 		DurationSeconds: dur,
 		Usage:           rec.Usage,
 		PushedRepos:     rec.PushedRepos,
+		FailedRepos:     rec.FailedRepos,
 		InternalIssues:  rec.InternalIssues,
 	}
 }
