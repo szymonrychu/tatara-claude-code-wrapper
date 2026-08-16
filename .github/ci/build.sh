@@ -29,7 +29,7 @@ BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # TATARA_CLI_VERSION pins the cli SHA baked into the image; keep in sync with
 # Dockerfile ARG default and Makefile default.  Use the short SHA published by
 # tatara-cli CI (both SHORT_SHA and VERSION tags are pushed on every main merge).
-TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-v2.1.0}"
+TATARA_CLI_VERSION="${TATARA_CLI_VERSION:-v2.2.0}"
 # There is deliberately NO TATARA_SKILLS_REF default here, and the build below
 # passes no build-arg for it (tatara-helmfile#397). The skills->wrapper
 # cd-release bump rewrites the DOCKERFILE ARG only, so a default here could
