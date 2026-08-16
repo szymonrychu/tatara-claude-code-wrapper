@@ -85,6 +85,10 @@ GLOBAL_CLAUDE_MD_PATH: "/etc/wrapper/global-claude.md"
 PROJECT_CLAUDE_MD_PATH: "/etc/wrapper/project-claude.md"
 MCP_BASE_PATH: "/etc/wrapper/mcp-base.json"
 MCP_OVERLAY_DIR: "/etc/wrapper/mcp.d"
-SKILLS_SRC_DIRS: "/templates/skills:/etc/wrapper/skills"
+{{- /* skillsCloneDir takes filepath.Dir of the FIRST entry as the boot-clone
+target, so this must keep the parent-of-skills shape and match
+cmd/wrapper/config.go's default. The old leading /templates/skills was deleted
+from the image in 2026-06-28 and derived a clone target of /templates. */}}
+SKILLS_SRC_DIRS: "/etc/wrapper/skills/skills"
 ALLOWED_TOOLS_PATH: "/etc/wrapper/allowed-tools.txt"
 {{- end -}}
