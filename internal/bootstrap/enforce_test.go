@@ -121,7 +121,7 @@ func TestCommitAndPushAll_PushesEachRepoOnItsNamespaceDir(t *testing.T) {
 		{Name: "tatara-cli", URL: "https://github.com/szymonrychu/tatara-cli.git"},
 		{Name: "helmfile", URL: "https://gitlab.com/szymonrychu/infra/helmfile.git"},
 	}
-	_, err := bootstrap.CommitAndPushAll("/ws", repos, "tatara/task-x", "msg", git, nil, nil)
+	_, _, err := bootstrap.CommitAndPushAll("/ws", repos, "tatara/task-x", "msg", git, nil, nil)
 	require.NoError(t, err)
 	var s []string
 	for _, c := range calls {

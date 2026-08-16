@@ -95,9 +95,10 @@ func TestCommitAndPushAll_SkipsEmptyNamespace(t *testing.T) {
 		{Name: "bad-empty", URL: ""},                   // namespacePath returns ""
 		{Name: "bad-host", URL: "https://github.com/"}, // single-segment -> ""
 	}
-	pushedRepos, err := bootstrap.CommitAndPushAll("/tmp/ws", repos, "feat/x", "msg", fakeGit, nil, nil)
+	pushedRepos, failedRepos, err := bootstrap.CommitAndPushAll("/tmp/ws", repos, "feat/x", "msg", fakeGit, nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, []string{"good"}, pushedRepos, "only the valid-namespace repo must be reported pushed")
+	require.Empty(t, failedRepos, "a skipped namespace-less repo was never attempted, so it did not fail")
 
 	// Only the good repo should have had git add/commit/push
 	addCalls := callsContainingAll(calls, "add")
@@ -182,7 +183,8 @@ func TestCommitAndPushAll_ReturnsOnlyDirtyRepos(t *testing.T) {
 		{Name: "dirty", URL: "https://github.com/owner/dirtyrepo"},
 		{Name: "clean", URL: "https://github.com/owner/cleanrepo"},
 	}
-	pushed, err := bootstrap.CommitAndPushAll("/tmp/ws", repos, "feat/x", "msg", fakeGit, nil, nil)
+	pushed, failed, err := bootstrap.CommitAndPushAll("/tmp/ws", repos, "feat/x", "msg", fakeGit, nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, []string{"dirty"}, pushed)
+	require.Empty(t, failed)
 }

@@ -46,6 +46,14 @@ type Record struct {
 	// which repos were touched in a multi-repo task (Defect A). Empty/absent for
 	// a turn that pushed nothing or a single-repo task with no diff.
 	PushedRepos []string `json:"pushedRepos,omitempty"`
+	// FailedRepos is the set of project repos whose commit/push FAILED this turn
+	// (issue #167). The turn-end loop attempts every repo rather than aborting on
+	// the first error, so a short PushedRepos list no longer means "nothing to
+	// push" - it can mean work was lost. This field is what tells the operator
+	// which, and it is the one the next pod most needs: the workspace is
+	// ephemeral, so a repo that failed to push holds commits that survive
+	// nowhere.
+	FailedRepos []string `json:"failedRepos,omitempty"`
 	// InternalIssues is the set of report_internal_issue calls the agent made
 	// during this turn, drained from the transcript Tailer's per-turn
 	// accumulator by cmd/wrapper/app.go before delivery. Empty/absent when the
