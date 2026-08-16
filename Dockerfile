@@ -22,7 +22,7 @@ ARG TATARA_CLI_VERSION=v2.1.0
 # the skills->wrapper cd-release bump can rewrite this line (mirrors
 # TATARA_CLI_VERSION). The Go default (cmd/wrapper/config.go) stays "main" for
 # local dev; in the image this ENV pins it.
-ARG TATARA_SKILLS_REF=v2.2.0
+ARG TATARA_SKILLS_REF=v2.3.0
 # renovate: repository=jdx/mise
 ARG MISE_VERSION=v2026.6.3
 # Read-only dependency discovery for the `upgrade` agent kind (shelled out to,
