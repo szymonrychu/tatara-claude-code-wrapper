@@ -24,6 +24,9 @@ chart="charts/tatara-claude-code-wrapper"
 render="$(helm template release "$chart")"
 
 home="$(sed -n 's/^ENV HOME=\([^[:space:]]*\).*/\1/p' Dockerfile | head -1)"
+home="${home%\"}"
+home="${home#\"}"
+home="${home%/}"
 if [ -z "${home}" ]; then
   echo "could not read 'ENV HOME=' from Dockerfile - this guard derives the writable root from it" >&2
   exit 1
@@ -38,7 +41,22 @@ if [ -z "${src}" ]; then
   exit 1
 fi
 
-first="${src%%:*}"
+# Mirror skillsCloneDir (cmd/wrapper/app.go): the FIRST NON-EMPTY colon-separated
+# entry decides, not field 1. A leading ":" would otherwise have this guard
+# reporting a clone dir the wrapper never uses.
+first=""
+IFS=: read -r -a entries <<<"${src}"
+for e in "${entries[@]}"; do
+  if [ -n "${e}" ]; then
+    first="${e}"
+    break
+  fi
+done
+if [ -z "${first}" ]; then
+  echo "SKILLS_SRC_DIRS=${src} has no non-empty entry; the wrapper would fall back to its" >&2
+  echo "hardcoded /etc/wrapper/skills, which is inside the read-only 'files' ConfigMap mount." >&2
+  exit 1
+fi
 clone_dir="$(dirname "${first}")"
 clone_parent="$(dirname "${clone_dir}")"
 
@@ -49,16 +67,29 @@ fail=0
 #    to uid 10001 and that the chart never mounts over. HOME-only is deliberate:
 #    /workspace is writable too, but it is the agent's repo checkout area, walked
 #    by CommitAndPushAll and PVC-backed in this chart.
-case "${clone_dir}/" in
-"${home}"/*) ;;
+#    "?*" not "*": HOME ITSELF is not an acceptable clone dir. /home/agent/skills
+#    would put .staging at /home/agent.staging, i.e. in /home, which is root-owned
+#    and never chowned - the same EACCES the "/templates" value produced.
+case "${clone_dir}" in
+"${home}"/?*) ;;
 *)
   echo "SKILLS_SRC_DIRS=${src} puts the skills clone dir at ${clone_dir}," >&2
-  echo "which is not under the image's HOME (${home}) and so is not writable by uid 10001." >&2
+  echo "which is not strictly under the image's HOME (${home}), so either it or its" >&2
+  echo ".staging sibling is not writable by uid 10001." >&2
   fail=1
   ;;
 esac
 
 mount_paths="$(printf '%s\n' "${render}" | sed -n 's/^[[:space:]]*mountPath:[[:space:]]*"\?\([^"]*\)"\?[[:space:]]*$/\1/p' | sort -u)"
+# The rendered deployment always carries at least the `files` and `workspace`
+# mounts. An empty extraction means the sed stopped matching (e.g. mounts became
+# flow-style through a toYaml), which would make both checks below pass
+# vacuously while still printing "ok".
+if [ -z "${mount_paths}" ]; then
+  echo "extracted no mountPath from the rendered chart - the shadowing checks below" >&2
+  echo "would pass vacuously. Fix the extraction rather than the chart." >&2
+  exit 1
+fi
 while IFS= read -r mp; do
   [ -n "${mp}" ] || continue
   mp="${mp%/}"

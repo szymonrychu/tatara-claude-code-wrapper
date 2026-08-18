@@ -44,6 +44,7 @@ jobs:
   # anyway, so nothing here ever asserted on what the render actually contains -
   # which is how two successive broken SKILLS_SRC_DIRS values shipped.
   chart-guard:
+    needs: [pin-guard]
     runs-on: tatara-claude-code-wrapper
     steps:
       - uses: actions/checkout@v4

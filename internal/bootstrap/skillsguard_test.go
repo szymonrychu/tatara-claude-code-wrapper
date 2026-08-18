@@ -310,16 +310,24 @@ func TestRender_ZeroSkillsLogsErrorWitness(t *testing.T) {
 	var logBuf bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
+	src := filepath.Join(t.TempDir(), "empty-clone")
 	err := Render(Params{
-		HomeDir:   t.TempDir(),
-		Workspace: t.TempDir(),
-		SkillsSrc: []string{filepath.Join(t.TempDir(), "empty-clone")},
-		Log:       log,
+		HomeDir:      t.TempDir(),
+		Workspace:    t.TempDir(),
+		SkillsSrc:    []string{src},
+		SkillProfile: "council",
+		Log:          log,
 	}, func(string, ...string) error { return nil })
 	require.Error(t, err)
 
 	var line map[string]any
-	for _, raw := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
+	for _, raw := range strings.Split(logBuf.String(), "\n") {
+		// Skip blanks rather than Unmarshal them: on the regression this test
+		// exists to catch the buffer can be empty, and "unexpected end of JSON
+		// input" would replace the message below that says what actually broke.
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
 		var rec map[string]any
 		require.NoError(t, json.Unmarshal([]byte(raw), &rec))
 		if rec["msg"] == "no skills installed; failing boot" {
@@ -328,5 +336,10 @@ func TestRender_ZeroSkillsLogsErrorWitness(t *testing.T) {
 	}
 	require.NotNil(t, line, "zero-skill boot logged no ERROR witness: %s", logBuf.String())
 	require.Equal(t, "ERROR", line["level"])
+	// Every field the deferred C1 alert has to key on, pinned here because that
+	// alert lives in another repo and cannot fail this build.
 	require.Equal(t, "install_skills", line["action"])
+	require.Equal(t, float64(0), line["count"])
+	require.Equal(t, []any{src}, line["sources"])
+	require.Equal(t, "council", line["profile"])
 }
