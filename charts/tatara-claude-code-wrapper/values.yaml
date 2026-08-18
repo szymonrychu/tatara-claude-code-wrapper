@@ -61,6 +61,13 @@ networkPolicy:
   # the scrape ingress rule rather than opening the API port cluster-wide.
   monitoringNamespace: ""
 
+# Both blocks are splatted into the pod spec verbatim. Two overrides break the
+# boot outright, because bootstrap.Render writes $HOME/.claude and boot-clones
+# the skills repo under $HOME before the pod ever serves /readyz: runAsUser
+# other than 10001 (HOME is mode 0755 owned by 10001 in the image), and
+# readOnlyRootFilesystem, which this chart has no writable volume to compensate
+# for. Neither is new - Render has always failed on the $HOME/.claude write -
+# but both now surface as a crashloop rather than a skill-less pod.
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 10001

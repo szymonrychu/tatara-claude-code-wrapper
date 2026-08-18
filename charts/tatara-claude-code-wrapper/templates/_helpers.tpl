@@ -85,6 +85,18 @@ GLOBAL_CLAUDE_MD_PATH: "/etc/wrapper/global-claude.md"
 PROJECT_CLAUDE_MD_PATH: "/etc/wrapper/project-claude.md"
 MCP_BASE_PATH: "/etc/wrapper/mcp-base.json"
 MCP_OVERLAY_DIR: "/etc/wrapper/mcp.d"
-SKILLS_SRC_DIRS: "/templates/skills:/etc/wrapper/skills"
+# Deliberately NOT cmd/wrapper/config.go's default (/etc/wrapper/skills/skills):
+# skillsCloneDir is filepath.Dir of the first entry, and this chart mounts the
+# `files` ConfigMap AT /etc/wrapper, which kubelet mounts read-only - so both the
+# clone dir and its .staging sibling would be unwritable. Agent pods keep the Go
+# default and are unaffected: the operator sets no SKILLS_SRC_DIRS and mounts
+# nothing over /etc/wrapper, which the image creates and chowns to uid 10001.
+#
+# HOME is the writable root here. Getting this wrong is a crashloop now that
+# Render fails on zero installed skills, and two successive values were wrong
+# with nothing to catch them ("/templates/skills", whose target died with the
+# baked skills on 2026-06-28, then the Go default above), hence the render
+# assertion in .github/ci/check-chart-skills-clone-dir.sh.
+SKILLS_SRC_DIRS: "/home/agent/skills/skills"
 ALLOWED_TOOLS_PATH: "/etc/wrapper/allowed-tools.txt"
 {{- end -}}

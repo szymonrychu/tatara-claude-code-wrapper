@@ -192,13 +192,21 @@ func (p *Pusher) endpoint() string {
 	return p.cfg.URL + sep + q.Encode()
 }
 
-// pushAllowedPrefixes are the wrapper-owned metric-name prefixes the operator's
-// push-receiver accepts. The wrapper's registry also carries the Go and process
-// runtime collectors (shared with the /metrics endpoint), but the operator drops
-// those families as reserved_name - they would collide with its own collectors on
-// the shared registry - so pushing them is pure waste and pollutes
+// pushAllowedPrefixes are the wrapper-owned metric-name prefixes this client
+// pushes. The wrapper's registry also carries the Go and process runtime
+// collectors (shared with the /metrics endpoint), but the operator drops those
+// families as reserved_name - they would collide with its own collectors on the
+// shared registry - so pushing them is pure waste and pollutes
 // operator_push_series_dropped_total. Filtering the push gatherer to these
 // prefixes keeps that counter a true signal (issue #59).
+//
+// This list is NARROWER than the receiver's, on purpose: it is the wrapper's own
+// naming contract, not a mirror of a value that lives in another repo's chart.
+// Agent pods have no scrape target, so anything it excludes does not exist as
+// far as Prometheus is concerned - and it is filtered here, a hop upstream of
+// operator_push_series_dropped_total, so nothing downstream can report the loss.
+// TestPushAllowlist_CoversEveryRegisteredFamily fails the build if a metric is
+// ever registered outside these prefixes again (issue #173).
 var pushAllowedPrefixes = []string{"ccw_", "tatara_wrapper_"}
 
 // allowlisted wraps g so Gather returns only families whose name matches a

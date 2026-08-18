@@ -76,11 +76,22 @@ func shouldInstall(activeProfile string, profiles []string) bool {
 	return false
 }
 
+// skillsRefSentinel is written into SkillsCloneDir holding the checked-out ref,
+// and only after checkout succeeds. It is the reuse predicate on a later boot:
+// a bare ".git exists" test cannot tell a completed checkout from a directory a
+// kill left behind between "git init" and "checkout --detach", which used to
+// install zero skills forever in that container, with cloneSkillsRepo returning
+// nil and nothing counted. It compares ref NAMES, so it catches a moved pin but
+// not a moved branch - reusing a stale "main" is the pre-existing behaviour and
+// is what tatara-helmfile#397 is about.
+const skillsRefSentinel = ".tatara-skills-ref"
+
 // cloneSkillsRepo shallow-clones SkillsRepo at SkillsRef into p.SkillsCloneDir.
 // Uses the same GitRunner + GIT_TOKEN credential-helper pattern as the main
 // repo clone. Retries 3x with exponential backoff. On total failure: logs WARN,
 // increments the failure counter, and returns nil (fail-open: boot proceeds
-// with whatever SkillsSrc entries exist or are already populated).
+// with whatever SkillsSrc entries exist or are already populated). Its return
+// is never the health predicate - Render keys on the installed skill count.
 func cloneSkillsRepo(p Params, git GitRunner) error {
 	repo := p.SkillsRepo
 	if repo == "" || p.SkillsCloneDir == "" {
@@ -102,33 +113,45 @@ func cloneSkillsRepo(p Params, git GitRunner) error {
 		}
 	}
 
-	// Skip when already cloned (pod restart with persistent clone dir).
-	if _, err := os.Stat(filepath.Join(p.SkillsCloneDir, ".git")); err == nil {
+	// Skip when the clone dir already holds a COMPLETED checkout of this exact
+	// ref (pod restart with persistent clone dir). Anything else - no sentinel,
+	// or a sentinel naming a different ref - is re-cloned from scratch below.
+	sentinel := filepath.Join(p.SkillsCloneDir, skillsRefSentinel)
+	if b, err := os.ReadFile(sentinel); err == nil && strings.TrimSpace(string(b)) == ref {
 		if p.Log != nil {
-			p.Log.Info("skills repo already cloned, skipping",
-				"action", "skills_clone", "dir", p.SkillsCloneDir)
+			p.Log.Info("skills repo already cloned at requested ref, skipping",
+				"action", "skills_clone", "dir", p.SkillsCloneDir, "ref", ref)
 		}
 		return nil
 	}
 
+	// The new tree is built in a sibling staging dir and promoted only once the
+	// checkout succeeds. Cloning in place would destroy a usable previous
+	// checkout BEFORE knowing whether the remote is reachable, and since Render
+	// now fails on zero skills that turns a survivable GitHub outage on a warm
+	// restart into a dead pod.
+	staging := filepath.Clean(p.SkillsCloneDir) + ".staging"
+	defer func() { _ = os.RemoveAll(staging) }()
+
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		// Remove any partial state from a previous failed attempt so that
-		// "git init" does not see a pre-existing .git and so the .git stat
-		// guard above cannot be tripped by a half-initialised directory.
-		if attempt > 1 {
-			_ = os.RemoveAll(p.SkillsCloneDir)
-		}
+		_ = os.RemoveAll(staging)
 		// SHA-ref-safe fetch sequence. "git clone -b <ref>" rejects raw commit
 		// SHAs ("Remote branch <sha> not found"); "git fetch origin <ref>" accepts
 		// branches, tags, and reachable commit SHAs uniformly (GitHub allows
 		// fetching any reachable SHA with --depth 1).
 		var stepErr error
 		for _, step := range []func() error{
-			func() error { return git("", "init", "-q", p.SkillsCloneDir) },
-			func() error { return git(p.SkillsCloneDir, "remote", "add", "origin", repo) },
-			func() error { return git(p.SkillsCloneDir, "fetch", "--depth", "1", "origin", ref) },
-			func() error { return git(p.SkillsCloneDir, "checkout", "-q", "--detach", "FETCH_HEAD") },
+			func() error { return git("", "init", "-q", staging) },
+			func() error { return git(staging, "remote", "add", "origin", repo) },
+			func() error { return git(staging, "fetch", "--depth", "1", "origin", ref) },
+			func() error { return git(staging, "checkout", "-q", "--detach", "FETCH_HEAD") },
+			// Stamped inside staging, so the sentinel can only ever ride along
+			// with a tree whose checkout ran to completion.
+			func() error {
+				return os.WriteFile(filepath.Join(staging, skillsRefSentinel), []byte(ref), 0o644)
+			},
+			func() error { return promoteSkillsClone(staging, p.SkillsCloneDir) },
 		} {
 			if stepErr = step(); stepErr != nil {
 				break
@@ -156,9 +179,32 @@ func cloneSkillsRepo(p Params, git GitRunner) error {
 			"action", "skills_clone", "error", lastErr)
 	}
 	if p.M != nil {
-		p.M.SkillsCloneFailures.Inc()
+		p.M.SkillsCloneFailures.WithLabelValues("skills_repo").Inc()
 	}
 	return nil
+}
+
+// promoteSkillsClone moves a completed staging clone onto dst. dst is only
+// destroyed when it is absent or is itself a skills clone (a .git or a sentinel
+// at its root): SkillsCloneDir is filepath.Dir of an operator-supplied
+// SKILLS_SRC_DIRS entry and is never validated, so a misconfiguration must not
+// let this delete a config mount. Refusing is fail-open - the boot continues
+// with whatever is already on disk, and Render's zero-skill check decides.
+func promoteSkillsClone(staging, dst string) error {
+	if _, err := os.Stat(dst); err == nil {
+		gitDir := filepath.Join(dst, ".git")
+		_, gitErr := os.Stat(gitDir)
+		_, sentErr := os.Stat(filepath.Join(dst, skillsRefSentinel))
+		if gitErr != nil && sentErr != nil {
+			return fmt.Errorf("refusing to replace %s: not a skills clone", dst)
+		}
+		if err := os.RemoveAll(dst); err != nil {
+			return fmt.Errorf("remove previous skills clone: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat %s: %w", dst, err)
+	}
+	return os.Rename(staging, dst)
 }
 
 // extraSkillSource is one entry of TATARA_EXTRA_SKILL_SOURCES: a Project-scoped
@@ -286,7 +332,7 @@ func installExtraSkillSources(p Params, git GitRunner) error {
 					"action", "extra_skills", "source", s.Name, "error", err)
 			}
 			if p.M != nil {
-				p.M.SkillsCloneFailures.Inc()
+				p.M.SkillsCloneFailures.WithLabelValues("extra").Inc()
 			}
 			continue
 		}
@@ -314,16 +360,31 @@ func installExtraSkillSources(p Params, git GitRunner) error {
 	return nil
 }
 
+// hasSkillsSrc reports whether any non-empty skill source directory was
+// configured. It is the escape hatch for Render's zero-skill check: a
+// deployment that deliberately runs skill-less sets none.
+func hasSkillsSrc(p Params) bool {
+	for _, src := range p.SkillsSrc {
+		if src != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // installSkills copies skill dirs from each SkillsSrc directory into
 // <workspace>/.claude/skills, filtered by p.SkillProfile. A skill dir is any
 // directory that directly contains a SKILL.md file. Later sources win on name
 // collision (custom overrides baked). An empty SkillProfile installs all skills
 // (fail-open). Skills whose profiles frontmatter field does not include the
 // active profile are skipped.
-func installSkills(p Params) error {
+//
+// Returns the number of skills installed. A missing source dir is still not an
+// error here; the count is the signal, and Render owns what zero means.
+func installSkills(p Params) (int, error) {
 	dst := filepath.Join(p.Workspace, ".claude", "skills")
 	if err := os.MkdirAll(dst, 0o755); err != nil {
-		return fmt.Errorf("mkdir skills: %w", err)
+		return 0, fmt.Errorf("mkdir skills: %w", err)
 	}
 	total := 0
 	for _, src := range p.SkillsSrc {
@@ -335,7 +396,7 @@ func installSkills(p Params) error {
 		}
 		n, err := installSkillsFromSrc(src, dst, p)
 		if err != nil {
-			return fmt.Errorf("install skills from %s: %w", src, err)
+			return total, fmt.Errorf("install skills from %s: %w", src, err)
 		}
 		total += n
 	}
@@ -346,7 +407,7 @@ func installSkills(p Params) error {
 	if p.M != nil {
 		p.M.SkillsInstalled.WithLabelValues(p.SkillProfile).Add(float64(total))
 	}
-	return nil
+	return total, nil
 }
 
 // installSkillsFromSrc walks src looking for skill dirs (dirs that directly

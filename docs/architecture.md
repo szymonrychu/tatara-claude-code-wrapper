@@ -79,8 +79,11 @@ either stateless (httpapi, webhook, bootstrap) or a plain store (turn).
    - `~/.claude.json` (0600): the no-dialog seed - `hasCompletedOnboarding`,
      `customApiKeyResponses.approved: ["<last 20 chars of ANTHROPIC_API_KEY>"]`,
      `projects["/workspace"].hasTrustDialogAccepted: true`;
-   - skills: baked (`/templates/skills`) + custom (`/etc/wrapper/skills`) copied
-     into `/workspace/.claude/skills`.
+   - skills: every `SKILLS_SRC_DIRS` entry copied into
+     `/workspace/.claude/skills`, later sources winning on name collision.
+     Nothing is baked into the image since the 20 baked skills were dropped on
+     2026-06-28, so the boot clone of `TATARA_SKILLS_REF` is the only source and
+     `Render` fails when it yields zero skills.
 3. **`session.Start`** spawns interactive `claude` under a PTY (no permission
    flag), starts a goroutine reading the PTY into the ring buffer, a goroutine
    `Wait`-ing on the process, and then runs `bootWait`.
@@ -222,6 +225,23 @@ JSON logs (`slog`) for every state transition and business action with
 - `ccw_hook_received_total` - counter
 - `ccw_turn_tokens_total{type="input|output|cache_read|cache_creation", model}` - counter (tokens summed across every assistant message of the turn; the last-message usage alone undercounts agentic turns)
 - `ccw_turn_cost_usd_total` - counter (cumulative turn cost; emitted only when `/workspace/result.json` carries `total_cost_usd`)
+- `ccw_skills_installed_total{profile}` - counter (skills written at boot)
+- `ccw_skills_clone_failures_total{source="skills_repo|extra"}` - counter
+- `ccw_agents_installed_total` - counter (typed subagent .md files written at boot)
+
+Every wrapper-owned family must start with `ccw_` or `tatara_wrapper_`. Agent
+pods have NO scrape target, so `internal/pushclient` is the only route to
+Prometheus and it drops anything outside those prefixes before the push -
+upstream of the operator's `operator_push_series_dropped_total`, so nothing
+downstream can report the loss. `TestPushAllowlist_CoversEveryRegisteredFamily`
+fails the build on a metric registered outside them.
+
+Nothing a FAILED boot counts is ever pushed: `Render` runs in `newApp` before
+the push client is constructed, so `ccw_skills_installed_total` is never
+observed at 0 and `ccw_bootstrap_render_total{result="fail"}` never leaves the
+pod. The witnesses for a boot failure are the structured ERROR log and the
+operator's `/readyz` respawn budget; alert on those, not on a boot-failure
+series that cannot appear.
 
 When claude exits unexpectedly, the last ~800 bytes of de-ANSI'd PTY output are
 logged as `pty_tail` - the single most useful field for diagnosing a boot or
