@@ -15,7 +15,7 @@ CLAUDE_CODE_VERSION ?= latest
 # drift - and it did, sitting at v2.1.0 while the Dockerfile was on v2.3.0,
 # overriding the CD-written value on every build. The `image` target below
 # passes no --build-arg for it, so the Dockerfile ARG default applies.
-TATARA_CLI_VERSION ?= v3.1.0
+TATARA_CLI_VERSION ?= v3.1.1
 IMAGE_REF := $(REGISTRY)/$(IMAGE_NAME):$(VERSION)
 MODPATH := github.com/szymonrychu/tatara-claude-code-wrapper
 
