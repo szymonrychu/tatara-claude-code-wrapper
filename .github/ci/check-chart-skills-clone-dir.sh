@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # The chart's SKILLS_SRC_DIRS decides where the boot clone lands: the wrapper
-# takes filepath.Dir of the FIRST entry as SkillsCloneDir, builds the new tree in
-# "<SkillsCloneDir>.staging" (a sibling), and promotes it with os.Rename. Since
-# Render now fails the boot on zero installed skills, a clone dir the pod cannot
-# write is no longer a skill-less boot - it is a CrashLoopBackOff.
+# takes filepath.Dir of the first non-empty entry as SkillsCloneDir, builds the
+# new tree in "<SkillsCloneDir>.staging" (a sibling), and promotes it with
+# os.Rename. Since Render now fails the boot on zero installed skills, a clone
+# dir the pod cannot write is no longer a skill-less boot - it is a
+# CrashLoopBackOff.
 #
 # Two values have already been wrong here and neither was caught by anything:
 # "/templates/skills" outlived the baked skills it named (dropped 2026-06-28) and
