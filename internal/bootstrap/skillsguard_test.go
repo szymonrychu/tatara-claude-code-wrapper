@@ -1,8 +1,12 @@
 package bootstrap
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -294,4 +298,35 @@ func TestCloneSkillsRepo_FailureCounterCarriesSourceLabel(t *testing.T) {
 		"ccw_skills_clone_failures_total", map[string]string{"source": "skills_repo"}))
 	require.Zero(t, counterWithLabel(t, reg,
 		"ccw_skills_clone_failures_total", map[string]string{"source": "extra"}))
+}
+
+// TestRender_ZeroSkillsLogsErrorWitness: with B1 the zero-skill boot is fatal,
+// so newApp returns before the push client is ever constructed and NO metric
+// from that boot reaches the operator - not ccw_skills_installed_total at 0, not
+// ccw_bootstrap_render_total{fail}. The structured ERROR line is therefore the
+// only in-pod witness the follow-up alert can key on; the existing "skills
+// installed" INFO line is the wrong severity for a condition that kills the pod.
+func TestRender_ZeroSkillsLogsErrorWitness(t *testing.T) {
+	var logBuf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	err := Render(Params{
+		HomeDir:   t.TempDir(),
+		Workspace: t.TempDir(),
+		SkillsSrc: []string{filepath.Join(t.TempDir(), "empty-clone")},
+		Log:       log,
+	}, func(string, ...string) error { return nil })
+	require.Error(t, err)
+
+	var line map[string]any
+	for _, raw := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
+		var rec map[string]any
+		require.NoError(t, json.Unmarshal([]byte(raw), &rec))
+		if rec["msg"] == "no skills installed; failing boot" {
+			line = rec
+		}
+	}
+	require.NotNil(t, line, "zero-skill boot logged no ERROR witness: %s", logBuf.String())
+	require.Equal(t, "ERROR", line["level"])
+	require.Equal(t, "install_skills", line["action"])
 }

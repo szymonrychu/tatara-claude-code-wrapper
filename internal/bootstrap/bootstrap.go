@@ -840,6 +840,19 @@ func Render(p Params, git GitRunner) error {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
 		}
+		// This log line, not a metric, is the witness. Failing here returns from
+		// newApp before the push client is constructed, so NOTHING this boot
+		// counted ever reaches the operator - ccw_skills_installed_total can
+		// never be observed at 0 and ccw_bootstrap_render_total{fail} never
+		// leaves the pod either. The rename in this same change buys
+		// observability for the happy path and for extra-source clone failures;
+		// the zero-skill case is witnessed by this line plus the operator's
+		// /readyz respawn budget, and the follow-up alert must be built on that
+		// rather than on a series that cannot appear.
+		if p.Log != nil {
+			p.Log.Error("no skills installed; failing boot", "action", "install_skills",
+				"count", 0, "sources", p.SkillsSrc, "profile", p.SkillProfile)
+		}
 		return fmt.Errorf("no skills installed from %v: the skills clone is missing or empty", p.SkillsSrc)
 	}
 	// Extra project skill sources (fail-open, per-source isolation): installed

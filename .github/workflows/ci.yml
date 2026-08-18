@@ -38,6 +38,21 @@ jobs:
       - name: guard TATARA_SKILLS_REF's single build-time source
         run: bash .github/ci/check-skills-pin-single-source.sh
 
+  # Kept OUT of pin-guard so that job stays a pure grep that fails first without
+  # installing a toolchain; this one needs helm to render. `ci / chart-validate`
+  # is off for this repo and only does `helm lint` + `helm template >/dev/null`
+  # anyway, so nothing here ever asserted on what the render actually contains -
+  # which is how two successive broken SKILLS_SRC_DIRS values shipped.
+  chart-guard:
+    runs-on: tatara-claude-code-wrapper
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - name: guard the chart's skills clone dir
+        run: bash .github/ci/check-chart-skills-clone-dir.sh
+
   ci:
     needs: [pin-guard]
     uses: szymonrychu/tatara-operator/.github/workflows/ci-shared.yml@v1.36.1

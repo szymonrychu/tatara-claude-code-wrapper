@@ -79,8 +79,11 @@ either stateless (httpapi, webhook, bootstrap) or a plain store (turn).
    - `~/.claude.json` (0600): the no-dialog seed - `hasCompletedOnboarding`,
      `customApiKeyResponses.approved: ["<last 20 chars of ANTHROPIC_API_KEY>"]`,
      `projects["/workspace"].hasTrustDialogAccepted: true`;
-   - skills: baked (`/templates/skills`) + custom (`/etc/wrapper/skills`) copied
-     into `/workspace/.claude/skills`.
+   - skills: every `SKILLS_SRC_DIRS` entry copied into
+     `/workspace/.claude/skills`, later sources winning on name collision.
+     Nothing is baked into the image since the 20 baked skills were dropped on
+     2026-06-28, so the boot clone of `TATARA_SKILLS_REF` is the only source and
+     `Render` fails when it yields zero skills.
 3. **`session.Start`** spawns interactive `claude` under a PTY (no permission
    flag), starts a goroutine reading the PTY into the ring buffer, a goroutine
    `Wait`-ing on the process, and then runs `bootWait`.
