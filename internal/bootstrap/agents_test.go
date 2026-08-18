@@ -99,7 +99,7 @@ func TestInstallAgents_MetricCounted(t *testing.T) {
 	require.NoError(t, err)
 	var total float64
 	for _, fam := range mf {
-		if fam.GetName() == "wrapper_agents_installed_total" {
+		if fam.GetName() == "ccw_agents_installed_total" {
 			for _, mm := range fam.GetMetric() {
 				total += mm.GetCounter().GetValue()
 			}

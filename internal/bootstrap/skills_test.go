@@ -143,7 +143,7 @@ func TestInstallSkills_FiltersByProfile(t *testing.T) {
 		"---\nname: skill-d\n---\n# body")
 
 	ws := t.TempDir()
-	err := installSkills(Params{
+	_, err := installSkills(Params{
 		Workspace:    ws,
 		SkillsSrc:    []string{src},
 		SkillProfile: "implement",
@@ -165,7 +165,7 @@ func TestInstallSkills_EmptyProfile_InstallsAll(t *testing.T) {
 			fmt.Sprintf("---\nname: %s\nprofiles: [\"implement\"]\n---\n# body", name))
 	}
 	ws := t.TempDir()
-	err := installSkills(Params{
+	_, err := installSkills(Params{
 		Workspace:    ws,
 		SkillsSrc:    []string{src},
 		SkillProfile: "", // empty = fail-open, install all
@@ -194,7 +194,7 @@ func TestInstallSkills_CategoryLayout_FiltersCorrectly(t *testing.T) {
 		"---\nname: tatara-guardrails\nprofiles: [\"brainstorm\"]\n---\n# body")
 
 	ws := t.TempDir()
-	err := installSkills(Params{
+	_, err := installSkills(Params{
 		Workspace:    ws,
 		SkillsSrc:    []string{src},
 		SkillProfile: "implement",
@@ -226,7 +226,8 @@ func TestInstallSkills_PreservesExecutableBit(t *testing.T) {
 	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755))
 
 	ws := t.TempDir()
-	require.NoError(t, installSkills(Params{Workspace: ws, SkillsSrc: []string{src}}))
+	_, err := installSkills(Params{Workspace: ws, SkillsSrc: []string{src}})
+	require.NoError(t, err)
 
 	dst := filepath.Join(ws, ".claude", "skills", "my-skill", "start-server.sh")
 	info, err := os.Stat(dst)
@@ -249,7 +250,8 @@ func TestInstallSkills_LogsShadowedSkill(t *testing.T) {
 	ws := t.TempDir()
 	var logBuf strings.Builder
 	log := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	require.NoError(t, installSkills(Params{Workspace: ws, SkillsSrc: []string{src1, src2}, Log: log}))
+	_, err := installSkills(Params{Workspace: ws, SkillsSrc: []string{src1, src2}, Log: log})
+	require.NoError(t, err)
 	require.Contains(t, logBuf.String(), "my-skill")
 }
 
@@ -262,7 +264,8 @@ func TestInstallSkills_CopiesDeployHarness(t *testing.T) {
 	mustWriteFile(t, filepath.Join(skillDir, "SKILL.md"), "---\nname: tatara-deploy-harness\n---\n")
 
 	ws := t.TempDir()
-	require.NoError(t, installSkills(Params{Workspace: ws, SkillsSrc: []string{src}}))
+	_, err := installSkills(Params{Workspace: ws, SkillsSrc: []string{src}})
+	require.NoError(t, err)
 
 	got := filepath.Join(ws, ".claude", "skills", "tatara-deploy-harness", "SKILL.md")
 	require.FileExists(t, got)
@@ -299,7 +302,7 @@ func TestCloneSkillsRepo_FailOpen(t *testing.T) {
 	require.NoError(t, err)
 	var failCount float64
 	for _, fam := range mf {
-		if fam.GetName() == "wrapper_skills_clone_failures_total" {
+		if fam.GetName() == "ccw_skills_clone_failures_total" {
 			for _, mm := range fam.GetMetric() {
 				failCount += mm.GetCounter().GetValue()
 			}
@@ -377,7 +380,7 @@ func TestCloneSkillsRepo_SHARef_RetryOnFetchFailure(t *testing.T) {
 	mf, err := reg.Gather()
 	require.NoError(t, err)
 	for _, fam := range mf {
-		if fam.GetName() == "wrapper_skills_clone_failures_total" {
+		if fam.GetName() == "ccw_skills_clone_failures_total" {
 			for _, mm := range fam.GetMetric() {
 				require.Equal(t, float64(0), mm.GetCounter().GetValue(),
 					"no failure counter when retries succeed")
@@ -428,7 +431,7 @@ func TestInstallSkills_MetricCounted(t *testing.T) {
 
 	reg := prometheus.NewRegistry()
 	m := metrics.New(reg)
-	err := installSkills(Params{
+	_, err := installSkills(Params{
 		Workspace:    t.TempDir(),
 		SkillsSrc:    []string{src},
 		SkillProfile: "implement",
@@ -440,7 +443,7 @@ func TestInstallSkills_MetricCounted(t *testing.T) {
 	require.NoError(t, err)
 	var total float64
 	for _, fam := range mf {
-		if fam.GetName() == "wrapper_skills_installed_total" {
+		if fam.GetName() == "ccw_skills_installed_total" {
 			for _, mm := range fam.GetMetric() {
 				for _, l := range mm.GetLabel() {
 					if l.GetName() == "profile" && l.GetValue() == "implement" {

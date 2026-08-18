@@ -817,13 +817,30 @@ func Render(p Params, git GitRunner) error {
 		return err
 	}
 	// cloneSkillsRepo is fail-open (always returns nil); discard the error
-	// explicitly so the intent is clear and errcheck linters are satisfied.
+	// explicitly so the intent is clear and errcheck linters are satisfied. Its
+	// return is not a health signal either way - a skipped clone over a
+	// half-populated dir also returns nil - so the check below keys on the
+	// installed count instead.
 	_ = cloneSkillsRepo(p, git)
-	if err := installSkills(p); err != nil {
+	installedSkills, err := installSkills(p)
+	if err != nil {
 		if p.M != nil {
 			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
 		}
 		return err
+	}
+	// A boot that configured skill sources and installed nothing produces a
+	// DIFFERENT agent, not a degraded one: no council harness, no guardrails, no
+	// TDD skill, no typed-subagent palette - while the operator's job text still
+	// names the skills the turn must invoke. Nothing is baked into the image, so
+	// the clone is the only source and there is no floor to fall back to. Fail
+	// loudly here rather than let the turn run and submit a wrong outcome.
+	// Configuring no SkillsSrc at all remains a deliberate skill-less boot.
+	if installedSkills == 0 && hasSkillsSrc(p) {
+		if p.M != nil {
+			p.M.BootstrapRenderTotal.WithLabelValues("fail").Inc()
+		}
+		return fmt.Errorf("no skills installed from %v: the skills clone is missing or empty", p.SkillsSrc)
 	}
 	// Extra project skill sources (fail-open, per-source isolation): installed
 	// after the baked skills so a project source can override a same-named

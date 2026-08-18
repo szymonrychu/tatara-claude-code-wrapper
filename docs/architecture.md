@@ -222,6 +222,16 @@ JSON logs (`slog`) for every state transition and business action with
 - `ccw_hook_received_total` - counter
 - `ccw_turn_tokens_total{type="input|output|cache_read|cache_creation", model}` - counter (tokens summed across every assistant message of the turn; the last-message usage alone undercounts agentic turns)
 - `ccw_turn_cost_usd_total` - counter (cumulative turn cost; emitted only when `/workspace/result.json` carries `total_cost_usd`)
+- `ccw_skills_installed_total{profile}` - counter (skills written at boot)
+- `ccw_skills_clone_failures_total{source="skills_repo|extra"}` - counter
+- `ccw_agents_installed_total` - counter (typed subagent .md files written at boot)
+
+Every wrapper-owned family must start with `ccw_` or `tatara_wrapper_`. Agent
+pods have NO scrape target, so `internal/pushclient` is the only route to
+Prometheus and it drops anything outside those prefixes before the push -
+upstream of the operator's `operator_push_series_dropped_total`, so nothing
+downstream can report the loss. `TestPushAllowlist_CoversEveryRegisteredFamily`
+fails the build on a metric registered outside them.
 
 When claude exits unexpectedly, the last ~800 bytes of de-ANSI'd PTY output are
 logged as `pty_tail` - the single most useful field for diagnosing a boot or

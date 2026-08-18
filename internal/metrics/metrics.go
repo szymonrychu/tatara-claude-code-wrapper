@@ -133,9 +133,12 @@ type Metrics struct {
 	TurnStallSuspected prometheus.Counter
 
 	// Skills delivery metrics (rule 13: boot-time clone and filter are fallible).
+	// These are ccw_-prefixed like every other wrapper family, and must stay that
+	// way: agent pods have no scrape target, so a name outside
+	// pushclient.pushAllowedPrefixes never reaches Prometheus at all (issue #173).
 	SkillsInstalled     *prometheus.CounterVec // label: profile
-	SkillsCloneFailures prometheus.Counter
-	AgentsInstalled     prometheus.Counter // total typed-agent .md files installed at boot
+	SkillsCloneFailures *prometheus.CounterVec // label: source=skills_repo|extra
+	AgentsInstalled     prometheus.Counter     // total typed-agent .md files installed at boot
 }
 
 func New(reg prometheus.Registerer) *Metrics {
@@ -225,11 +228,11 @@ func New(reg prometheus.Registerer) *Metrics {
 		TurnStallSuspected: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "ccw_turn_stall_suspected_total", Help: "Windows of a full TurnTimeout with no transcript activity on an in-flight turn. The wrapper no longer fails such turns; the operator decides."}),
 		SkillsInstalled: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "wrapper_skills_installed_total", Help: "Skills installed at boot by profile."}, []string{"profile"}),
-		SkillsCloneFailures: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "wrapper_skills_clone_failures_total", Help: "Skills repo boot-clone failures (after 3 retries)."}),
+			Name: "ccw_skills_installed_total", Help: "Skills installed at boot by profile."}, []string{"profile"}),
+		SkillsCloneFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_skills_clone_failures_total", Help: "Skill-source boot-clone failures, by source: skills_repo (the harness skills repo, after 3 retries) or extra (one TATARA_EXTRA_SKILL_SOURCES entry)."}, []string{"source"}),
 		AgentsInstalled: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "wrapper_agents_installed_total", Help: "Typed subagent .md files installed at boot."}),
+			Name: "ccw_agents_installed_total", Help: "Typed subagent .md files installed at boot."}),
 	}
 	reg.MustRegister(m.TurnsTotal, m.TurnDuration, m.TurnInFlight,
 		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal,

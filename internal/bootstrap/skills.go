@@ -76,11 +76,20 @@ func shouldInstall(activeProfile string, profiles []string) bool {
 	return false
 }
 
+// skillsRefSentinel is written into SkillsCloneDir holding the checked-out ref,
+// and only after checkout succeeds. It is the reuse predicate on a later boot:
+// a bare ".git exists" test cannot tell a completed checkout from a directory a
+// kill left behind between "git init" and "checkout --detach", and cannot tell
+// that the requested ref moved since the clone. Both cases used to install zero
+// skills forever, with cloneSkillsRepo returning nil and nothing counted.
+const skillsRefSentinel = ".tatara-skills-ref"
+
 // cloneSkillsRepo shallow-clones SkillsRepo at SkillsRef into p.SkillsCloneDir.
 // Uses the same GitRunner + GIT_TOKEN credential-helper pattern as the main
 // repo clone. Retries 3x with exponential backoff. On total failure: logs WARN,
 // increments the failure counter, and returns nil (fail-open: boot proceeds
-// with whatever SkillsSrc entries exist or are already populated).
+// with whatever SkillsSrc entries exist or are already populated). Its return
+// is never the health predicate - Render keys on the installed skill count.
 func cloneSkillsRepo(p Params, git GitRunner) error {
 	repo := p.SkillsRepo
 	if repo == "" || p.SkillsCloneDir == "" {
@@ -102,23 +111,24 @@ func cloneSkillsRepo(p Params, git GitRunner) error {
 		}
 	}
 
-	// Skip when already cloned (pod restart with persistent clone dir).
-	if _, err := os.Stat(filepath.Join(p.SkillsCloneDir, ".git")); err == nil {
+	// Skip when the clone dir already holds a COMPLETED checkout of this exact
+	// ref (pod restart with persistent clone dir). Anything else - no sentinel,
+	// or a sentinel naming a different ref - is re-cloned from scratch below.
+	sentinel := filepath.Join(p.SkillsCloneDir, skillsRefSentinel)
+	if b, err := os.ReadFile(sentinel); err == nil && strings.TrimSpace(string(b)) == ref {
 		if p.Log != nil {
-			p.Log.Info("skills repo already cloned, skipping",
-				"action", "skills_clone", "dir", p.SkillsCloneDir)
+			p.Log.Info("skills repo already cloned at requested ref, skipping",
+				"action", "skills_clone", "dir", p.SkillsCloneDir, "ref", ref)
 		}
 		return nil
 	}
 
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		// Remove any partial state from a previous failed attempt so that
-		// "git init" does not see a pre-existing .git and so the .git stat
-		// guard above cannot be tripped by a half-initialised directory.
-		if attempt > 1 {
-			_ = os.RemoveAll(p.SkillsCloneDir)
-		}
+		// Remove any partial state - from a previous attempt in this process, or
+		// from a container killed mid-clone - so that "git init" does not see a
+		// pre-existing .git.
+		_ = os.RemoveAll(p.SkillsCloneDir)
 		// SHA-ref-safe fetch sequence. "git clone -b <ref>" rejects raw commit
 		// SHAs ("Remote branch <sha> not found"); "git fetch origin <ref>" accepts
 		// branches, tags, and reachable commit SHAs uniformly (GitHub allows
@@ -135,6 +145,12 @@ func cloneSkillsRepo(p Params, git GitRunner) error {
 			}
 		}
 		if stepErr == nil {
+			// Stamped only here: the sentinel is the proof the checkout ran to
+			// completion, and is what the next boot's reuse test reads.
+			if err := os.WriteFile(sentinel, []byte(ref), 0o644); err != nil && p.Log != nil {
+				p.Log.Warn("skills clone: sentinel write failed; next boot will re-clone",
+					"action", "skills_clone", "error", err)
+			}
 			if p.Log != nil {
 				p.Log.Info("skills repo cloned", "action", "skills_clone",
 					"repo", repo, "ref", ref, "dir", p.SkillsCloneDir)
@@ -156,7 +172,7 @@ func cloneSkillsRepo(p Params, git GitRunner) error {
 			"action", "skills_clone", "error", lastErr)
 	}
 	if p.M != nil {
-		p.M.SkillsCloneFailures.Inc()
+		p.M.SkillsCloneFailures.WithLabelValues("skills_repo").Inc()
 	}
 	return nil
 }
@@ -286,7 +302,7 @@ func installExtraSkillSources(p Params, git GitRunner) error {
 					"action", "extra_skills", "source", s.Name, "error", err)
 			}
 			if p.M != nil {
-				p.M.SkillsCloneFailures.Inc()
+				p.M.SkillsCloneFailures.WithLabelValues("extra").Inc()
 			}
 			continue
 		}
@@ -314,16 +330,31 @@ func installExtraSkillSources(p Params, git GitRunner) error {
 	return nil
 }
 
+// hasSkillsSrc reports whether any non-empty skill source directory was
+// configured. It is the escape hatch for Render's zero-skill check: a
+// deployment that deliberately runs skill-less sets none.
+func hasSkillsSrc(p Params) bool {
+	for _, src := range p.SkillsSrc {
+		if src != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // installSkills copies skill dirs from each SkillsSrc directory into
 // <workspace>/.claude/skills, filtered by p.SkillProfile. A skill dir is any
 // directory that directly contains a SKILL.md file. Later sources win on name
 // collision (custom overrides baked). An empty SkillProfile installs all skills
 // (fail-open). Skills whose profiles frontmatter field does not include the
 // active profile are skipped.
-func installSkills(p Params) error {
+//
+// Returns the number of skills installed. A missing source dir is still not an
+// error here; the count is the signal, and Render owns what zero means.
+func installSkills(p Params) (int, error) {
 	dst := filepath.Join(p.Workspace, ".claude", "skills")
 	if err := os.MkdirAll(dst, 0o755); err != nil {
-		return fmt.Errorf("mkdir skills: %w", err)
+		return 0, fmt.Errorf("mkdir skills: %w", err)
 	}
 	total := 0
 	for _, src := range p.SkillsSrc {
@@ -335,7 +366,7 @@ func installSkills(p Params) error {
 		}
 		n, err := installSkillsFromSrc(src, dst, p)
 		if err != nil {
-			return fmt.Errorf("install skills from %s: %w", src, err)
+			return total, fmt.Errorf("install skills from %s: %w", src, err)
 		}
 		total += n
 	}
@@ -346,7 +377,7 @@ func installSkills(p Params) error {
 	if p.M != nil {
 		p.M.SkillsInstalled.WithLabelValues(p.SkillProfile).Add(float64(total))
 	}
-	return nil
+	return total, nil
 }
 
 // installSkillsFromSrc walks src looking for skill dirs (dirs that directly
