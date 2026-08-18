@@ -236,6 +236,13 @@ upstream of the operator's `operator_push_series_dropped_total`, so nothing
 downstream can report the loss. `TestPushAllowlist_CoversEveryRegisteredFamily`
 fails the build on a metric registered outside them.
 
+Nothing a FAILED boot counts is ever pushed: `Render` runs in `newApp` before
+the push client is constructed, so `ccw_skills_installed_total` is never
+observed at 0 and `ccw_bootstrap_render_total{result="fail"}` never leaves the
+pod. The witnesses for a boot failure are the structured ERROR log and the
+operator's `/readyz` respawn budget; alert on those, not on a boot-failure
+series that cannot appear.
+
 When claude exits unexpectedly, the last ~800 bytes of de-ANSI'd PTY output are
 logged as `pty_tail` - the single most useful field for diagnosing a boot or
 dialog regression.
