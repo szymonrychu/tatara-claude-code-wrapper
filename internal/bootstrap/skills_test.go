@@ -357,6 +357,11 @@ func TestCloneSkillsRepo_SHARef_RetryOnFetchFailure(t *testing.T) {
 	cloneDir := filepath.Join(t.TempDir(), "skills-clone")
 	fetchCalls := 0
 	stubGit := func(_ string, args ...string) error {
+		// Real "git init <dir>" creates the target; cloneSkillsRepo writes the
+		// sentinel into it before promoting, so the stub must too.
+		if len(args) > 2 && args[0] == "init" {
+			return os.MkdirAll(args[2], 0o755)
+		}
 		if len(args) > 0 && args[0] == "fetch" {
 			fetchCalls++
 			if fetchCalls < 3 {

@@ -85,6 +85,12 @@ GLOBAL_CLAUDE_MD_PATH: "/etc/wrapper/global-claude.md"
 PROJECT_CLAUDE_MD_PATH: "/etc/wrapper/project-claude.md"
 MCP_BASE_PATH: "/etc/wrapper/mcp-base.json"
 MCP_OVERLAY_DIR: "/etc/wrapper/mcp.d"
-SKILLS_SRC_DIRS: "/templates/skills:/etc/wrapper/skills"
+# Must stay in step with cmd/wrapper/config.go's default: skillsCloneDir takes
+# filepath.Dir of the first entry as the boot-clone target. The old
+# "/templates/skills:/etc/wrapper/skills" outlived the baked skills it pointed
+# at (dropped 2026-06-28) and made that target "/templates", which the pod's uid
+# cannot create - a skill-less boot before Render started failing on zero
+# skills, a crashloop after.
+SKILLS_SRC_DIRS: "/etc/wrapper/skills/skills"
 ALLOWED_TOOLS_PATH: "/etc/wrapper/allowed-tools.txt"
 {{- end -}}

@@ -109,6 +109,26 @@ func TestRender_SucceedsWhenSkillsInstalled(t *testing.T) {
 	}, func(string, ...string) error { return nil }))
 }
 
+// gitStub emulates the parts of git cloneSkillsRepo depends on: "init <dir>"
+// creates the target and its .git, "checkout" writes a marker file so a test can
+// tell one checkout from another. fetchErr, when non-nil, fails every fetch.
+func gitStub(t *testing.T, tree string, fetchErr error) (GitRunner, *bool) {
+	t.Helper()
+	fetched := false
+	return func(dir string, a ...string) error {
+		switch {
+		case len(a) > 2 && a[0] == "init":
+			return os.MkdirAll(filepath.Join(a[2], ".git"), 0o755)
+		case len(a) > 0 && a[0] == "fetch":
+			fetched = true
+			return fetchErr
+		case len(a) > 0 && a[0] == "checkout":
+			return os.WriteFile(filepath.Join(dir, "tree.txt"), []byte(tree), 0o644)
+		}
+		return nil
+	}, &fetched
+}
+
 // TestCloneSkillsRepo_ReclonesWhenSentinelMissing covers pre-mortem 4: a
 // container killed between "git init" and "checkout --detach" leaves .git
 // present and the tree empty. The old bare .git stat skip made every later boot
@@ -118,17 +138,13 @@ func TestCloneSkillsRepo_ReclonesWhenSentinelMissing(t *testing.T) {
 	cloneDir := filepath.Join(t.TempDir(), "skills-clone")
 	require.NoError(t, os.MkdirAll(filepath.Join(cloneDir, ".git"), 0o755))
 
-	var fetched bool
-	git := func(_ string, a ...string) error {
-		if len(a) > 0 && a[0] == "fetch" {
-			fetched = true
-		}
-		return nil
-	}
+	git, fetched := gitStub(t, "fresh", nil)
 	require.NoError(t, cloneSkillsRepo(Params{
 		SkillsRepo: "https://example.invalid/skills", SkillsRef: "v1", SkillsCloneDir: cloneDir,
 	}, git))
-	require.True(t, fetched, "half-initialised clone dir must be re-cloned, not reused")
+	require.True(t, *fetched, "half-initialised clone dir must be re-cloned, not reused")
+	requireFileContent(t, filepath.Join(cloneDir, skillsRefSentinel), "v1")
+	requireFileContent(t, filepath.Join(cloneDir, "tree.txt"), "fresh")
 }
 
 // TestCloneSkillsRepo_ReclonesWhenSentinelRefDiffers: the pin moved between
@@ -137,18 +153,71 @@ func TestCloneSkillsRepo_ReclonesWhenSentinelRefDiffers(t *testing.T) {
 	cloneDir := filepath.Join(t.TempDir(), "skills-clone")
 	require.NoError(t, os.MkdirAll(filepath.Join(cloneDir, ".git"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(cloneDir, skillsRefSentinel), []byte("v1"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(cloneDir, "tree.txt"), []byte("stale"), 0o644))
 
-	var fetched bool
-	git := func(_ string, a ...string) error {
-		if len(a) > 0 && a[0] == "fetch" {
-			fetched = true
-		}
-		return nil
-	}
+	git, fetched := gitStub(t, "fresh", nil)
 	require.NoError(t, cloneSkillsRepo(Params{
 		SkillsRepo: "https://example.invalid/skills", SkillsRef: "v2", SkillsCloneDir: cloneDir,
 	}, git))
-	require.True(t, fetched, "a ref change must re-clone")
+	require.True(t, *fetched, "a ref change must re-clone")
+	requireFileContent(t, filepath.Join(cloneDir, skillsRefSentinel), "v2")
+	requireFileContent(t, filepath.Join(cloneDir, "tree.txt"), "fresh")
+}
+
+// TestCloneSkillsRepo_KeepsExistingCloneWhenFetchFails is the offline floor. A
+// pod restarting onto a persistent clone dir written by an older wrapper has no
+// sentinel, so it re-clones - but clobbering the good tree BEFORE the fetch
+// would turn a survivable GitHub outage into a dead boot now that Render fails
+// on zero skills. The new tree is staged beside the old one and only promoted
+// once checkout succeeds.
+func TestCloneSkillsRepo_KeepsExistingCloneWhenFetchFails(t *testing.T) {
+	orig := SkillsCloneRetryDelay
+	SkillsCloneRetryDelay = func(int) {}
+	defer func() { SkillsCloneRetryDelay = orig }()
+
+	base := t.TempDir()
+	cloneDir := filepath.Join(base, "skills-clone")
+	require.NoError(t, os.MkdirAll(filepath.Join(cloneDir, ".git"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(cloneDir, "tree.txt"), []byte("previous"), 0o644))
+
+	git, _ := gitStub(t, "fresh", os.ErrPermission)
+	require.NoError(t, cloneSkillsRepo(Params{
+		SkillsRepo: "https://example.invalid/skills", SkillsRef: "v2", SkillsCloneDir: cloneDir,
+	}, git))
+
+	requireFileContent(t, filepath.Join(cloneDir, "tree.txt"), "previous")
+	require.NoFileExists(t, filepath.Join(cloneDir, skillsRefSentinel),
+		"a surviving old tree must not be stamped with the ref it does not hold")
+	entries, err := os.ReadDir(base)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "the staging dir must be cleaned up: %v", entries)
+}
+
+// TestCloneSkillsRepo_RefusesToReplaceNonCloneTarget: SkillsCloneDir is derived
+// by filepath.Dir from operator-supplied SKILLS_SRC_DIRS and is never validated.
+// Pointed at a config mount it would delete the wrapper's own inputs, so the
+// destructive promote runs only over an absent dir or a previous skills clone.
+func TestCloneSkillsRepo_RefusesToReplaceNonCloneTarget(t *testing.T) {
+	orig := SkillsCloneRetryDelay
+	SkillsCloneRetryDelay = func(int) {}
+	defer func() { SkillsCloneRetryDelay = orig }()
+
+	cloneDir := filepath.Join(t.TempDir(), "etc-wrapper")
+	require.NoError(t, os.MkdirAll(cloneDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(cloneDir, "allowed-tools.txt"), []byte("Bash"), 0o644))
+
+	git, _ := gitStub(t, "fresh", nil)
+	require.NoError(t, cloneSkillsRepo(Params{
+		SkillsRepo: "https://example.invalid/skills", SkillsRef: "v1", SkillsCloneDir: cloneDir,
+	}, git))
+	requireFileContent(t, filepath.Join(cloneDir, "allowed-tools.txt"), "Bash")
+}
+
+func requireFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, want, string(b))
 }
 
 // TestCloneSkillsRepo_ReusesCloneWhenSentinelMatches keeps the persistent-clone
@@ -175,20 +244,11 @@ func TestCloneSkillsRepo_ReusesCloneWhenSentinelMatches(t *testing.T) {
 // checkout completed, so it must not exist unless every git step succeeded.
 func TestCloneSkillsRepo_WritesSentinelAfterCheckout(t *testing.T) {
 	cloneDir := filepath.Join(t.TempDir(), "skills-clone")
-	git := func(dir string, a ...string) error {
-		if len(a) > 0 && a[0] == "init" {
-			return os.MkdirAll(filepath.Join(cloneDir, ".git"), 0o755)
-		}
-		_ = dir
-		return nil
-	}
+	git, _ := gitStub(t, "fresh", nil)
 	require.NoError(t, cloneSkillsRepo(Params{
 		SkillsRepo: "https://example.invalid/skills", SkillsRef: "abc123", SkillsCloneDir: cloneDir,
 	}, git))
-
-	b, err := os.ReadFile(filepath.Join(cloneDir, skillsRefSentinel))
-	require.NoError(t, err)
-	require.Equal(t, "abc123", string(b))
+	requireFileContent(t, filepath.Join(cloneDir, skillsRefSentinel), "abc123")
 }
 
 // TestCloneSkillsRepo_NoSentinelOnFailure guards the other half: a failed clone
@@ -199,12 +259,7 @@ func TestCloneSkillsRepo_NoSentinelOnFailure(t *testing.T) {
 	defer func() { SkillsCloneRetryDelay = orig }()
 
 	cloneDir := filepath.Join(t.TempDir(), "skills-clone")
-	git := func(_ string, a ...string) error {
-		if len(a) > 0 && a[0] == "fetch" {
-			return os.ErrPermission
-		}
-		return nil
-	}
+	git, _ := gitStub(t, "fresh", os.ErrPermission)
 	require.NoError(t, cloneSkillsRepo(Params{
 		SkillsRepo: "https://example.invalid/skills", SkillsRef: "abc123", SkillsCloneDir: cloneDir,
 	}, git))
