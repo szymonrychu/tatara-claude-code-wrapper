@@ -74,6 +74,7 @@ type config struct {
 	HomeDir                   string
 	ClaudePath                string
 	HookPath                  string
+	StatusLinePath            string
 	GlobalClaudeMdPath        string
 	ProjectClaudeMdPath       string
 	MCPBasePath               string
@@ -179,6 +180,7 @@ func loadConfig(args []string) (config, error) {
 		HomeDir:             envOr("HOME_DIR", os.Getenv("HOME")),
 		ClaudePath:          envOr("CLAUDE_PATH", "claude"),
 		HookPath:            envOr("HOOK_PATH", "/usr/local/bin/cc-stop-hook"),
+		StatusLinePath:      envOr("STATUSLINE_PATH", "/usr/local/bin/cc-statusline"),
 		GlobalClaudeMdPath:  envOr("GLOBAL_CLAUDE_MD_PATH", "/etc/wrapper/global-claude.md"),
 		ProjectClaudeMdPath: envOr("PROJECT_CLAUDE_MD_PATH", "/etc/wrapper/project-claude.md"),
 		MCPBasePath:         envOr("MCP_BASE_PATH", "/etc/wrapper/mcp-base.json"),

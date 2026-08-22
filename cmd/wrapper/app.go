@@ -19,6 +19,7 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/obs"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/pushclient"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/ratelimit"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/transcript"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
@@ -67,6 +68,38 @@ type app struct {
 	// per-turn goroutine.
 	heldIssuesMu       sync.Mutex
 	heldInternalIssues []turn.InternalIssueReport
+	// rateLimits holds the newest account-usage snapshot cmd/cc-statusline
+	// reported over loopback. Read at delivery time by finalizeTurn, never
+	// carried on turn.Record: the value is ACCOUNT-WIDE (one subscription
+	// shared by the whole fleet), not per-turn accounting.
+	rateLimits *ratelimit.Latest
+}
+
+// accountUsage returns the newest statusline-reported account usage snapshot,
+// or nil when this pod has observed none (an old claude, a pod on an API key
+// rather than a subscription token, or a session that has not yet made its
+// first API call). Nil is the SAFE value: the operator's gate stays exactly as
+// inert as it is today rather than reading a fabricated 0%.
+func (a *app) accountUsage() *accountUsagePayload {
+	if a.rateLimits == nil {
+		return nil
+	}
+	s, ok := a.rateLimits.Get()
+	if !ok {
+		return nil
+	}
+	p := &accountUsagePayload{
+		ObservedAt:      s.ObservedAt,
+		FiveHourPercent: s.FiveHourPercent,
+		WeeklyPercent:   s.WeeklyPercent,
+	}
+	if !s.FiveHourReset.IsZero() {
+		p.FiveHourResetUnix = s.FiveHourReset.Unix()
+	}
+	if !s.WeeklyReset.IsZero() {
+		p.WeeklyResetUnix = s.WeeklyReset.Unix()
+	}
+	return p
 }
 
 // holdInternalIssues parks reports from a turn whose callback was suppressed by
@@ -134,11 +167,12 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 	defaultCB := cfg.DefaultCallbackURL
 
 	a := &app{
-		log:      log,
-		sess:     sess,
-		sender:   sender,
-		pub:      &http.Server{Addr: cfg.HTTPAddr, ReadHeaderTimeout: 10 * time.Second},
-		internal: &http.Server{Addr: cfg.InternalAddr, ReadHeaderTimeout: 10 * time.Second},
+		log:        log,
+		sess:       sess,
+		sender:     sender,
+		rateLimits: &ratelimit.Latest{},
+		pub:        &http.Server{Addr: cfg.HTTPAddr, ReadHeaderTimeout: 10 * time.Second},
+		internal:   &http.Server{Addr: cfg.InternalAddr, ReadHeaderTimeout: 10 * time.Second},
 		finishHook: func(shutdownCtx context.Context) {
 			fireLifecycleHookBounded(shutdownCtx, cfg, m, log, "conversationFinished",
 				cfg.HookConversationFinished, 5*time.Second)
@@ -192,7 +226,8 @@ func newApp(ctx context.Context, cfg config) (*app, error) {
 		verifier = v
 	}
 
-	api := httpapi.New(httpapi.Deps{Ctl: sess, Store: store, Verifier: verifier, Log: log, Registry: reg, Metrics: m})
+	api := httpapi.New(httpapi.Deps{Ctl: sess, Store: store, Verifier: verifier, Log: log, Registry: reg, Metrics: m,
+		RateLimits: a.rateLimits})
 	a.pub.Handler = api.Router()
 	a.internal.Handler = api.InternalRouter()
 
@@ -339,7 +374,7 @@ func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log
 	if url == "" {
 		url = defaultCB
 	}
-	sender.DeliverPayload(url, rec.ID, newCallbackPayload(rec, cfg.TaskName))
+	sender.DeliverPayload(url, rec.ID, newCallbackPayload(rec, cfg.TaskName, a.accountUsage()))
 
 	// agentTurnFinished runs last, after the turn's work is committed,
 	// pushed, and the operator callback delivered. Best-effort.
@@ -437,6 +472,7 @@ func buildBootstrapParams(cfg config, log *slog.Logger, m *metrics.Metrics) boot
 		SkillsCloneDir:    skillsCloneDir(cfg.SkillsSrcDirs),
 		AgentsSrc:         []string{filepath.Join(skillsCloneDir(cfg.SkillsSrcDirs), ".claude", "agents")},
 		HookCommand:       cfg.HookPath,
+		StatusLineCommand: cfg.StatusLinePath,
 		AllowedTools:      readLines(cfg.AllowedToolsPath),
 		EnableAllMCP:      true,
 		PermissionMode:    cfg.PermissionMode,

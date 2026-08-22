@@ -43,7 +43,7 @@ func TestNewCallbackPayload_CarriesTaskNameAndDurationSeconds(t *testing.T) {
 		CompletedAt: &completed,
 	}
 
-	body, err := json.Marshal(newCallbackPayload(rec, "task-abc"))
+	body, err := json.Marshal(newCallbackPayload(rec, "task-abc", nil))
 	require.NoError(t, err)
 
 	var p operatorTurnCompletePayload
@@ -55,6 +55,22 @@ func TestNewCallbackPayload_CarriesTaskNameAndDurationSeconds(t *testing.T) {
 	require.Equal(t, "end_turn", p.StopReason)
 }
 
+// TestAccountUsageWireKeys pins accountUsagePayload's exact JSON encoding.
+// tatara-operator decodes these keys into its own
+// internal/controller.turnAccountUsage - there is no shared Go module between
+// the two repos, so this test IS the contract: it is the only thing that
+// would catch a field rename here silently breaking the operator's decode.
+func TestAccountUsageWireKeys(t *testing.T) {
+	b, err := json.Marshal(accountUsagePayload{
+		ObservedAt: time.Unix(0, 0).UTC(), FiveHourPercent: 1, FiveHourResetUnix: 2,
+		WeeklyPercent: 3, WeeklyResetUnix: 4,
+	})
+	require.NoError(t, err)
+	require.JSONEq(t,
+		`{"observedAt":"1970-01-01T00:00:00Z","fiveHourPercent":1,"fiveHourResetUnix":2,"weeklyPercent":3,"weeklyResetUnix":4}`,
+		string(b))
+}
+
 // TestNewCallbackPayload_ZeroDurationAndEmptyTaskNameWhenUnset verifies the
 // zero-value defaults: a turn that has not completed yet (no CompletedAt)
 // reports durationSeconds 0, and an empty taskName round-trips as an omitted
@@ -62,7 +78,7 @@ func TestNewCallbackPayload_CarriesTaskNameAndDurationSeconds(t *testing.T) {
 func TestNewCallbackPayload_ZeroDurationAndEmptyTaskNameWhenUnset(t *testing.T) {
 	rec := &turn.Record{ID: "turn-1", State: turn.Running, StartedAt: time.Now()}
 
-	body, err := json.Marshal(newCallbackPayload(rec, ""))
+	body, err := json.Marshal(newCallbackPayload(rec, "", nil))
 	require.NoError(t, err)
 
 	var p operatorTurnCompletePayload

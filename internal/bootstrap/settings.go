@@ -27,6 +27,9 @@ func writeSettings(p Params, claudeHome string) error {
 			"sessionUrl": false,
 		},
 	}
+	if p.StatusLineCommand != "" {
+		settings["statusLine"] = map[string]any{"type": "command", "command": p.StatusLineCommand}
+	}
 	if p.Effort != "" {
 		settings["effortLevel"] = p.Effort
 	}

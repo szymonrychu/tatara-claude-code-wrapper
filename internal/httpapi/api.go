@@ -17,6 +17,7 @@ import (
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/auth"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/metrics"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/obs"
+	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/ratelimit"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/session"
 	"github.com/szymonrychu/tatara-claude-code-wrapper/internal/turn"
 )
@@ -46,6 +47,9 @@ type Deps struct {
 	Log      *slog.Logger
 	Registry *prometheus.Registry
 	Metrics  *metrics.Metrics
+	// RateLimits holds the newest account-usage snapshot the statusline
+	// reported. Nil is safe: the route then accepts and discards.
+	RateLimits *ratelimit.Latest
 }
 
 type API struct {
@@ -55,13 +59,14 @@ type API struct {
 	log   *slog.Logger
 	reg   *prometheus.Registry
 	m     *metrics.Metrics
+	rl    *ratelimit.Latest
 }
 
 func New(d Deps) *API {
 	if d.Log == nil {
 		d.Log = slog.Default()
 	}
-	return &API{ctl: d.Ctl, store: d.Store, v: d.Verifier, log: d.Log, reg: d.Registry, m: d.Metrics}
+	return &API{ctl: d.Ctl, store: d.Store, v: d.Verifier, log: d.Log, reg: d.Registry, m: d.Metrics, rl: d.RateLimits}
 }
 
 // probeRoutes are the infra-plane endpoints whose access logs are pure noise at
@@ -184,12 +189,15 @@ func (a *API) mountV1(r chi.Router) {
 	r.Delete("/v1/session", a.deleteSession)
 }
 
-// InternalRouter is the loopback-only surface the Stop hook posts to.
+// InternalRouter is the loopback-only surface the Stop hook and the statusline
+// command post to. Neither route is authenticated: the trust boundary is the
+// pod's own network namespace.
 func (a *API) InternalRouter() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(a.requestLogger)
 	r.Post("/internal/turn-complete", a.turnComplete)
+	r.Post("/internal/account-usage", a.accountUsage)
 	return r
 }
 
