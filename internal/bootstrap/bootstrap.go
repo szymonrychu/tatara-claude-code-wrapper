@@ -48,8 +48,13 @@ type Params struct {
 	// redesign Decision 6). Derived from the same skills-repo clone as
 	// SkillsSrc; not profile-gated (see agents.go doc comment for why).
 	// Later sources win on name collision.
-	AgentsSrc                 []string
-	HookCommand               string
+	AgentsSrc   []string
+	HookCommand string
+	// StatusLineCommand is the claude statusLine command (cmd/cc-statusline),
+	// which reports account-usage snapshots to the wrapper over loopback. It
+	// PRINTS NOTHING, so no status line is rendered; the reporting side effect
+	// is the entire point. Empty disables it.
+	StatusLineCommand         string
 	AllowedTools              []string
 	EnableAllMCP              bool
 	PermissionMode            string

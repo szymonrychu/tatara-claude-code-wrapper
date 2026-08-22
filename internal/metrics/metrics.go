@@ -24,6 +24,7 @@ type Metrics struct {
 	LifecycleHookTotal   *prometheus.CounterVec // labels: result=ok|fail, hook=preClone|postClone|conversationStart|...
 	HookOutcome          *prometheus.CounterVec // labels: result=ok|bad_payload|rejected|store_error
 	MetricPushTotal      *prometheus.CounterVec // labels: result=ok|encode_fail|transport_fail|rejected
+	StatuslineReports    *prometheus.CounterVec // labels: result=ok|bad_payload
 
 	// HTTP-layer metrics (rule 13: request count/latency/in-flight/panics).
 	HTTPRequestsTotal   *prometheus.CounterVec   // labels: route, method, status_code
@@ -173,6 +174,8 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "ccw_lifecycle_hook_total", Help: "Project lifecycle hook executions by result and hook name."}, []string{"result", "hook"}),
 		HookOutcome: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_hook_outcome_total", Help: "Stop-hook callback outcomes at every decision point."}, []string{"result"}),
+		StatuslineReports: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ccw_statusline_reports_total", Help: "Claude account-usage statusline reports received, by result."}, []string{"result"}),
 		MetricPushTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "ccw_metric_push_total", Help: "Metric push attempts by result."}, []string{"result"}),
 		HTTPRequestsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -238,6 +241,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.ClaudeRestarts, m.WebhookDelivery, m.HookReceived, m.StreamEventsTotal,
 		m.BootstrapCloneTotal, m.BootstrapDuration, m.CommitPushTotal, m.SafetyPushTotal,
 		m.BootstrapHookInstall, m.LifecycleHookTotal, m.HookOutcome, m.MetricPushTotal,
+		m.StatuslineReports,
 		m.HTTPRequestsTotal, m.HTTPRequestDuration, m.HTTPInFlight, m.HTTPPanicsTotal,
 		m.AuthTotal, m.TurnResumes, m.TurnRefusals, m.OutcomeRepromptTotal, m.BootstrapRenderTotal,
 		m.BootstrapReconcileTotal, m.BootstrapLockCleared, m.BootstrapWorkspaceRecovered,

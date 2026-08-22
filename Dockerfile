@@ -50,7 +50,8 @@ ARG DATE=unknown
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
       -ldflags "-s -w -X github.com/szymonrychu/tatara-claude-code-wrapper/internal/version.Version=${VERSION} -X github.com/szymonrychu/tatara-claude-code-wrapper/internal/version.Commit=${COMMIT} -X github.com/szymonrychu/tatara-claude-code-wrapper/internal/version.Date=${DATE}" \
       -o /out/wrapper ./cmd/wrapper && \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o /out/cc-stop-hook ./cmd/cc-stop-hook
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o /out/cc-stop-hook ./cmd/cc-stop-hook && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o /out/cc-statusline ./cmd/cc-statusline
 
 # Stage 2: pull the tatara-cli binary at a pinned version.
 FROM harbor.szymonrichert.pl/containers/tatara-cli:${TATARA_CLI_VERSION} AS tatara-cli
@@ -119,6 +120,7 @@ RUN npm install -g renovate@${RENOVATE_VERSION} --engine-strict && npm cache cle
 COPY --from=tatara-cli /usr/local/bin/tatara /usr/local/bin/tatara
 COPY --from=go-build /out/wrapper /usr/local/bin/wrapper
 COPY --from=go-build /out/cc-stop-hook /usr/local/bin/cc-stop-hook
+COPY --from=go-build /out/cc-statusline /usr/local/bin/cc-statusline
 
 # Pin the skills ref the wrapper boot-clones (re-declare the global ARG to bring
 # it into this stage's scope, then bake it as the runtime default ENV).
