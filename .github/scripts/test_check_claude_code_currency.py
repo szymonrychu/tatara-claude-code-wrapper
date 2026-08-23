@@ -234,3 +234,23 @@ def test_max_lag_is_two():
     an accidental copy from the skills check.
     """
     assert currency.MAX_LAG == 2
+
+
+def test_a_prerelease_latest_is_not_reported_as_an_inconsistent_registry():
+    """parse_versions drops a prerelease, so `latest not in versions` fires for
+    a registry that is behaving perfectly. Reporting it as inconsistent sends
+    the reader to npm instead of to the frozen pin.
+    """
+    problems = currency.evaluate("2.1.201", ["2.1.200", "2.1.201"], "2.2.0-rc.1")
+    assert len(problems) == 1
+    assert "not a plain X.Y.Z release" in problems[0]
+    assert "inconsistent" not in problems[0]
+
+
+def test_a_latest_absent_from_a_plain_version_list_is_still_inconsistent():
+    """The other branch must survive: a plain X.Y.Z latest that is not in the
+    published set really is a broken registry answer.
+    """
+    problems = currency.evaluate("2.1.201", ["2.1.200", "2.1.201"], "2.1.999")
+    assert len(problems) == 1
+    assert "inconsistent" in problems[0]

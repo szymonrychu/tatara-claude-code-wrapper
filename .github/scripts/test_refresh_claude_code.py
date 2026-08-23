@@ -91,7 +91,9 @@ def test_no_workflow_url_carries_a_credential():
     errors, and carried in argv. `authenticate_origin` hands it to a
     credential helper instead.
     """
-    for path in sorted(WORKFLOWS.glob("*.yml")):
+    paths = sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
+    assert paths
+    for path in paths:
         text = path.read_text(encoding="utf-8")
         assert "x-access-token" not in text, path.name
         assert not re.search(r"https://[^\s\"']*\$\{?[A-Za-z_]*TOKEN", text), path.name
@@ -187,9 +189,22 @@ def test_ci_runs_this_suite():
     """These tests and check_claude_code_currency.py are wired into ci, on a
     hosted runner: they need python and the checkout, nothing else.
     """
-    text = CI.read_text(encoding="utf-8")
-    assert "pytest .github" in text
-    assert "ubuntu-latest" in text
+    lines = CI.read_text(encoding="utf-8").splitlines()
+    starts = [i for i, ln in enumerate(lines) if ln.strip() == "workflow-machinery:"]
+    assert len(starts) == 1
+    indent = len(lines[starts[0]]) - len(lines[starts[0]].lstrip())
+    end = next(
+        (j for j in range(starts[0] + 1, len(lines))
+         if lines[j].strip() and not lines[j].strip().startswith("#")
+         and (len(lines[j]) - len(lines[j].lstrip())) <= indent),
+        len(lines),
+    )
+    job = "\n".join(lines[starts[0]:end])
+    # Tied to the job that actually runs pytest: asserting `ubuntu-latest`
+    # appears anywhere in ci.yml would stay green if this job moved onto the
+    # ARC runner, which is the change the assertion exists to catch.
+    assert "pytest .github" in job
+    assert "runs-on: ubuntu-latest" in job
 
 
 # --- Part B: run the step body for real --------------------------------------
@@ -238,8 +253,10 @@ FAKE_LIB_FUNCTIONS = set(re.findall(r"^(\S+)\(\)", FAKE_LIB, re.M))
 STUB_GH = r"""#!/usr/bin/env bash
 if [ "$1" = api ] && printf '%s ' "$@" | grep -q ' PATCH '; then
   key=api-patch
+elif [ "$1" = api ] && printf '%s ' "$@" | grep -q ' POST '; then
+  key=api-label-post
 elif [ "$1" = api ]; then
-  key=api-labels
+  key=api-label-read
 else
   key="$1-$2"
 fi
@@ -266,6 +283,8 @@ printf '%s\n' "${CURL_BODY-}"
 """
 
 PINNED = "2.1.201"
+# One normal day's bump: inside the workflow's max_jump, so it arms.
+BUMPED = "2.1.205"
 
 
 def npm_latest(version):
@@ -363,7 +382,7 @@ class Harness:
         log = self.tmp / LIB_LOG
         return log.read_text(encoding="utf-8").splitlines() if log.exists() else []
 
-    def run(self, latest="2.1.241", curl_rc=0, **env):
+    def run(self, latest=BUMPED, curl_rc=0, **env):
         script = (
             "set -euo pipefail\n"
             "shopt -s inherit_errexit\n"
@@ -400,7 +419,13 @@ def test_the_double_models_exactly_the_helpers_the_workflow_calls():
     """A double that carries a helper the workflow no longer calls, or misses
     one it does, makes every Part B result meaningless.
     """
-    body = step_body(REFRESH, BUMP_STEP)
+    # Comments strip out first: `arm_pr` and `_pr_state` are both named in
+    # comments, so matching the raw body would keep this green after the
+    # workflow stopped calling them.
+    body = "\n".join(
+        ln for ln in step_body(REFRESH, BUMP_STEP).splitlines()
+        if not ln.strip().startswith("#")
+    )
     called = {f for f in FAKE_LIB_FUNCTIONS if re.search(rf"(?<![\w-]){f}\b", body)}
     assert called == FAKE_LIB_FUNCTIONS
 
@@ -443,10 +468,10 @@ def test_an_unparseable_registry_answer_fails_loudly(h):
 
 
 def test_a_first_run_pushes_the_branch_and_arms_the_pr(h):
-    r = h.run(latest="2.1.241")
+    r = h.run()
     assert r.returncode == 0, r.stdout + r.stderr
     assert h.remote_sha() != ""
-    assert "ARG CLAUDE_CODE_VERSION=2.1.241" in h.remote_dockerfile()
+    assert f"ARG CLAUDE_CODE_VERSION={BUMPED}" in h.remote_dockerfile()
     assert "ARG CLAUDE_CODE_VERSION\n" in h.remote_dockerfile(), (
         "the bare re-declaration in the claude layer must survive the rewrite"
     )
@@ -461,8 +486,8 @@ def test_an_identical_tree_is_not_re_pushed(h):
     every morning restarts the whole self-hosted ci matrix on the open PR, so
     the push is decided on the tree, not on the commit.
     """
-    before = h.push_branch("2.1.241")
-    r = h.run(latest="2.1.241")
+    before = h.push_branch(BUMPED)
+    r = h.run()
     assert r.returncode == 0, r.stdout + r.stderr
     assert h.remote_sha() == before
     assert any(ln.startswith("open_or_reuse_pr") for ln in h.lib_calls()), (
@@ -472,11 +497,11 @@ def test_an_identical_tree_is_not_re_pushed(h):
 
 
 def test_a_stale_branch_is_rebuilt(h):
-    before = h.push_branch("2.1.230")
-    r = h.run(latest="2.1.241")
+    before = h.push_branch("2.1.198")
+    r = h.run()
     assert r.returncode == 0, r.stdout + r.stderr
     assert h.remote_sha() != before
-    assert "ARG CLAUDE_CODE_VERSION=2.1.241" in h.remote_dockerfile()
+    assert f"ARG CLAUDE_CODE_VERSION={BUMPED}" in h.remote_dockerfile()
 
 
 def test_a_failed_branch_read_is_not_treated_as_an_absent_branch(h):
@@ -484,13 +509,13 @@ def test_a_failed_branch_read_is_not_treated_as_an_absent_branch(h):
     ls-remote that FAILED must not license a force-push over a branch this run
     could not see.
     """
-    h.push_branch("2.1.241")
+    h.push_branch(BUMPED)
     before = h.remote_sha()
     # Blocks the remote transport only; the local checkout/commit still work,
     # so the run reaches ls-remote and dies THERE. Asserting on that specific
     # diagnosis is what separates "the guard fired" from "something else broke
     # before the push happened to be reached".
-    r = h.run(latest="2.1.241", GIT_ALLOW_PROTOCOL="none")
+    r = h.run(GIT_ALLOW_PROTOCOL="none")
     assert r.returncode != 0
     assert h.remote_sha() == before
     assert "refusing to force-push over a branch this run never saw" in (r.stdout + r.stderr)
@@ -506,35 +531,56 @@ def test_a_reused_pr_gets_its_title_and_body_rewritten(h):
     """The title becomes the squash commit message, and a reused PR keeps
     yesterday's version in it.
     """
-    r = h.run(latest="2.1.241")
+    r = h.run()
     assert r.returncode == 0, r.stdout + r.stderr
     patch = h.calls("api-patch")
     assert len(patch) == 1, h.calls()
     assert "repos/szymonrychu/tatara-claude-code-wrapper/pulls/191" in patch[0]
-    assert "2.1.241" in patch[0]
+    assert BUMPED in patch[0]
 
 
 def test_a_failed_title_rewrite_fails_the_run(h):
     h.plan("api-patch", ["1"])
-    r = h.run(latest="2.1.241")
+    r = h.run()
     assert r.returncode != 0
     assert "could not" in (r.stdout + r.stderr)
 
 
+def recovered(h):
+    """The crash-recovery state: a prior run pushed the branch and died before
+    arming, so today's run rebuilds an IDENTICAL tree and does not push.
+    """
+    h.push_branch(BUMPED)
+
+
 def test_an_already_armed_pr_is_not_re_armed(h):
-    r = h.run(latest="2.1.241", FAKE_PR_STATE="ARMED")
+    recovered(h)
+    r = h.run(FAKE_PR_STATE="ARMED")
     assert r.returncode == 0, r.stdout + r.stderr
     assert not any(ln.startswith("arm_pr") for ln in h.lib_calls())
 
 
+def test_an_armed_read_is_not_trusted_after_this_run_moved_the_head(h):
+    """GitHub disables auto-merge when the head branch is force-pushed, and the
+    field is not synchronously consistent with a ref update seconds old. A stale
+    ARMED believed here leaves a green PR that never merges, i.e. #184 again.
+    """
+    h.push_branch("2.1.198")
+    r = h.run(FAKE_PR_STATE="ARMED")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert any(ln.startswith("arm_pr") for ln in h.lib_calls()), (
+        "a force-pushed head must be re-armed, not trusted"
+    )
+
+
 def test_an_already_merged_pr_is_a_success(h):
-    r = h.run(latest="2.1.241", FAKE_PR_STATE="MERGED")
+    r = h.run(FAKE_PR_STATE="MERGED")
     assert r.returncode == 0, r.stdout + r.stderr
     assert not any(ln.startswith("arm_pr") for ln in h.lib_calls())
 
 
 def test_an_unreadable_pr_state_fails_the_run(h):
-    r = h.run(latest="2.1.241", FAKE_STATE_RC=1)
+    r = h.run(FAKE_STATE_RC=1)
     assert r.returncode != 0
     assert not any(ln.startswith("arm_pr") for ln in h.lib_calls())
 
@@ -545,16 +591,31 @@ def test_a_clean_labelled_pr_that_auto_merge_refuses_is_merged_outright(h):
     behind: open, green, unarmed, and never merging on its own. That is the
     47-day shape this redesign exists to end, so it cannot be a daily red.
     """
+    recovered(h)
     h.plan("pr-view", ["0 CLEAN"])
-    h.plan("api-labels", ["0 area/cd,semver:patch"])
-    r = h.run(latest="2.1.241", FAKE_ARM_RC=1)
+    h.plan("api-label-read", ["0 area/cd,semver:patch"])
+    r = h.run(FAKE_ARM_RC=1)
     assert r.returncode == 0, r.stdout + r.stderr
     assert h.calls("pr-merge"), "a clean PR auto-merge refused must be merged directly"
 
 
+def test_a_pr_this_run_just_pushed_is_never_merged_outright(h):
+    """The fallback is for a PR an EARLIER run left behind, which by definition
+    has an unchanged tree. On a head this run just moved, the checks are pending
+    and `--auto` is the right mechanism; merging outright would merge something
+    no run has ever seen go green. CLEAN alone does not distinguish the two.
+    """
+    h.plan("pr-view", ["0 CLEAN"])
+    h.plan("api-label-read", ["0 semver:patch"])
+    r = h.run(FAKE_ARM_RC=1)
+    assert r.returncode != 0
+    assert not h.calls("pr-merge")
+
+
 def test_a_pr_that_is_not_mergeable_is_not_merged_outright(h):
+    recovered(h)
     h.plan("pr-view", ["0 BLOCKED"])
-    r = h.run(latest="2.1.241", FAKE_ARM_RC=1)
+    r = h.run(FAKE_ARM_RC=1)
     assert r.returncode != 0
     assert not h.calls("pr-merge")
 
@@ -565,16 +626,72 @@ def test_an_unlabelled_pr_is_never_merged_outright(h):
     status for a failed label POST as for a failed arm, so the label has to be
     re-read here rather than assumed.
     """
+    recovered(h)
     h.plan("pr-view", ["0 CLEAN"])
-    h.plan("api-labels", ["0 area/cd"])
-    r = h.run(latest="2.1.241", FAKE_ARM_RC=1)
+    h.plan("api-label-read", ["0 area/cd"])
+    r = h.run(FAKE_ARM_RC=1)
     assert r.returncode != 0
     assert not h.calls("pr-merge")
     assert "semver:patch" in (r.stdout + r.stderr)
 
 
 def test_an_unreadable_merge_state_is_not_treated_as_mergeable(h):
+    recovered(h)
     h.plan("pr-view", ["1"])
-    r = h.run(latest="2.1.241", FAKE_ARM_RC=1)
+    r = h.run(FAKE_ARM_RC=1)
     assert r.returncode != 0
     assert not h.calls("pr-merge")
+
+
+# --- the catch-up guard ------------------------------------------------------
+
+
+def test_a_catch_up_jump_is_labelled_but_left_unarmed(h):
+    """#184 pre-mortem 1: 2.1.201 to 2.1.241 is 40 releases onto every agent pod
+    in the fleet. `ci` sets enable-image: false and builds no image, so a green
+    run on a Dockerfile-only PR is not evidence the new claude-code installs -
+    `release` is the first thing that builds it, and it cuts the semver tag
+    BEFORE the build, so a bad bump leaves a tag with no image behind it.
+    """
+    r = h.run(latest="2.1.241")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert h.remote_sha() != "", "the PR is still opened; only the arming stops"
+    assert not any(ln.startswith("arm_pr") for ln in h.lib_calls())
+    assert h.calls("api-label-post"), (
+        "an unarmed PR still needs the semver label: a human merging it "
+        "unlabelled publishes an image release refuses to tag"
+    )
+    assert not h.calls("pr-merge")
+
+
+def test_a_minor_bump_is_left_unarmed(h):
+    r = h.run(latest="2.2.0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not any(ln.startswith("arm_pr") for ln in h.lib_calls())
+
+
+def test_a_bump_inside_the_jump_budget_is_armed(h):
+    """The steady state has to keep working, or the guard has replaced a dead
+    cron with a cron nobody ever merges.
+    """
+    r = h.run(latest="2.1.206")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert any(ln.startswith("arm_pr") for ln in h.lib_calls())
+
+
+def test_a_prerelease_latest_is_refused_outright(h):
+    """dist-tags.latest is a pointer and nothing guarantees it names a plain
+    release. The currency check's version filter drops a prerelease too, so
+    pinning one would also red that check with a diagnosis blaming npm.
+    """
+    r = h.run(latest="2.2.0-rc.1")
+    assert r.returncode != 0
+    assert h.remote_sha() == ""
+    assert "not a plain X.Y.Z release" in (r.stdout + r.stderr)
+
+
+def test_a_failed_label_post_stops_before_arming(h):
+    h.plan("api-label-post", ["1"])
+    r = h.run()
+    assert r.returncode != 0
+    assert not any(ln.startswith("arm_pr") for ln in h.lib_calls())

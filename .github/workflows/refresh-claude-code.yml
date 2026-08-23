@@ -84,11 +84,48 @@ jobs:
             exit 1
           fi
 
+          # dist-tags.latest is a pointer and nothing guarantees it names a
+          # plain release. Pinning the fleet to a prerelease is not this
+          # workflow's job, and the currency check's version filter drops one
+          # too, so it would red with a diagnosis pointing at npm.
+          if ! [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::npm dist-tags.latest is '${latest}', which is not a plain X.Y.Z release; refusing to pin the fleet to it." >&2
+            exit 1
+          fi
+
           current="$(sed -n 's/^ARG CLAUDE_CODE_VERSION=//p' Dockerfile | head -1)"
           echo "current=$current latest=$latest"
           if [ "$current" = "$latest" ]; then
             echo "main already pins $latest; nothing to do"
             exit 0
+          fi
+
+          # Arm auto-merge only for a bump the size of a normal day's.
+          #
+          # `ci` sets enable-image: false and builds no image, so a green run
+          # on a Dockerfile-only PR is NOT evidence that the new claude-code
+          # installs or boots - `release` is the first thing that builds it,
+          # and it cuts the semver tag BEFORE it builds, so a bad bump leaves
+          # a published tag with no image behind it (MEMORY.md 2026-07-30).
+          # That risk is acceptable for the one-or-two-release bump this cron
+          # emits daily and is not acceptable for a catch-up after an outage:
+          # #184's pre-mortem 1 is explicit that 39 releases at once must not
+          # reach every agent pod in the fleet unreviewed. Those land as a
+          # labelled, unarmed PR for a human.
+          max_jump=5
+          arm=yes
+          jump=""
+          if [ "${current%.*}" != "${latest%.*}" ]; then
+            arm=no
+            jump="a minor or major change"
+          elif [[ "${current##*.}" =~ ^[0-9]+$ && "${latest##*.}" =~ ^[0-9]+$ ]]; then
+            if [ "$(( ${latest##*.} - ${current##*.} ))" -gt "$max_jump" ]; then
+              arm=no
+              jump="$(( ${latest##*.} - ${current##*.} )) patch releases at once"
+            fi
+          else
+            arm=no
+            jump="a version this workflow cannot size"
           fi
 
           authenticate_origin "$REPO"
@@ -103,7 +140,10 @@ jobs:
           # Whether to push is decided on the TREE, not on the commit: `git
           # commit` mints a new sha for an identical tree, and force-pushing
           # that every morning would restart the whole self-hosted ci matrix on
-          # the open PR forever. An ls-remote that FAILED is not "the branch is
+          # the open PR forever. It fires only when NOTHING moved - neither the
+          # version nor main - because the left side is main's tip plus the
+          # bump; a commit landing on main between two runs rebases the branch,
+          # which is intended. An ls-remote that FAILED is not "the branch is
           # absent" - only an empty SUCCESSFUL answer means there is nothing to
           # compare against.
           if ! remote_head="$(retry "git ls-remote $branch" \
@@ -119,7 +159,17 @@ jobs:
               echo "::error::could not fetch ${branch} from origin." >&2
               exit 1
             fi
-            if [ "$(git rev-parse "HEAD^{tree}")" = "$(git rev-parse "refs/remotes/origin/${branch}^{tree}")" ]; then
+            # Read both trees into variables first. Inside an `if` condition
+            # bash suspends errexit, and `git rev-parse` prints its ARGUMENT
+            # on stdout when it cannot resolve it, so comparing two bare
+            # substitutions there would silently compare garbage - the same
+            # failure-becomes-a-value shape that produced 27 orphan branches.
+            if ! local_tree="$(git rev-parse "HEAD^{tree}")" ||
+               ! remote_tree="$(git rev-parse "refs/remotes/origin/${branch}^{tree}")"; then
+              echo "::error::could not resolve the trees to compare for ${branch}." >&2
+              exit 1
+            fi
+            if [ "$local_tree" = "$remote_tree" ]; then
               echo "origin/${branch} already carries claude-code ${latest} on this base; not re-pushing"
               push=no
             fi
@@ -150,6 +200,23 @@ jobs:
             exit 1
           fi
 
+          # Labelled here, not only inside arm_pr, because a PR this run
+          # deliberately leaves UNARMED still has to carry it: ci cuts the
+          # release tag from that label, so a human merging an unlabelled
+          # catch-up publishes an image nothing ever tags. arm_pr posts it
+          # again below; the REST call is idempotent.
+          if ! retry "label ${REPO}#${num}" \
+              gh api -X POST "repos/${REPO}/issues/${num}/labels" \
+              -f "labels[]=${label}" >/dev/null; then
+            echo "::error::could not label ${pr_url}; ci cuts the release tag from that label." >&2
+            exit 1
+          fi
+
+          if [ "$arm" = no ]; then
+            echo "::warning::${pr_url} bumps ${current} to ${latest} (${jump}); NOT arming auto-merge. ci builds no image, so a green run on this PR is not evidence that the new claude-code installs or boots. Review and merge it by hand."
+            exit 0
+          fi
+
           # Read the state BEFORE arming. `gh pr merge --auto` refuses a PR with
           # nothing left pending, and a green-but-unarmed PR is precisely what a
           # run that died between the push and the arm leaves behind, i.e. the
@@ -165,8 +232,16 @@ jobs:
               exit 0
               ;;
             ARMED)
-              echo "${pr_url} is already armed"
-              exit 0
+              # Only trustworthy when this run did NOT move the head. GitHub
+              # disables auto-merge when the head branch is force-pushed, and
+              # this field is not synchronously consistent with a ref update
+              # seconds old - believing a stale ARMED would leave a green PR
+              # that never merges, which is the shape being fixed here.
+              if [ "$push" = no ]; then
+                echo "${pr_url} is already armed"
+                exit 0
+              fi
+              echo "${pr_url} read back ARMED, but this run force-pushed its head; re-arming"
               ;;
           esac
 
@@ -174,17 +249,28 @@ jobs:
             exit 0
           fi
 
-          # Auto-merge refused it. Merge outright, but ONLY when the forge says
-          # the PR is mergeable now AND the semver label is already on it: ci
-          # cuts the release tag from that label, so a merge landing without it
-          # publishes an image nothing ever tags. arm_pr returns the same status
-          # for a failed label POST as for a failed arm, so the label is re-read
-          # here rather than assumed.
+          # Auto-merge refused it. The fallback exists for ONE state: a PR left
+          # open, green and unarmed by a run that died between the push and the
+          # arm. That state necessarily has an unchanged tree, so it is gated on
+          # `push=no` - a PR this run just created or just moved has checks
+          # pending, `--auto` is the correct mechanism for it, and merging it
+          # outright would be merging something no run has ever seen go green.
+          if [ "$push" = yes ]; then
+            echo "::error::could not arm auto-merge on ${pr_url}, whose head this run just pushed." >&2
+            exit 1
+          fi
+
+          # Even then, only when the forge says the PR is mergeable now AND the
+          # semver label reads back: arm_pr returns the same status for a failed
+          # label POST as for a failed arm, so it is re-read rather than assumed.
           if ! mergeable="$(retry "read mergeStateStatus ${REPO}#${num}" \
               gh pr view "$pr_url" --repo "$REPO" --json mergeStateStatus --jq '.mergeStateStatus')"; then
             echo "::error::could not read the merge state of ${pr_url} after auto-merge refused it." >&2
             exit 1
           fi
+          # CLEAN is the only value that means "mergeable and every required
+          # check passed". UNSTABLE (a check failed but is not required) and
+          # UNKNOWN (the forge is still recomputing) are both refusals here.
           if [ "$mergeable" != CLEAN ]; then
             echo "::error::auto-merge is not armed on ${pr_url} and it is not mergeable now (mergeStateStatus=${mergeable})." >&2
             exit 1

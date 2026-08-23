@@ -21,12 +21,23 @@ correct target for the lag computation: measuring against the newest published
 version instead would count releases the pin was never supposed to track. A
 pin ahead of `latest` (negative lag) is clean, not a problem.
 
-MAX_LAG = 2, not 1 as in check_skills_currency.py's tag lag. claude-code
-publishes several times a day, clustered 16:00-02:00Z. Over the last 60
-releases, the lag introduced in the 06:17Z-09:17Z window (the bump cron to
-this check running) was 0 on 49 of 50 days and 1 on the remaining one. It
-therefore takes roughly 2-3 consecutive dead cron days to red, which is the
-point: this check reds for drift, never for a bump in flight.
+MAX_LAG = 2, not 1 as in check_skills_currency.py's tag lag. Two separate
+things had to be measured for that number to hold, because the pin this reads
+is main's, so it only moves when the bump PR MERGES:
+
+  - publish rate. claude-code publishes several times a day, clustered
+    16:00-02:00Z. Over the last 60 releases the lag introduced in the
+    06:17Z-09:17Z window (the bump cron to this check) was 0 on 49 of 50 days
+    and 1 on the remaining one.
+  - merge latency, which is the assumption the first measurement does NOT
+    cover. Over the 45 auto-merged CD bump PRs in this repo: median 7.0 min,
+    p90 19.9 min, max 52.9 min, none over 180. So the three-hour window
+    covers the merge with a 3.4x margin on the worst observed case.
+
+It therefore takes roughly 2-3 consecutive dead cron days to red, which is the
+point: this check reds for drift, never for a bump in flight. If ARC capacity
+ever pushes the merge past 09:17 the check reds on a working cron, so the
+filed issue points at the open PR first.
 
 PIN_RE anchors on the trailing `=`, not just the ARG name. Dockerfile:17 is
 `ARG CLAUDE_CODE_VERSION=2.1.201`, but Dockerfile:106 re-declares the same ARG
@@ -139,6 +150,16 @@ def evaluate(pin, versions, latest, max_lag=MAX_LAG):
         problems.append(
             f"{PACKUMENT_URL} carries no dist-tags.latest, so there is no "
             "target to measure the pin against."
+        )
+    elif not SEMVER_RE.match(latest):
+        # Distinct from the inconsistent-registry case below: a prerelease is
+        # absent from `versions` only because parse_versions drops it, so
+        # reporting "names no published release" would send the reader to npm
+        # about a registry that is behaving perfectly.
+        problems.append(
+            f"{PACKUMENT_URL} dist-tags.latest={latest} is not a plain X.Y.Z "
+            f"release. refresh-claude-code.yml refuses to pin the fleet to a "
+            f"prerelease, so the pin is frozen until latest moves back to one."
         )
     elif versions and latest not in versions:
         problems.append(

@@ -7,3 +7,8 @@ dist/
 # inherited by every later turn (issue #131).
 /wrapper
 /cc-stop-hook
+
+# pytest/python bytecode. Never useful in a commit, and an agent task branch
+# inherits everything it carries (see the built-binary incident, #131).
+__pycache__/
+*.pyc
