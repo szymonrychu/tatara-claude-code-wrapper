@@ -68,6 +68,19 @@ type app struct {
 	// per-turn goroutine.
 	heldIssuesMu       sync.Mutex
 	heldInternalIssues []turn.InternalIssueReport
+	// heldPushedRepos/heldFailedRepos carry the same turn's commit/push report
+	// forward for the same reason, and it is the more consequential half: the
+	// operator's LastTurnFailedRepos drives the synthetic handoff note, and
+	// /workspace is the container writable layer with no volume, so a repo that
+	// failed to push holds commits that exist nowhere but a disk about to
+	// disappear. The next turn cannot re-derive either list - a repo that
+	// committed and then failed to push has a clean index next turn, so
+	// CommitAndPush short-circuits and it lands in neither list
+	// (internal/bootstrap/repo.go's documented KNOWN LIMITATION). Guarded by
+	// heldReposMu: finalizeTurn runs on a per-turn goroutine.
+	heldReposMu     sync.Mutex
+	heldPushedRepos []string
+	heldFailedRepos []string
 	// rateLimits holds the newest account-usage snapshot cmd/cc-statusline
 	// reported over loopback. Read at delivery time by finalizeTurn, never
 	// carried on turn.Record: the value is ACCOUNT-WIDE (one subscription
@@ -121,6 +134,92 @@ func (a *app) takePendingInternalIssues() []turn.InternalIssueReport {
 	held := a.heldInternalIssues
 	a.heldInternalIssues = nil
 	return held
+}
+
+// holdRepoLists parks the commit/push report from a turn whose callback was
+// suppressed by the outcome re-prompt, for the next turn's callback to carry.
+//
+// It ASSIGNS rather than appending, unlike holdInternalIssues: it is only ever
+// called with rec's lists, which the drain below has already merged with
+// anything a previous suppression held, so a chain of suppressions accumulates
+// through mergeRepoLists rather than here. Appending would skip that merge's
+// subtraction rules and let a held failure outlive the push that fixed it.
+func (a *app) holdRepoLists(pushed, failed []string) {
+	a.heldReposMu.Lock()
+	defer a.heldReposMu.Unlock()
+	a.heldPushedRepos, a.heldFailedRepos = pushed, failed
+}
+
+// takePendingRepoLists returns and clears the repo lists held from earlier
+// suppressed turns.
+func (a *app) takePendingRepoLists() (pushed, failed []string) {
+	a.heldReposMu.Lock()
+	defer a.heldReposMu.Unlock()
+	pushed, failed = a.heldPushedRepos, a.heldFailedRepos
+	a.heldPushedRepos, a.heldFailedRepos = nil, nil
+	return pushed, failed
+}
+
+// mergeRepoLists folds the repo lists held from turns whose callback the
+// outcome re-prompt suppressed into this turn's, for delivery on this turn's
+// callback:
+//
+//	pushed = union(held.pushed, this.pushed) \ this.failed
+//	failed = (held.failed \ union(held.pushed, this.pushed)) union this.failed
+//
+// The two subtractions are not symmetric, because the fields are not. A stale
+// pushedRepos is optimistic and inert; a stale failedRepos is an active
+// instruction to redo work that has since landed (tatara-operator
+// api/v1alpha1/task_types.go), so a held failure is cancelled by any later push
+// of the same repo.
+//
+// The second subtraction keeps the lists DISJOINT. The operator renders
+// pushedRepos and failedRepos into the synthetic handoff note independently,
+// with no dedup and no precedence (tatara-operator internal/agent/ttlstop.go),
+// so a repo in both produces a note that says it pushed and then says its
+// commits exist nowhere. Only the hold can produce that overlap - a single turn
+// cannot, since CommitAndPushAll appends each repo to exactly one list - and
+// this turn's result is the newer fact, so it wins.
+//
+// Both results are nil when empty: the two fields are omitempty on the wire and
+// an empty list is not the same signal as an absent one.
+func mergeRepoLists(heldPushed, heldFailed, thisPushed, thisFailed []string) (pushed, failed []string) {
+	allPushed := unionRepos(heldPushed, thisPushed)
+	return subtractRepos(allPushed, thisFailed), unionRepos(subtractRepos(heldFailed, allPushed), thisFailed)
+}
+
+// unionRepos concatenates a then b, preserving first-seen order and dropping
+// repeats. Nil when the result is empty.
+func unionRepos(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	var out []string
+	for _, list := range [][]string{a, b} {
+		for _, name := range list {
+			if !seen[name] {
+				seen[name] = true
+				out = append(out, name)
+			}
+		}
+	}
+	return out
+}
+
+// subtractRepos returns the elements of a not present in b, preserving order.
+func subtractRepos(a, b []string) []string {
+	if len(a) == 0 || len(b) == 0 {
+		return a
+	}
+	drop := make(map[string]bool, len(b))
+	for _, name := range b {
+		drop[name] = true
+	}
+	var out []string
+	for _, name := range a {
+		if !drop[name] {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 func newApp(ctx context.Context, cfg config) (*app, error) {
@@ -326,6 +425,23 @@ func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log
 	// residual in docs/superpowers/plans/2026-07-19-w1-lastcompleted-fallback.md).
 	rec.InternalIssues = append(a.takePendingInternalIssues(), a.sess.DrainInternalIssues(rec.ID)...)
 
+	// Same hand-off for the commit/push report, and it MUST sit here for the
+	// same reason: the suppressed callback is the only egress for these two
+	// lists too (newCallbackPayload is the sole wire path, and the mid-turn
+	// safety pusher is forbidden from writing PushedRepos - see safetypush.go).
+	//
+	// Below the commit/push log lines above on purpose, so pushed_repos there
+	// keeps describing only THIS turn's push, and above the reprompt block so a
+	// chained suppression re-holds the accumulated set.
+	//
+	// Note this re-attributes the held work to THIS turn: the operator stamps
+	// LastTurnReposTurnID from the callback's turn id, so the merged lists
+	// arrive named by the re-prompted turn while partly describing an earlier
+	// one. That is the intent - being current is what makes the operator treat
+	// them as owned rather than stale.
+	heldPushed, heldFailed := a.takePendingRepoLists()
+	rec.PushedRepos, rec.FailedRepos = mergeRepoLists(heldPushed, heldFailed, rec.PushedRepos, rec.FailedRepos)
+
 	// Defect C: a critical outcome tool (submit_outcome) the operator rejected
 	// shows up in the turn transcript as an is_error tool_result. Rather than
 	// let the turn finish silently (which the operator misreads as
@@ -359,9 +475,15 @@ func (a *app) finalizeTurn(rec *turn.Record, cfg config, m *metrics.Metrics, log
 				// here and its callback never sent, so without this they are
 				// lost outright.
 				a.holdInternalIssues(rec.InternalIssues)
+				a.holdRepoLists(rec.PushedRepos, rec.FailedRepos)
+				// The repo lists are logged by name, not counted: which repo
+				// holds commits that never reached origin is the actionable
+				// part, and this line is the only witness that provably escapes
+				// an agent pod (ccw_commit_push_total has no series - #189).
 				log.Info("re-prompted agent after rejected outcome tool; suppressing this turn's callback",
 					"action", "outcome_reprompt", "turn_id", rec.ID, "tool", toolName, "error", errText,
-					"retryable", retryable, "held_internal_issues", len(rec.InternalIssues))
+					"retryable", retryable, "held_internal_issues", len(rec.InternalIssues),
+					"held_pushed_repos", rec.PushedRepos, "held_failed_repos", rec.FailedRepos)
 				return
 			}
 			m.OutcomeRepromptTotal.WithLabelValues(toolName, "budget_exhausted").Inc()
