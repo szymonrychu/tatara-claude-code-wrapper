@@ -233,10 +233,22 @@ open_or_reuse_pr() {
   printf '%s\n' "$FAKE_PR_URL"
 }
 
+# $FAKE_PR_STATE is a SEQUENCE, whitespace separated, last entry repeating, and
+# NONE means the empty answer (open, not armed). The disarm and the post-merge
+# re-read both read the state twice and the two answers differ, so one fixed
+# value cannot express either path.
 _pr_state() {
   printf '_pr_state\n' >> "$LIB_LOG"
   [ "${FAKE_STATE_RC:-0}" = 0 ] || return 1
-  printf '%s\n' "${FAKE_PR_STATE-}"
+  local n states s
+  n=$(( $(cat "$STUB_DIR/state.n" 2>/dev/null || echo 0) + 1 ))
+  printf '%s' "$n" > "$STUB_DIR/state.n"
+  read -r -a states <<< "${FAKE_PR_STATE-}"
+  [ "${#states[@]}" -eq 0 ] && { printf '\n'; return 0; }
+  [ "$n" -gt "${#states[@]}" ] && n="${#states[@]}"
+  s="${states[$((n - 1))]}"
+  [ "$s" = NONE ] && s=""
+  printf '%s\n' "$s"
 }
 
 arm_pr() {
@@ -255,6 +267,8 @@ if [ "$1" = api ] && printf '%s ' "$@" | grep -q ' PATCH '; then
   key=api-patch
 elif [ "$1" = api ] && printf '%s ' "$@" | grep -q ' POST '; then
   key=api-label-post
+elif [ "$1" = api ] && printf '%s ' "$@" | grep -q '/pulls?'; then
+  key=api-pr-history
 elif [ "$1" = api ]; then
   key=api-label-read
 else
@@ -285,6 +299,11 @@ printf '%s\n' "${CURL_BODY-}"
 PINNED = "2.1.201"
 # One normal day's bump: inside the workflow's max_jump, so it arms.
 BUMPED = "2.1.205"
+
+# The identity the workflow commits under, and therefore the only identity whose
+# work on the stable branch it may force-push over.
+BOT_NAME = "szymonrychu-bot"
+BOT_EMAIL = "szymonrychu-bot@users.noreply.github.com"
 
 
 def npm_latest(version):
@@ -330,7 +349,7 @@ class Harness:
     def origin_url(self):
         return f"file://{self.origin}"
 
-    def _git(self, cwd, *args):
+    def _git(self, cwd, *args, name=BOT_NAME, email=BOT_EMAIL):
         return subprocess.run(
             ["git", *args],
             cwd=str(cwd),
@@ -339,24 +358,35 @@ class Harness:
             check=True,
             env={
                 **os.environ,
-                "GIT_AUTHOR_NAME": "seed",
-                "GIT_AUTHOR_EMAIL": "seed@example.com",
-                "GIT_COMMITTER_NAME": "seed",
-                "GIT_COMMITTER_EMAIL": "seed@example.com",
+                "GIT_AUTHOR_NAME": name,
+                "GIT_AUTHOR_EMAIL": email,
+                "GIT_COMMITTER_NAME": name,
+                "GIT_COMMITTER_EMAIL": email,
             },
         )
 
-    def _commit(self, cwd, content, message):
+    def _commit(self, cwd, content, message, **who):
         (cwd / "Dockerfile").write_text(content, encoding="utf-8")
         self._git(cwd, "add", "Dockerfile")
-        self._git(cwd, "commit", "-m", message)
+        self._git(cwd, "commit", "-m", message, **who)
 
-    def push_branch(self, version, base="main"):
-        """Put an existing bump branch on origin, as a prior run would have."""
+    def push_branch(self, version, base="main", extra=None, **who):
+        """Put an existing bump branch on origin, as a prior run would have.
+
+        `who` overrides the committing identity and `extra` adds a second file
+        to the commit: between them they model the two ways the branch tip can
+        stop being "main plus the bump" that this workflow is allowed to
+        rebuild.
+        """
         side = self.tmp / f"side-{version}"
         self._git(self.tmp, "clone", self.origin_url, str(side))
         self._git(side, "checkout", "-B", BRANCH, f"origin/{base}")
-        self._commit(side, dockerfile(version), f"chore(deps): bump claude-code to {version}")
+        if extra:
+            (side / extra).write_text("fixup\n", encoding="utf-8")
+            self._git(side, "add", extra)
+        self._commit(
+            side, dockerfile(version), f"chore(deps): bump claude-code to {version}", **who
+        )
         self._git(side, "push", "-f", "origin", f"HEAD:{BRANCH}")
         return self.remote_sha()
 
@@ -403,6 +433,7 @@ class Harness:
                 "CURL_BODY": npm_latest(latest),
                 "CURL_RC": str(curl_rc),
                 "REPO": REPO,
+                "GITHUB_REF_NAME": "main",
                 "GH_TOKEN": "not-a-real-token",
                 "FAKE_PR_URL": PR_URL,
                 **{k: str(v) for k, v in env.items()},
@@ -695,3 +726,175 @@ def test_a_failed_label_post_stops_before_arming(h):
     r = h.run()
     assert r.returncode != 0
     assert not any(ln.startswith("arm_pr") for ln in h.lib_calls())
+
+
+def test_a_catch_up_bump_disarms_a_pr_an_earlier_run_armed(h):
+    """Declining to arm is not disarming, and the PR is not necessarily new.
+
+    Day 1 bumps 4 releases and arms PR #N. `ci` stalls - the failure class this
+    whole issue is about ran 47 days. npm keeps publishing, and the first day
+    the delta crosses max_jump this run force-pushes a catch-up head onto that
+    same PR. If it merely declines to arm, the arm from day 1 is still there
+    and squashes the catch-up onto every agent pod the moment ci recovers.
+    """
+    h.push_branch("2.1.198")
+    r = h.run(latest="2.1.241", FAKE_PR_STATE="ARMED NONE")
+    assert r.returncode == 0, r.stdout + r.stderr
+    disarm = [c for c in h.calls("pr-merge") if "--disable-auto" in c]
+    assert len(disarm) == 1, h.calls()
+    assert not any(ln.startswith("arm_pr") for ln in h.lib_calls())
+
+
+def test_a_disarm_that_does_not_take_fails_the_run(h):
+    """`gh pr merge --disable-auto` exiting 0 is not evidence of anything, the
+    same way `--auto` exiting 0 is not (gh-lib.sh:199-202). The observable is
+    the read-back, and a PR still armed on a catch-up head is the exact state
+    this guard exists to prevent.
+    """
+    h.push_branch("2.1.198")
+    r = h.run(latest="2.1.241", FAKE_PR_STATE="ARMED")
+    assert r.returncode != 0
+    assert "still armed" in (r.stdout + r.stderr)
+
+
+def test_an_unarmed_catch_up_pr_is_not_disarmed(h):
+    """No `--disable-auto` on a PR that was never armed: that call errors on a
+    PR in the wrong state, and a red run here would be a false alarm.
+    """
+    r = h.run(latest="2.1.241")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not h.calls("pr-merge")
+
+
+def test_a_downgrade_is_never_armed(h):
+    """The jump budget was a SIGNED comparison: `$(( 150 - 201 ))` is -51, which
+    is not `-gt 5`, so npm re-pointing dist-tags.latest back after a bad line
+    would have shipped 51 releases of rollback to the fleet unreviewed. The
+    stated intent is "a bump the size of a normal day's", and -51 is not that.
+    """
+    r = h.run(latest="2.1.150")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not any(ln.startswith("arm_pr") for ln in h.lib_calls())
+    assert h.calls("api-label-post"), "the PR is still opened and labelled"
+
+
+# --- whose branch is it --------------------------------------------------------
+
+
+def test_a_human_commit_on_the_branch_is_not_force_pushed_over(h):
+    """The arm=no path tells a human to "review and merge it by hand" on a
+    branch with a fixed, well-known name. One fixup commit there (a compat tweak
+    the new claude-code needs) would be discarded by the next `checkout -B` off
+    main and overwritten by the force-push, silently turning the PR back into a
+    bump-only diff while keeping its label and review context.
+    """
+    before = h.push_branch("2.1.198", name="a-human", email="human@example.com")
+    r = h.run()
+    assert r.returncode != 0
+    assert h.remote_sha() == before
+    assert "human@example.com" in (r.stdout + r.stderr)
+
+
+def test_a_branch_tip_touching_more_than_the_dockerfile_is_not_force_pushed_over(h):
+    """Bot-authored is not enough on its own: the ref this run may rebuild is
+    "main plus the bump", and a second file in the tip commit means it is not.
+    """
+    before = h.push_branch("2.1.198", extra="compat.patch")
+    r = h.run()
+    assert r.returncode != 0
+    assert h.remote_sha() == before
+    assert "compat.patch" in (r.stdout + r.stderr)
+
+
+def test_a_dispatch_from_a_non_main_ref_is_refused(h):
+    """workflow_dispatch accepts any ref and actions/checkout takes the
+    dispatched one, so without this the `checkout -B` branches off a task branch
+    and the force-push replaces the canonical bump branch with it - then opens a
+    labelled, armed PR whose diff is the whole feature branch. Dispatching this
+    workflow from a task branch to test it is the obvious thing to do.
+    """
+    r = h.run(GITHUB_REF_NAME="tatara/feat-184")
+    assert r.returncode != 0
+    assert h.remote_sha() == ""
+    assert h.lib_calls() == []
+
+
+def test_an_unset_ref_name_is_refused(h):
+    r = h.run(GITHUB_REF_NAME="")
+    assert r.returncode != 0
+    assert h.remote_sha() == ""
+
+
+# --- closing the PR is a veto --------------------------------------------------
+
+
+def test_a_closed_pr_is_not_reopened_on_an_identical_bump(h):
+    """`_list_open_pr` filters --state open and `current` comes from main, which
+    a close does not change, so nothing else in this workflow can see the
+    rejection: a human who closes an armed bump because it wedged agent pods
+    gets a fresh PR on the byte-identical head at 06:17, armed again.
+    """
+    before = h.push_branch(BUMPED)
+    h.plan("api-pr-history", ["0 191 -"])
+    r = h.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert h.remote_sha() == before
+    assert not any(ln.startswith("open_or_reuse_pr") for ln in h.lib_calls())
+    assert not any(ln.startswith("arm_pr") for ln in h.lib_calls())
+
+
+def test_a_closed_pr_leaves_the_next_bump_unarmed(h):
+    """npm moving on is a new artifact and gets a new PR, but the rejection
+    still stands until a bump actually merges: re-arming the day after a human
+    closed one is the same surprise one version along.
+    """
+    h.plan("api-pr-history", ["0 191 -"])
+    r = h.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert h.remote_sha() != ""
+    assert any(ln.startswith("open_or_reuse_pr") for ln in h.lib_calls())
+    assert not any(ln.startswith("arm_pr") for ln in h.lib_calls())
+    assert "191" in (r.stdout + r.stderr)
+
+
+def test_a_merged_pr_is_not_a_veto(h):
+    """The steady state: the newest completed PR on the branch is the one that
+    merged yesterday, and the guard has to expire on it or it has replaced a
+    dead cron with a cron nobody ever merges.
+    """
+    h.plan("api-pr-history", ["0 191 2026-08-22T06:31:00Z"])
+    r = h.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert any(ln.startswith("arm_pr") for ln in h.lib_calls())
+
+
+def test_an_unreadable_pr_history_is_not_an_absent_veto(h):
+    h.plan("api-pr-history", ["1"])
+    r = h.run()
+    assert r.returncode != 0
+    assert h.remote_sha() == ""
+
+
+def test_a_squash_that_landed_on_a_timeout_is_not_a_failure(h):
+    """`gh pr merge --squash` is the one non-idempotent verb under `retry`: the
+    merge can land server-side while the client times out, and attempts 2-5 then
+    each get "not mergeable". Reporting that as a red run means the one workflow
+    whose red is supposed to mean "the pin is stranded" cries wolf. gh-lib.sh:
+    171-181 already solved the same asymmetry for `gh pr create`.
+    """
+    recovered(h)
+    h.plan("pr-view", ["0 CLEAN"])
+    h.plan("api-label-read", ["0 semver:patch"])
+    h.plan("pr-merge", ["1"])
+    r = h.run(FAKE_ARM_RC=1, FAKE_PR_STATE="NONE MERGED")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "merged" in (r.stdout + r.stderr)
+
+
+def test_a_squash_that_did_not_land_still_fails_the_run(h):
+    recovered(h)
+    h.plan("pr-view", ["0 CLEAN"])
+    h.plan("api-label-read", ["0 semver:patch"])
+    h.plan("pr-merge", ["1"])
+    r = h.run(FAKE_ARM_RC=1, FAKE_PR_STATE="NONE")
+    assert r.returncode != 0
