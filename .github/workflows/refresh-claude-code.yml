@@ -24,8 +24,10 @@ name: refresh-claude-code
 #      matched in any case: the branch name embedded the version, so every day
 #      asked about a name that had never existed.
 #
-# Hence ONE stable branch and no pre-guard at all. The only skip condition is
-# main's pin already equalling npm's latest, which no failed read can imitate.
+# Hence ONE stable branch and no "is some PR open" pre-guard at all. There are
+# exactly two skip conditions, and no failed read can imitate either: main's pin
+# already equals npm's latest, or a human closed the PR for THIS version without
+# merging it. The second one expires when any bump merges.
 on:
   schedule:
     - cron: "17 6 * * *"
@@ -172,23 +174,57 @@ jobs:
           # in bash: `gh --jq` is gojq, not the jq binary, and nothing in this
           # repo's test suite can execute it, so the only part of this read that
           # is actually covered is the part written in shell.
+          #
+          # The TITLE rides along because what a close rejects is the VERSION,
+          # not the tree. This workflow rewrites that title to "... to <X.Y.Z>"
+          # on every run, so it is the record of what was on the table.
           if ! pr_history="$(retry "pr history ${REPO}#${branch}" \
               gh api "repos/${REPO}/pulls?head=${REPO%%/*}:${branch}&state=all&per_page=100&sort=created&direction=desc" \
-              --jq '.[] | select(.state == "closed") | "\(.number) \(.merged_at // "-")"')"; then
+              --jq '.[] | select(.state == "closed") | "\(.number) \(.merged_at // "-") \(.title)"')"; then
             echo "::error::could not read the PR history for ${branch}; refusing to assume nobody has rejected a bump." >&2
             exit 1
           fi
           vetoed_by=""
+          vetoed_version=""
           # Parameter expansion, not `| head -1`: under `pipefail` a SIGPIPE'd
           # producer aborts the step, and this one is the only reader of a list
           # that grows with every bump PR ever opened.
           newest="${pr_history%%$'\n'*}"
-          if [ -n "$newest" ] && [ "${newest#* }" = "-" ]; then
-            vetoed_by="${newest%% *}"
+          if [ -n "$newest" ]; then
+            newest_rest="${newest#* }"
+            if [ "${newest_rest%% *}" = "-" ]; then
+              vetoed_by="${newest%% *}"
+              if [[ "${newest_rest#* }" =~ ([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*$ ]]; then
+                vetoed_version="${BASH_REMATCH[1]}"
+              fi
+            fi
           fi
           if [ -n "$vetoed_by" ]; then
             arm=no
-            jump="#${vetoed_by} was closed without merging"
+            # Appended, not overwritten: a run that is BOTH a catch-up and
+            # vetoed used to print only the veto, so the human it hands the
+            # merge to is never told the diff spans 40 upstream releases.
+            jump="${jump:+${jump}, and }#${vetoed_by} was closed without merging"
+          fi
+
+          # A standing rejection is scoped to the version it rejected. Gated on
+          # tree equality instead, it only held while main was frozen: main's
+          # tip plus the bump changes whenever ANYTHING lands on main, and this
+          # repo's main takes CD pin bumps regularly, so the byte-identical
+          # rejected bump came back as a fresh PR - one per commit to main.
+          #
+          # A title this cannot size vetoes everything until a bump merges: an
+          # unreadable rejection scope is the widest one, and the currency check
+          # reds within 3 days if that ever wedges the pin.
+          if [ -n "$vetoed_by" ]; then
+            if [ -z "$vetoed_version" ]; then
+              echo "::warning::#${vetoed_by} was closed without merging and its title names no version, so this run cannot tell what was rejected; not opening a ${latest} bump. Merge a bump, or reopen #${vetoed_by}, to resume."
+              exit 0
+            fi
+            if [ "$vetoed_version" = "$latest" ]; then
+              echo "::warning::#${vetoed_by} rejected ${vetoed_version} and npm has not moved since; not re-opening the identical bump. Merge a bump, or reopen #${vetoed_by}, to resume."
+              exit 0
+            fi
           fi
 
           authenticate_origin "$REPO"
@@ -242,12 +278,32 @@ jobs:
             # every morning, and neither way the tip stops being this workflow's
             # own work survives both of these.
             if ! tip_email="$(git log -1 --format=%ae "refs/remotes/origin/${branch}")" ||
-               ! tip_files="$(git diff-tree --no-commit-id --name-only -r "refs/remotes/origin/${branch}")"; then
+               ! tip_files="$(git diff-tree --no-commit-id --name-only -r "refs/remotes/origin/${branch}")" ||
+               ! tip_merges="$(git rev-list --no-walk --count --merges "refs/remotes/origin/${branch}")"; then
               echo "::error::could not inspect the tip of ${branch}." >&2
               exit 1
             fi
-            if [ "$tip_email" != "$bot_email" ] || [ "$tip_files" != Dockerfile ]; then
-              echo "::error::origin/${branch} is not a bot-authored Dockerfile-only bump (author '${tip_email}', files '${tip_files//$'\n'/ }'); refusing to force-push over work this run did not create. Merge it, or delete the branch, to resume." >&2
+            # The merge case is tested FIRST and named, because `git diff-tree
+            # -r` prints NOTHING and exits 0 on a merge commit: an "Update
+            # branch" click - the likeliest way this branch stops being main
+            # plus the bump - is bot-authored AND reports no files, so the
+            # file-list test diagnoses it as "changed nothing", which reads like
+            # an empty branch worth deleting.
+            why=""
+            if [ "$tip_merges" != 0 ]; then
+              why="its tip is a merge commit, which is what the \"Update branch\" button leaves behind"
+            elif [ "$tip_email" != "$bot_email" ]; then
+              why="its tip is authored by '${tip_email}', not ${bot_email}"
+            elif [ "$tip_files" != Dockerfile ]; then
+              why="its tip touches '${tip_files//$'\n'/ }', not the Dockerfile alone"
+            fi
+            # Deleting the branch is deliberately NOT offered. It closes the
+            # open PR unmerged, which the veto above reads as a standing
+            # rejection, so the obvious remedy silently stops this cron arming
+            # anything until a human merges a bump by hand - a message a reader
+            # acts on that means something else, which is #184's own shape.
+            if [ -n "$why" ]; then
+              echo "::error::origin/${branch} is not a bot-authored Dockerfile-only bump: ${why}. Refusing to force-push over work this run did not create. Merge the open PR to resume; deleting the branch instead closes the open PR unmerged, which this workflow reads as a standing rejection." >&2
               exit 1
             fi
 
@@ -266,13 +322,51 @@ jobs:
               push=no
             fi
           fi
-          # An identical tree behind a standing rejection is the byte-identical
-          # bump a human already declined, so it is not re-opened at all. When
-          # npm moves on the new version does get a PR - a different artifact
-          # deserves a fresh look - but unarmed, until a bump merges.
-          if [ -n "$vetoed_by" ] && [ "$push" = no ]; then
-            echo "::warning::#${vetoed_by} was closed without merging and nothing has moved since; not re-opening the identical ${latest} bump. Reopen it, or merge a pin, to resume."
-            exit 0
+          # Disarm BEFORE the head moves, not after.
+          #
+          # `arm` is fully decided above, so there is no reason to put the
+          # force-push and four retry-wrapped forge calls (open_or_reuse_pr, the
+          # title PATCH, the label POST, the state read) between a catch-up head
+          # and the removal of an arm an EARLIER run put on that PR - up to ~50s
+          # of backoff each under a partial outage, with auto-merge live on the
+          # new head throughout. Refusing to move the head until the arm is gone
+          # closes that window rather than narrowing it.
+          #
+          # Issued unconditionally when a PR is open, NOT gated on a read saying
+          # ARMED. That is the same field the ARMED case below refuses to
+          # believe after a push, and believing an empty answer is the same
+          # staleness in the other direction - it would skip the disarm AND the
+          # read-back and move the head under a PR that is still armed.
+          # `--disable-auto` errors on a PR that was never armed, so ITS failure
+          # is a warning and the read-back is the observable.
+          if [ "$arm" = no ]; then
+            if ! armed_url="$(_list_open_pr "$REPO" "$branch")"; then
+              echo "::error::could not list open PRs for ${REPO}#${branch}; refusing to move the head without knowing whether one is armed." >&2
+              exit 1
+            fi
+            if [ -n "$armed_url" ]; then
+              if ! retry "disarm ${REPO}#${branch}" \
+                  gh pr merge "$armed_url" --repo "$REPO" --disable-auto >/dev/null; then
+                echo "::warning::gh pr merge --disable-auto failed on ${armed_url}, which is expected when it was never armed; the read-back decides." >&2
+              fi
+              if ! state="$(_pr_state "$REPO" "$armed_url")"; then
+                echo "::error::could not confirm auto-merge is off on ${armed_url}." >&2
+                exit 1
+              fi
+              if [ "$state" = ARMED ]; then
+                echo "::error::${armed_url} is still armed for auto-merge and this run refuses to arm it (${jump}); refusing to move its head, which would merge unreviewed." >&2
+                exit 1
+              fi
+              if [ "$state" = MERGED ]; then
+                # It won the race. Nothing here can undo that, but the log must
+                # not claim a disarm that never happened, and main now carries a
+                # bump this run refused to arm: `current` is stale, so anything
+                # pushed from here would be sized against the wrong base.
+                echo "::warning::${armed_url} (${jump}) merged while this run was disarming it; not pushing on a stale view of main."
+                exit 0
+              fi
+              echo "auto-merge is off on ${armed_url}"
+            fi
           fi
 
           if [ "$push" = yes ]; then
@@ -322,47 +416,30 @@ jobs:
             echo "::error::could not read the state of ${pr_url}." >&2
             exit 1
           fi
-          if [ "$state" = MERGED ]; then
-            echo "${pr_url} is already merged; nothing to arm"
+
+          # Read BEFORE the MERGED short-circuit below. A bump this run refused
+          # to arm that merged anyway - between the disarm above and this read -
+          # is either a hand-merge or pre-mortem 1 firing, and the run cannot
+          # tell them apart; reporting it as an ordinary green success hides the
+          # one of those two that matters.
+          if [ "$arm" = no ]; then
+            if [ "$state" = ARMED ]; then
+              # Nothing between the read-back above and here arms a PR, and a
+              # PR this run just created cannot be armed. So this is a re-arm or
+              # a field this run cannot trust, and both are refusals.
+              echo "::error::${pr_url} reads ARMED after this run disarmed it, and this run refuses to arm it (${jump}); it would merge unreviewed." >&2
+              exit 1
+            fi
+            if [ "$state" = MERGED ]; then
+              echo "::warning::${pr_url} (${jump}) merged although this run refused to arm it. ci builds no image, so nothing green on that PR proved the new claude-code installs; check the release build."
+              exit 0
+            fi
+            echo "::warning::${pr_url} bumps ${current} to ${latest} (${jump}); auto-merge is off and NOT being armed. ci builds no image, so a green run on this PR is not evidence that the new claude-code installs or boots. Review and merge it by hand."
             exit 0
           fi
 
-          if [ "$arm" = no ]; then
-            # Declining to arm is NOT disarming, and this PR is not necessarily
-            # new. Day 1 bumps four releases and arms PR #N; ci stalls - the
-            # failure class this whole issue is about ran 47 days - npm keeps
-            # publishing, and the first day the delta crosses max_jump this run
-            # force-pushes a catch-up head onto that same PR. Day 1's arm then
-            # squashes 40 upstream releases onto every agent pod in the fleet
-            # the moment ci recovers. GitHub drops auto-merge when the pusher
-            # LACKS write access, which the bot PAT has, so the push above may
-            # not be assumed to have cleared it either - which is also why the
-            # ARMED branch below refuses to trust a read-back after a push.
-            # The arm is removed explicitly, and the removal is read back:
-            # `--disable-auto` exiting 0 is no more evidence than `--auto`
-            # exiting 0 was.
-            if [ "$state" = ARMED ]; then
-              if ! retry "disarm ${REPO}#${num}" \
-                  gh pr merge "$pr_url" --repo "$REPO" --disable-auto >/dev/null; then
-                echo "::warning::gh pr merge --disable-auto failed on ${pr_url}; re-reading the state before deciding." >&2
-              fi
-              if ! state="$(_pr_state "$REPO" "$pr_url")"; then
-                echo "::error::could not confirm auto-merge is off on ${pr_url}." >&2
-                exit 1
-              fi
-              if [ "$state" = ARMED ]; then
-                echo "::error::${pr_url} is still armed for auto-merge, and this run refuses to arm it (${jump}); it would merge unreviewed." >&2
-                exit 1
-              fi
-              if [ "$state" = MERGED ]; then
-                # It won the race. Nothing here can undo that, but the log must
-                # not claim a disarm that never happened.
-                echo "::warning::${pr_url} (${jump}) merged while this run was disarming it."
-                exit 0
-              fi
-              echo "disarmed auto-merge on ${pr_url}"
-            fi
-            echo "::warning::${pr_url} bumps ${current} to ${latest} (${jump}); NOT arming auto-merge. ci builds no image, so a green run on this PR is not evidence that the new claude-code installs or boots. Review and merge it by hand."
+          if [ "$state" = MERGED ]; then
+            echo "${pr_url} is already merged; nothing to arm"
             exit 0
           fi
 

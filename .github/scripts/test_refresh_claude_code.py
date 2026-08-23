@@ -32,6 +32,7 @@ a real git repo with a real origin, and a test double for gh-lib.sh.
 
 import os
 import re
+import shutil
 import subprocess
 import textwrap
 from pathlib import Path
@@ -255,6 +256,14 @@ arm_pr() {
   printf 'arm_pr %s %s %s\n' "$1" "$2" "$3" >> "$LIB_LOG"
   return "${FAKE_ARM_RC:-0}"
 }
+
+# The PR the branch already has open, as seen BEFORE this run pushes anything.
+# Empty by default: most fixtures start with no PR at all.
+_list_open_pr() {
+  printf '_list_open_pr %s %s\n' "$1" "$2" >> "$LIB_LOG"
+  [ "${FAKE_LIST_RC:-0}" = 0 ] || return 1
+  printf '%s\n' "${FAKE_OPEN_PR_URL-}"
+}
 """
 
 FAKE_LIB_FUNCTIONS = set(re.findall(r"^(\S+)\(\)", FAKE_LIB, re.M))
@@ -388,6 +397,36 @@ class Harness:
             side, dockerfile(version), f"chore(deps): bump claude-code to {version}", **who
         )
         self._git(side, "push", "-f", "origin", f"HEAD:{BRANCH}")
+        return self.remote_sha()
+
+    def advance_main(self, name):
+        """A commit to main that has nothing to do with claude-code.
+
+        This repo's main takes CD pin bumps regularly, so "main moved between
+        two runs" is the normal case, not an exotic one. The runner checks main
+        out fresh every morning, so the work clone is rebuilt too.
+        """
+        side = self.tmp / f"main-{name}"
+        self._git(self.tmp, "clone", self.origin_url, str(side))
+        (side / name).write_text("unrelated\n", encoding="utf-8")
+        self._git(side, "add", name)
+        self._git(side, "commit", "-m", f"chore: {name}")
+        self._git(side, "push", "origin", "main")
+        shutil.rmtree(self.work)
+        self._git(self.tmp, "clone", "--depth=1", self.origin_url, str(self.work))
+
+    def click_update_branch(self):
+        """The "Update branch" button: a merge of main into the bump branch.
+
+        `git diff-tree --no-commit-id --name-only -r` prints NOTHING and exits 0
+        on a merge commit, so this tip passes a Dockerfile-only test by
+        reporting no files at all.
+        """
+        side = self.tmp / "update-branch"
+        self._git(self.tmp, "clone", self.origin_url, str(side))
+        self._git(side, "checkout", "-B", BRANCH, f"origin/{BRANCH}")
+        self._git(side, "merge", "--no-ff", "origin/main", "-m", "Merge branch 'main'")
+        self._git(side, "push", "origin", f"HEAD:{BRANCH}")
         return self.remote_sha()
 
     def remote_sha(self):
@@ -737,40 +776,108 @@ def test_a_catch_up_bump_disarms_a_pr_an_earlier_run_armed(h):
     same PR. If it merely declines to arm, the arm from day 1 is still there
     and squashes the catch-up onto every agent pod the moment ci recovers.
     """
-    h.push_branch("2.1.198")
-    r = h.run(latest="2.1.241", FAKE_PR_STATE="ARMED NONE")
+    before = h.push_branch("2.1.198")
+    r = h.run(latest="2.1.241", FAKE_OPEN_PR_URL=PR_URL, FAKE_PR_STATE="NONE")
     assert r.returncode == 0, r.stdout + r.stderr
     disarm = [c for c in h.calls("pr-merge") if "--disable-auto" in c]
     assert len(disarm) == 1, h.calls()
+    assert h.remote_sha() != before, "a disarmed PR may have its head moved"
     assert not any(ln.startswith("arm_pr") for ln in h.lib_calls())
 
 
-def test_a_disarm_that_does_not_take_fails_the_run(h):
-    """`gh pr merge --disable-auto` exiting 0 is not evidence of anything, the
-    same way `--auto` exiting 0 is not (gh-lib.sh:199-202). The observable is
-    the read-back, and a PR still armed on a catch-up head is the exact state
-    this guard exists to prevent.
+def test_the_disarm_happens_before_the_head_moves(h):
+    """`arm` is fully decided before the checkout, so there is no reason to put
+    the push and four retry-wrapped forge calls between a catch-up head and the
+    removal of an arm an earlier run put on that PR - up to ~50s of backoff each
+    under a partial outage, with auto-merge live on the new head throughout.
     """
     h.push_branch("2.1.198")
-    r = h.run(latest="2.1.241", FAKE_PR_STATE="ARMED")
+    r = h.run(latest="2.1.241", FAKE_OPEN_PR_URL=PR_URL, FAKE_PR_STATE="NONE")
+    assert r.returncode == 0, r.stdout + r.stderr
+    order = [c.split()[0] for c in h.calls()]
+    assert "pr-merge" in order and "api-patch" in order
+    assert order.index("pr-merge") < order.index("api-patch"), h.calls()
+
+
+def test_a_catch_up_pr_is_disarmed_even_when_the_state_reads_unarmed(h):
+    """The disarm may not be gated on `_pr_state` saying ARMED.
+
+    That is the same field the ARMED case below refuses to believe, and an empty
+    answer is the same staleness in the other direction: it would skip the
+    disarm AND the read-back and exit 0 on a head that is still armed. The call
+    errors on a PR that was never armed, which is why ITS failure is tolerated
+    and the read-back is the observable.
+    """
+    h.push_branch("2.1.198")
+    h.plan("pr-merge", ["1"])
+    r = h.run(latest="2.1.241", FAKE_OPEN_PR_URL=PR_URL, FAKE_PR_STATE="NONE")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert [c for c in h.calls("pr-merge") if "--disable-auto" in c]
+
+
+def test_a_disarm_that_does_not_take_leaves_the_head_where_it_was(h):
+    """`gh pr merge --disable-auto` exiting 0 is not evidence of anything, the
+    same way `--auto` exiting 0 is not (gh-lib.sh:199-202). The observable is
+    the read-back, and the head must not move onto a PR still armed.
+    """
+    before = h.push_branch("2.1.198")
+    r = h.run(latest="2.1.241", FAKE_OPEN_PR_URL=PR_URL, FAKE_PR_STATE="ARMED")
     assert r.returncode != 0
     assert "still armed" in (r.stdout + r.stderr)
+    assert h.remote_sha() == before
+
+
+def test_an_unlistable_pr_is_not_an_absent_arm(h):
+    """A list that FAILED must never license moving the head of a PR this run
+    could not see the arming state of.
+    """
+    before = h.push_branch("2.1.198")
+    r = h.run(latest="2.1.241", FAKE_LIST_RC=1)
+    assert r.returncode != 0
+    assert h.remote_sha() == before
 
 
 def test_a_catch_up_that_merges_mid_disarm_does_not_claim_a_disarm(h):
     """Nothing here can undo it, but the log must not report a removal that
-    never happened - the whole point of reading the observable back.
+    never happened, and this run's view of main is now stale.
     """
-    h.push_branch("2.1.198")
-    r = h.run(latest="2.1.241", FAKE_PR_STATE="ARMED MERGED")
+    before = h.push_branch("2.1.198")
+    r = h.run(latest="2.1.241", FAKE_OPEN_PR_URL=PR_URL, FAKE_PR_STATE="MERGED")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "merged while this run was disarming it" in (r.stdout + r.stderr)
-    assert "disarmed auto-merge" not in (r.stdout + r.stderr)
+    assert "auto-merge is off" not in (r.stdout + r.stderr)
+    assert h.remote_sha() == before
 
 
-def test_an_unarmed_catch_up_pr_is_not_disarmed(h):
-    """No `--disable-auto` on a PR that was never armed: that call errors on a
-    PR in the wrong state, and a red run here would be a false alarm.
+def test_a_refused_bump_that_merged_anyway_is_not_an_ordinary_success(h):
+    """The MERGED short-circuit used to sit ABOVE the arm=no gate, so a bump
+    this run deliberately refused to arm, which merged anyway between the disarm
+    and this read, was logged as a plain green success with no mention of the
+    jump - indistinguishable from a hand-merge, and the run cannot tell them
+    apart.
+    """
+    r = h.run(latest="2.1.241", FAKE_PR_STATE="MERGED")
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout + r.stderr
+    assert "::warning::" in out
+    assert "40 patch releases at once" in out
+
+
+def test_a_pr_that_reads_armed_after_being_disarmed_fails_the_run(h):
+    """Nothing between the read-back and here arms a PR, so an ARMED answer at
+    this point is either a re-arm or a forge field this run cannot trust. Both
+    are refusals: the whole point of the catch-up guard is that 40 releases do
+    not reach the fleet unreviewed.
+    """
+    h.push_branch("2.1.198")
+    r = h.run(latest="2.1.241", FAKE_OPEN_PR_URL=PR_URL, FAKE_PR_STATE="NONE ARMED")
+    assert r.returncode != 0
+    assert "armed" in (r.stdout + r.stderr)
+
+
+def test_an_unarmed_catch_up_pr_with_no_open_pr_is_not_disarmed(h):
+    """Nothing to disarm when the branch has no PR at all: the one this run is
+    about to open cannot be armed, because this run is what would arm it.
     """
     r = h.run(latest="2.1.241")
     assert r.returncode == 0, r.stdout + r.stderr
@@ -817,6 +924,39 @@ def test_a_branch_tip_touching_more_than_the_dockerfile_is_not_force_pushed_over
     assert "compat.patch" in (r.stdout + r.stderr)
 
 
+def test_an_update_branch_merge_tip_is_named_as_a_merge(h):
+    """`git diff-tree --no-commit-id --name-only -r <merge>` prints NOTHING and
+    exits 0, so a merge tip passes a Dockerfile-only test by reporting no files
+    at all - and clicking "Update branch" on the bump PR is the likeliest way
+    this branch stops being main plus the bump. Diagnosed as "changed no files"
+    it reads like an empty branch worth deleting, which is the one remedy that
+    makes things worse.
+    """
+    before = h.push_branch("2.1.198")
+    h.advance_main("unrelated.txt")
+    before = h.click_update_branch()
+    r = h.run()
+    assert r.returncode != 0
+    assert h.remote_sha() == before
+    out = r.stdout + r.stderr
+    assert "merge commit" in out
+    assert "files ''" not in out
+
+
+def test_the_ownership_refusal_names_what_deleting_the_branch_costs(h):
+    """Deleting the head branch of an open PR closes that PR UNMERGED, and a
+    closed-unmerged PR is this workflow's standing rejection - so the obvious
+    remedy silently stops the cron arming until a human merges a bump by hand.
+    Advising it without saying so is the same shape as the guard that started
+    #184: a message a reader acts on that means something else.
+    """
+    before = h.push_branch("2.1.198", name="a-human", email="human@example.com")
+    r = h.run()
+    assert r.returncode != 0
+    assert h.remote_sha() == before
+    assert "closes the open PR unmerged" in (r.stdout + r.stderr)
+
+
 def test_a_dispatch_from_a_non_main_ref_is_refused(h):
     """workflow_dispatch accepts any ref and actions/checkout takes the
     dispatched one, so without this the `checkout -B` branches off a task branch
@@ -839,6 +979,15 @@ def test_an_unset_ref_name_is_refused(h):
 # --- closing the PR is a veto --------------------------------------------------
 
 
+def closed(version, number=191):
+    """The api-pr-history projection for one closed-unmerged bump PR.
+
+    The version is read out of the TITLE, which this workflow rewrites on every
+    run - the rejected artifact is what a close rejects.
+    """
+    return f"0 {number} - chore(deps): bump claude-code to {version}"
+
+
 def test_a_closed_pr_is_not_reopened_on_an_identical_bump(h):
     """`_list_open_pr` filters --state open and `current` comes from main, which
     a close does not change, so nothing else in this workflow can see the
@@ -846,7 +995,7 @@ def test_a_closed_pr_is_not_reopened_on_an_identical_bump(h):
     gets a fresh PR on the byte-identical head at 06:17, armed again.
     """
     before = h.push_branch(BUMPED)
-    h.plan("api-pr-history", ["0 191 -"])
+    h.plan("api-pr-history", [closed(BUMPED)])
     r = h.run()
     assert r.returncode == 0, r.stdout + r.stderr
     assert h.remote_sha() == before
@@ -854,12 +1003,42 @@ def test_a_closed_pr_is_not_reopened_on_an_identical_bump(h):
     assert not any(ln.startswith("arm_pr") for ln in h.lib_calls())
 
 
+def test_a_closed_pr_survives_an_unrelated_commit_to_main(h):
+    """The veto is about the VERSION a human rejected, not about the tree.
+
+    Gated on tree equality it only held while main was frozen: main's tip plus
+    the bump changes whenever anything at all lands on main - and this repo's
+    main takes CD pin bumps regularly - so the byte-identical rejected bump came
+    back as a fresh PR, one per commit to main, each needing another close.
+    """
+    before = h.push_branch(BUMPED)
+    h.advance_main("unrelated.txt")
+    h.plan("api-pr-history", [closed(BUMPED)])
+    r = h.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert h.remote_sha() == before
+    assert not any(ln.startswith("open_or_reuse_pr") for ln in h.lib_calls())
+
+
+def test_a_veto_whose_version_cannot_be_read_stops_the_cron(h):
+    """An unreadable rejection scope is the WIDEST one. A hand-edited title is
+    the only way here, the currency check reds within 3 days if it ever wedges
+    the pin, and the alternative is guessing that a rejection a run cannot size
+    does not apply to what it is about to open.
+    """
+    h.plan("api-pr-history", ["0 191 - please stop bumping this"])
+    r = h.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert h.remote_sha() == ""
+    assert not any(ln.startswith("open_or_reuse_pr") for ln in h.lib_calls())
+
+
 def test_a_closed_pr_leaves_the_next_bump_unarmed(h):
     """npm moving on is a new artifact and gets a new PR, but the rejection
     still stands until a bump actually merges: re-arming the day after a human
     closed one is the same surprise one version along.
     """
-    h.plan("api-pr-history", ["0 191 -"])
+    h.plan("api-pr-history", [closed("2.1.202")])
     r = h.run()
     assert r.returncode == 0, r.stdout + r.stderr
     assert h.remote_sha() != ""
@@ -868,12 +1047,44 @@ def test_a_closed_pr_leaves_the_next_bump_unarmed(h):
     assert "191" in (r.stdout + r.stderr)
 
 
+def test_a_veto_on_an_older_version_still_reconciles_the_open_pr(h):
+    """The unarmed PR for the CURRENT bump is already open and neither npm nor
+    main has moved. The run used to exit above the title PATCH and the label
+    POST telling the reader to "reopen" a PR that was never closed - so an open
+    PR's semver:patch went unreconciled for as long as that state lasted, and ci
+    cuts the release tag from that label.
+    """
+    h.push_branch(BUMPED)
+    h.plan("api-pr-history", [closed("2.1.202")])
+    r = h.run(FAKE_OPEN_PR_URL=PR_URL)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert h.calls("api-patch"), "the reused PR's title still names the version"
+    assert h.calls("api-label-post")
+    assert not any(ln.startswith("arm_pr") for ln in h.lib_calls())
+
+
+def test_a_catch_up_under_a_veto_reports_both_reasons(h):
+    """A run that is both a 40-release catch-up and vetoed used to print only
+    the veto: the human is told to merge by hand with no hint the diff spans 40
+    upstream releases.
+    """
+    h.plan("api-pr-history", [closed("2.1.202")])
+    r = h.run(latest="2.1.241")
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout + r.stderr
+    assert "40 patch releases at once" in out
+    assert "191" in out
+
+
 def test_a_merged_pr_is_not_a_veto(h):
     """The steady state: the newest completed PR on the branch is the one that
     merged yesterday, and the guard has to expire on it or it has replaced a
     dead cron with a cron nobody ever merges.
     """
-    h.plan("api-pr-history", ["0 191 2026-08-22T06:31:00Z"])
+    h.plan(
+        "api-pr-history",
+        [f"0 191 2026-08-22T06:31:00Z chore(deps): bump claude-code to {BUMPED}"],
+    )
     r = h.run()
     assert r.returncode == 0, r.stdout + r.stderr
     assert any(ln.startswith("arm_pr") for ln in h.lib_calls())
