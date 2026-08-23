@@ -194,6 +194,44 @@ func (h *repoListHarness) clean(t *testing.T, id string, pushed, failed []string
 	}
 }
 
+// A HOLD MUST NEVER CLOBBER ANOTHER GOROUTINE'S HELD SET.
+//
+// finalizeTurn runs on a per-turn goroutine and the take/hold pair is split
+// across it: only each half is atomic, not the pair. Two finalisers overlap
+// whenever one is still inside CommitAndPushAll while the next turn's
+// re-prompt has already been submitted. If the hold ASSIGNED, a finaliser
+// whose own lists are both empty would write nil over the set the other one
+// just parked - losing exactly the payload this whole change exists to save.
+//
+// holdInternalIssues survives the same split because it early-returns on empty
+// AND appends. The hold folds instead, which is the identity on the sequential
+// path (takePendingRepoLists runs unconditionally first, so the held fields are
+// always nil by the time a hold can run) and keeps the subtraction rules under
+// the race.
+func TestHoldRepoLists_DoesNotClobberAnEarlierHold(t *testing.T) {
+	a := &app{log: testLogger()}
+
+	a.holdRepoLists([]string{"repo-a"}, []string{"repo-c"})
+	// A second finaliser reaches its hold with nothing of its own.
+	a.holdRepoLists(nil, nil)
+
+	pushed, failed := a.takePendingRepoLists()
+	require.Equal(t, []string{"repo-a"}, pushed, "an empty hold must not erase a parked set")
+	require.Equal(t, []string{"repo-c"}, failed, "an empty hold must not erase a parked set")
+
+	// And the fold still applies the subtraction: a later push cancels the
+	// held failure rather than stacking beside it.
+	a.holdRepoLists([]string{"repo-x"}, []string{"repo-y"})
+	a.holdRepoLists([]string{"repo-y"}, nil)
+	pushed, failed = a.takePendingRepoLists()
+	require.Equal(t, []string{"repo-x", "repo-y"}, pushed)
+	require.Nil(t, failed, "a hold that pushes a held failure must cancel it, not keep both")
+
+	pushed, failed = a.takePendingRepoLists()
+	require.Nil(t, pushed, "take must clear")
+	require.Nil(t, failed, "take must clear")
+}
+
 // THE SUPPRESSED CALLBACK IS THE ONLY EGRESS FOR THE REPO LISTS TOO.
 //
 // The reproduction from #191. Turn N pushes A,B and fails C, then its
@@ -242,6 +280,32 @@ func TestFinalizeTurn_ChainedRepromptsAccumulateRepoLists(t *testing.T) {
 	require.Equal(t, []any{"repo-a", "repo-b", "repo-d"}, body["pushedRepos"],
 		"a second suppression must not drop the first suppression's pushes")
 	require.Equal(t, []any{"repo-c"}, body["failedRepos"])
+}
+
+// The chain does not always end with a clean turn: once maxOutcomeReprompts is
+// spent, reprompt() refuses and finalizeTurn falls THROUGH the suppression
+// block to deliver the callback so the operator's own cap takes over. That
+// fall-through is the last exit the held lists have, so it must carry them.
+func TestFinalizeTurn_BudgetExhaustedStillDeliversTheHeldRepoLists(t *testing.T) {
+	h := newRepoListHarness(t)
+	h.suppressed(t, "turn-1", []string{"repo-a"}, []string{"repo-c"})
+	h.suppressed(t, "turn-2", []string{"repo-b"}, nil)
+
+	// Third rejected outcome: the re-prompt budget is spent, so this turn is
+	// NOT suppressed - it delivers, and it is the only turn that can.
+	h.mgr.SetTranscriptPathForTest(rejectedOutcomeTranscript(t))
+	rec := &turn.Record{ID: "turn-3", CallbackURL: h.url}
+	h.app.finalizeTurn(rec, config{}, metrics.New(prometheus.NewRegistry()),
+		obs.NewLogger(h.logs, slog.LevelInfo), h.sender, "")
+
+	select {
+	case body := <-h.delivered:
+		require.Equal(t, []any{"repo-a", "repo-b"}, body["pushedRepos"],
+			"the budget-exhausted fall-through is the held lists' last exit")
+		require.Equal(t, []any{"repo-c"}, body["failedRepos"])
+	case <-time.After(2 * time.Second):
+		t.Fatal("a budget-exhausted turn must deliver its callback")
+	}
 }
 
 // A turn that pushed nothing and was not suppressed must be byte-identical on

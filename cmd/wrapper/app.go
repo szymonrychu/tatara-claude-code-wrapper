@@ -139,15 +139,22 @@ func (a *app) takePendingInternalIssues() []turn.InternalIssueReport {
 // holdRepoLists parks the commit/push report from a turn whose callback was
 // suppressed by the outcome re-prompt, for the next turn's callback to carry.
 //
-// It ASSIGNS rather than appending, unlike holdInternalIssues: it is only ever
-// called with rec's lists, which the drain below has already merged with
-// anything a previous suppression held, so a chain of suppressions accumulates
-// through mergeRepoLists rather than here. Appending would skip that merge's
-// subtraction rules and let a held failure outlive the push that fixed it.
+// It FOLDS into whatever is already held rather than assigning. On the
+// sequential path that is the identity - takePendingRepoLists runs
+// unconditionally above, so both fields are nil by the time any hold can run,
+// and a chain of suppressions accumulates through that drain. It matters
+// because the take and the hold are two separate critical sections of one
+// finalizeTurn, and finalizeTurn runs on a per-turn goroutine: two finalisers
+// overlap whenever one is still inside CommitAndPushAll while the next turn's
+// re-prompt has already been submitted. An assigning hold whose own lists were
+// both empty would write nil over the set the other finaliser just parked,
+// losing exactly the payload this hand-off exists to save. holdInternalIssues
+// survives the same split by early-returning on empty and appending; folding
+// is the equivalent here that also keeps mergeRepoLists' subtraction rules.
 func (a *app) holdRepoLists(pushed, failed []string) {
 	a.heldReposMu.Lock()
 	defer a.heldReposMu.Unlock()
-	a.heldPushedRepos, a.heldFailedRepos = pushed, failed
+	a.heldPushedRepos, a.heldFailedRepos = mergeRepoLists(a.heldPushedRepos, a.heldFailedRepos, pushed, failed)
 }
 
 // takePendingRepoLists returns and clears the repo lists held from earlier
