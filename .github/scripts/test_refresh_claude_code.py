@@ -757,6 +757,17 @@ def test_a_disarm_that_does_not_take_fails_the_run(h):
     assert "still armed" in (r.stdout + r.stderr)
 
 
+def test_a_catch_up_that_merges_mid_disarm_does_not_claim_a_disarm(h):
+    """Nothing here can undo it, but the log must not report a removal that
+    never happened - the whole point of reading the observable back.
+    """
+    h.push_branch("2.1.198")
+    r = h.run(latest="2.1.241", FAKE_PR_STATE="ARMED MERGED")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "merged while this run was disarming it" in (r.stdout + r.stderr)
+    assert "disarmed auto-merge" not in (r.stdout + r.stderr)
+
+
 def test_an_unarmed_catch_up_pr_is_not_disarmed(h):
     """No `--disable-auto` on a PR that was never armed: that call errors on a
     PR in the wrong state, and a red run here would be a false alarm.

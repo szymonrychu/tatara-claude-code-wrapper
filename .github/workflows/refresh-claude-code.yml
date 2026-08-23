@@ -354,6 +354,12 @@ jobs:
                 echo "::error::${pr_url} is still armed for auto-merge, and this run refuses to arm it (${jump}); it would merge unreviewed." >&2
                 exit 1
               fi
+              if [ "$state" = MERGED ]; then
+                # It won the race. Nothing here can undo that, but the log must
+                # not claim a disarm that never happened.
+                echo "::warning::${pr_url} (${jump}) merged while this run was disarming it."
+                exit 0
+              fi
               echo "disarmed auto-merge on ${pr_url}"
             fi
             echo "::warning::${pr_url} bumps ${current} to ${latest} (${jump}); NOT arming auto-merge. ci builds no image, so a green run on this PR is not evidence that the new claude-code installs or boots. Review and merge it by hand."
