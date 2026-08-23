@@ -72,6 +72,28 @@ jobs:
       # true would silently reintroduce the double-publish this repo already
       # fixed once.
       enable-image: false
+      # Dockerfile:57 is `FROM harbor.szymonrichert.pl/containers/tatara-cli:
+      # ${TATARA_CLI_VERSION}`. image-verify passes no `--opt target=`, so
+      # buildkit solves the whole graph and always reaches it. Measured on this
+      # repo's first ever run of that job (PR #186 at v3.10.0): 401
+      # Unauthorized on the manifest HEAD, and no project on that Harbor serves
+      # anonymous pull.
+      #
+      # The shared job cannot simply be handed the credential. The only Harbor
+      # credentials in that workflow are the PUSH ones, and on pull_request the
+      # caller is taken from the PR head - so it would be writing a
+      # push-capable credential onto a runner whose job graph a PR can edit.
+      # tatara-operator's internal/cicontract/doc.go forbids registry
+      # credentials on the PR path outright, and merge_gate_test.go fails on
+      # any HARBOR_* env in a non-publishing job.
+      #
+      # NOT a local decision. The matching entry is
+      # cicontract.ImageVerifyExempt in tatara-operator, and the scheduled
+      # ci-shared-currency audit reds on any consumer that sets this false
+      # without one. Until a pull-only credential or an anonymously pullable
+      # base image exists, this repo's Dockerfile is first compiled in
+      # release.yml. tatara-operator#640.
+      enable-image-verify: false
     secrets: inherit
 
 # NOTE: image + chart publish is NOT here. On a green push-to-main run, the
