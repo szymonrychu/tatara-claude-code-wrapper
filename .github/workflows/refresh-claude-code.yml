@@ -2,11 +2,28 @@ name: refresh-claude-code
 
 # Daily check for a newer @anthropic-ai/claude-code npm release. When npm
 # publishes a version above the pinned Dockerfile `ARG CLAUDE_CODE_VERSION`,
-# open a semver:patch PR bumping the pin and enable auto-merge. A green `ci`
-# run then cascades through `release`, which rebuilds+publishes the wrapper
-# image at the new claude version (the claude layer is isolated, so only it
-# rebuilds). Mirrors the bot-authored auto-merge-PR pattern from tatara-helmfile
-# cd-release: szymonrychu-bot identity, PAT-in-URL push, gh label + auto-merge.
+# rebuild the `deps/claude-code` branch on top of main, open or reuse a
+# semver:patch PR and arm auto-merge. A green `ci` run then cascades through
+# `release`, which rebuilds+publishes the wrapper image at the new claude
+# version (the claude layer is isolated, so only it rebuilds).
+#
+# This failed on all 27 runs from 2026-07-07 to 2026-08-23 (#184), leaving 27
+# orphan `deps/claude-code-*` branches on origin with zero PRs between them.
+# Run 32624497855 names both defects on one path:
+#
+#   1. `gh: command not found`. The ARC runner image for this repo has no gh.
+#      release.yml survives on the same runner only because cd-release's first
+#      composite step installs it ("Self-hosted ARC runner images lack gh").
+#      This workflow now goes through that same action, which also exports the
+#      forge helpers it was hand-rolled without.
+#   2. The dedup guard ran `gh pr list ... | grep -q .` as an `if` CONDITION,
+#      where bash suspends errexit, so that 127 was indistinguishable from "no
+#      PR is open" and the run pushed a branch anyway. It could never have
+#      matched in any case: the branch name embedded the version, so every day
+#      asked about a name that had never existed.
+#
+# Hence ONE stable branch and no pre-guard at all. The only skip condition is
+# main's pin already equalling npm's latest, which no failed read can imitate.
 on:
   schedule:
     - cron: "17 6 * * *"
@@ -26,36 +43,54 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # We push the bump branch with a PAT-in-URL below; the persisted
-          # default GITHUB_TOKEN header would otherwise override it (see the
-          # release workflow for the same reason).
+          # `authenticate_origin` clears the persisted extraheader anyway; not
+          # writing it in the first place is one fewer way for the read-only
+          # default GITHUB_TOKEN to win a request. Same reason as release.yml.
           persist-credentials: false
 
-      - name: check npm and open bump PR
+      # Installs gh (absent from this runner image) and exports
+      # $CD_RELEASE_LIB. Nothing else: mode=setup does no tag and no bump.
+      - name: gh CLI and the cd-release forge helpers
+        uses: szymonrychu/tatara-helmfile/.github/actions/cd-release@main
+        with:
+          mode: setup
+          token: ${{ secrets.TATARA_CD_TOKEN }}
+
+      - name: open or update the claude-code bump PR
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit
+          source "$CD_RELEASE_LIB"
 
-          # Dependency-light: read the npm registry latest tag with curl (no
-          # node/npm setup needed on the runner).
-          latest="$(curl -fsSL https://registry.npmjs.org/@anthropic-ai/claude-code/latest \
-            | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)"
-          current="$(sed -n 's/^ARG CLAUDE_CODE_VERSION=//p' Dockerfile | head -1)"
-          echo "current=$current latest=$latest"
-          if [ -z "$latest" ]; then
-            echo "::error::could not resolve npm latest for @anthropic-ai/claude-code" >&2
+          # ONE stable branch. A versioned name is a fresh name every day, so a
+          # run that fails leaves a branch nothing later reuses or cleans up,
+          # and the residue is one orphan per day forever.
+          branch="deps/claude-code"
+          label="semver:patch"
+
+          if ! payload="$(retry "npm dist-tags.latest" \
+              curl -fsSL https://registry.npmjs.org/@anthropic-ai/claude-code/latest)"; then
+            echo "::error::could not read the npm latest tag for @anthropic-ai/claude-code." >&2
             exit 1
           fi
+          # Matched in bash rather than piped through grep: under `pipefail` a
+          # no-match would abort the step with no diagnosis at all, and a silent
+          # exit is the one thing a failed read must never produce here.
+          if [[ "$payload" =~ \"version\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+            latest="${BASH_REMATCH[1]}"
+          else
+            echo "::error::could not parse a version out of the npm registry answer." >&2
+            exit 1
+          fi
+
+          current="$(sed -n 's/^ARG CLAUDE_CODE_VERSION=//p' Dockerfile | head -1)"
+          echo "current=$current latest=$latest"
           if [ "$current" = "$latest" ]; then
-            echo "already pinned to $latest; nothing to do"
+            echo "main already pins $latest; nothing to do"
             exit 0
           fi
 
-          branch="deps/claude-code-${latest}"
-          if gh pr list --repo "$REPO" --head "$branch" --state open \
-              --json number --jq '.[0].number' | grep -q .; then
-            echo "bump PR for $latest already open"
-            exit 0
-          fi
+          authenticate_origin "$REPO"
 
           git config user.name "szymonrychu-bot"
           git config user.email "szymonrychu-bot@users.noreply.github.com"
@@ -63,15 +98,110 @@ jobs:
           sed -i "s/^ARG CLAUDE_CODE_VERSION=.*/ARG CLAUDE_CODE_VERSION=${latest}/" Dockerfile
           git add Dockerfile
           git commit -m "chore(deps): bump claude-code to ${latest}"
-          git push -f "https://x-access-token:${TOKEN}@github.com/${REPO}.git" "HEAD:${branch}"
 
-          gh label create semver:patch --repo "$REPO" --color 0e8a16 \
-            --description "tatara CD dependency bump" 2>/dev/null || true
-          url="$(gh pr create --repo "$REPO" --base main --head "$branch" \
-            --title "chore(deps): bump claude-code to ${latest}" \
-            --body "Automated: @anthropic-ai/claude-code ${current} -> ${latest}. A green ci run cascades to a rebuilt+published wrapper image at the new claude version.")"
-          # REST label add (repo scope only, unlike `gh pr edit --add-label`).
-          num="${url##*/}"
-          gh api -X POST "repos/$REPO/issues/$num/labels" -f "labels[]=semver:patch" >/dev/null
-          gh pr merge "$url" --repo "$REPO" --auto --squash
-          echo "opened + auto-merge enabled: $url"
+          # Whether to push is decided on the TREE, not on the commit: `git
+          # commit` mints a new sha for an identical tree, and force-pushing
+          # that every morning would restart the whole self-hosted ci matrix on
+          # the open PR forever. An ls-remote that FAILED is not "the branch is
+          # absent" - only an empty SUCCESSFUL answer means there is nothing to
+          # compare against.
+          if ! remote_head="$(retry "git ls-remote $branch" \
+              git ls-remote --heads origin "refs/heads/${branch}")"; then
+            echo "::error::could not read refs/heads/${branch} from origin; refusing to force-push over a branch this run never saw." >&2
+            exit 1
+          fi
+          push=yes
+          if [ -n "$remote_head" ]; then
+            # Depth-1 checkout, so the branch tip has to be fetched explicitly.
+            if ! retry "git fetch $branch" git fetch --depth=1 origin \
+                "+refs/heads/${branch}:refs/remotes/origin/${branch}"; then
+              echo "::error::could not fetch ${branch} from origin." >&2
+              exit 1
+            fi
+            if [ "$(git rev-parse "HEAD^{tree}")" = "$(git rev-parse "refs/remotes/origin/${branch}^{tree}")" ]; then
+              echo "origin/${branch} already carries claude-code ${latest} on this base; not re-pushing"
+              push=no
+            fi
+          fi
+          if [ "$push" = yes ]; then
+            git push -f origin "HEAD:${branch}"
+          fi
+
+          # Everything below is what makes the pushed pin MERGE, so every step
+          # of it is status-checked: a pin behind a PR that was never opened,
+          # never retitled or never armed is the shape that cost 47 days here.
+          title="chore(deps): bump claude-code to ${latest}"
+          body="Automated: @anthropic-ai/claude-code ${current} -> ${latest}. A green ci run cascades to a rebuilt+published wrapper image at the new claude version. Opened by .github/workflows/refresh-claude-code.yml."
+          if ! pr_url="$(open_or_reuse_pr "$REPO" "$branch" "$title" "$body")"; then
+            exit 1
+          fi
+          num="$(pr_number "$pr_url")"
+
+          # A REUSED PR still carries the previous run's version in its title,
+          # and the title is what the squash merge commits, so it is rewritten
+          # every time the head moves. REST rather than `gh pr edit`: that runs
+          # a GraphQL query whose `login` field demands read:org on a classic
+          # PAT, and the bot PAT is repo-only (gh-lib.sh:212).
+          if ! retry "patch ${REPO}#${num}" \
+              gh api -X PATCH "repos/${REPO}/pulls/${num}" \
+              -f "title=${title}" -f "body=${body}" >/dev/null; then
+            echo "::error::could not rewrite the title/body of ${pr_url}; the squash commit would name the wrong version." >&2
+            exit 1
+          fi
+
+          # Read the state BEFORE arming. `gh pr merge --auto` refuses a PR with
+          # nothing left pending, and a green-but-unarmed PR is precisely what a
+          # run that died between the push and the arm leaves behind, i.e. the
+          # state this redesign exists to recover from. arm_pr's own rescue
+          # covers only the MERGED case (gh-lib.sh:220-232).
+          if ! state="$(_pr_state "$REPO" "$pr_url")"; then
+            echo "::error::could not read the state of ${pr_url}." >&2
+            exit 1
+          fi
+          case "$state" in
+            MERGED)
+              echo "${pr_url} is already merged; nothing to arm"
+              exit 0
+              ;;
+            ARMED)
+              echo "${pr_url} is already armed"
+              exit 0
+              ;;
+          esac
+
+          if arm_pr "$REPO" "$pr_url" "$label"; then
+            exit 0
+          fi
+
+          # Auto-merge refused it. Merge outright, but ONLY when the forge says
+          # the PR is mergeable now AND the semver label is already on it: ci
+          # cuts the release tag from that label, so a merge landing without it
+          # publishes an image nothing ever tags. arm_pr returns the same status
+          # for a failed label POST as for a failed arm, so the label is re-read
+          # here rather than assumed.
+          if ! mergeable="$(retry "read mergeStateStatus ${REPO}#${num}" \
+              gh pr view "$pr_url" --repo "$REPO" --json mergeStateStatus --jq '.mergeStateStatus')"; then
+            echo "::error::could not read the merge state of ${pr_url} after auto-merge refused it." >&2
+            exit 1
+          fi
+          if [ "$mergeable" != CLEAN ]; then
+            echo "::error::auto-merge is not armed on ${pr_url} and it is not mergeable now (mergeStateStatus=${mergeable})." >&2
+            exit 1
+          fi
+          if ! labels="$(retry "read labels ${REPO}#${num}" \
+              gh api "repos/${REPO}/issues/${num}" --jq '[.labels[].name] | join(",")')"; then
+            echo "::error::could not read the labels of ${pr_url}." >&2
+            exit 1
+          fi
+          case ",${labels}," in
+            *",${label},"*) ;;
+            *)
+              echo "::error::${pr_url} is mergeable but carries no ${label}; ci cuts the release tag from that label, so merging it here would publish an untagged image." >&2
+              exit 1
+              ;;
+          esac
+          if ! retry "merge ${REPO}#${num}" gh pr merge "$pr_url" --repo "$REPO" --squash; then
+            echo "::error::could not merge ${pr_url}." >&2
+            exit 1
+          fi
+          echo "auto-merge refused a clean PR; merged ${pr_url} directly"
