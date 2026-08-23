@@ -5,7 +5,9 @@ name: refresh-claude-code
 # rebuild the `deps/claude-code` branch on top of main, open or reuse a
 # semver:patch PR and arm auto-merge. A green `ci` run then cascades through
 # `release`, which rebuilds+publishes the wrapper image at the new claude
-# version (the claude layer is isolated, so only it rebuilds).
+# version (the claude layer is isolated, so only it rebuilds). Note that
+# `release` is the FIRST thing that builds the image - `ci` sets
+# enable-image: false - which is why the arming below is budgeted.
 #
 # This failed on all 27 runs from 2026-07-07 to 2026-08-23 (#184), leaving 27
 # orphan `deps/claude-code-*` branches on origin with zero PRs between them.
@@ -182,7 +184,7 @@ jobs:
           # of it is status-checked: a pin behind a PR that was never opened,
           # never retitled or never armed is the shape that cost 47 days here.
           title="chore(deps): bump claude-code to ${latest}"
-          body="Automated: @anthropic-ai/claude-code ${current} -> ${latest}. A green ci run cascades to a rebuilt+published wrapper image at the new claude version. Opened by .github/workflows/refresh-claude-code.yml."
+          body="Automated: @anthropic-ai/claude-code ${current} -> ${latest}. Merging rebuilds and publishes the wrapper image at the new claude version via \`release\`, which is also the first thing that builds it: \`ci\` sets enable-image: false, so a green run here does not prove the new claude-code installs. Opened by .github/workflows/refresh-claude-code.yml."
           if ! pr_url="$(open_or_reuse_pr "$REPO" "$branch" "$title" "$body")"; then
             exit 1
           fi
