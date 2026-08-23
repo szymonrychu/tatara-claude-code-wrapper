@@ -216,13 +216,22 @@ jobs:
           # A title this cannot size vetoes everything until a bump merges: an
           # unreadable rejection scope is the widest one, and the currency check
           # reds within 3 days if that ever wedges the pin.
+          #
+          # Neither message offers "reopen it" as the remedy, and both say what
+          # reopening actually does. A reopened PR leaves `select(.state ==
+          # "closed")`, so the next run sees NO veto and arms the byte-identical
+          # version the human rejected - the delta was in budget the day it was
+          # opened, which is exactly why it was armed and why there was
+          # something to reject. Advising it would be a remedy whose stated
+          # effect and real effect differ, which is the defect class this whole
+          # change is about.
           if [ -n "$vetoed_by" ]; then
             if [ -z "$vetoed_version" ]; then
-              echo "::warning::#${vetoed_by} was closed without merging and its title names no version, so this run cannot tell what was rejected; not opening a ${latest} bump. Merge a bump, or reopen #${vetoed_by}, to resume."
+              echo "::warning::#${vetoed_by} was closed without merging and its title names no version, so this run cannot tell what was rejected; not opening a ${latest} bump. Merging any bump clears this. Reopening #${vetoed_by} does not: it removes the rejection, and the next run would arm it."
               exit 0
             fi
             if [ "$vetoed_version" = "$latest" ]; then
-              echo "::warning::#${vetoed_by} rejected ${vetoed_version} and npm has not moved since; not re-opening the identical bump. Merge a bump, or reopen #${vetoed_by}, to resume."
+              echo "::warning::#${vetoed_by} rejected ${vetoed_version} and npm has not moved since; not re-opening the identical bump. The next version npm publishes gets its own PR, unarmed, and merging any bump clears this. Reopening #${vetoed_by} does not: it removes the rejection, and the next run would arm it."
               exit 0
             fi
           fi
@@ -345,8 +354,16 @@ jobs:
               exit 1
             fi
             if [ -n "$armed_url" ]; then
-              if ! retry "disarm ${REPO}#${branch}" \
-                  gh pr merge "$armed_url" --repo "$REPO" --disable-auto >/dev/null; then
+              # Deliberately NOT under `retry`. Issuing it unconditionally makes
+              # it EXPECTED to fail on every steady catch-up or veto day - the
+              # PR is unarmed and stays unarmed - and gh-lib retries 5 times with
+              # a growing sleep, so wrapping it would burn 5+10+15+20 = 50s of
+              # backoff in front of the force-push every morning for a failure
+              # already declared meaningless. That is the same cost this block
+              # was moved above the push to avoid. One attempt; the read-back is
+              # the observable, and a transient failure against a genuinely
+              # armed PR surfaces there as a refusal to move the head at all.
+              if ! gh pr merge "$armed_url" --repo "$REPO" --disable-auto >/dev/null; then
                 echo "::warning::gh pr merge --disable-auto failed on ${armed_url}, which is expected when it was never armed; the read-back decides." >&2
               fi
               if ! state="$(_pr_state "$REPO" "$armed_url")"; then
@@ -424,11 +441,30 @@ jobs:
           # one of those two that matters.
           if [ "$arm" = no ]; then
             if [ "$state" = ARMED ]; then
-              # Nothing between the read-back above and here arms a PR, and a
-              # PR this run just created cannot be armed. So this is a re-arm or
-              # a field this run cannot trust, and both are refusals.
-              echo "::error::${pr_url} reads ARMED after this run disarmed it, and this run refuses to arm it (${jump}); it would merge unreviewed." >&2
-              exit 1
+              # The head has ALREADY moved by here, so erroring out would be a
+              # report rather than a refusal: the run reds and the catch-up sits
+              # on origin under a live auto-merge, landing on the fleet the
+              # moment ci goes green. The pre-push twin refuses and can; this
+              # one has to remove the arm.
+              #
+              # Two ways to reach it, and the removal answers both: the pre-push
+              # read-back was stale, or something armed the PR in the window -
+              # a human clicking "Enable auto-merge" on the PR that yesterday's
+              # warning told them to merge by hand is the obvious one. RETRIED,
+              # unlike the pre-push removal, because a read already said ARMED,
+              # so a failure here is real rather than the expected no-op.
+              if ! retry "disarm ${REPO}#${num}" \
+                  gh pr merge "$pr_url" --repo "$REPO" --disable-auto >/dev/null; then
+                echo "::warning::gh pr merge --disable-auto failed on ${pr_url}; the read-back decides." >&2
+              fi
+              if ! state="$(_pr_state "$REPO" "$pr_url")"; then
+                echo "::error::could not confirm auto-merge is off on ${pr_url}." >&2
+                exit 1
+              fi
+              if [ "$state" = ARMED ]; then
+                echo "::error::${pr_url} is still armed for auto-merge after two removals, and this run refuses to arm it (${jump}); it would merge unreviewed. Disable auto-merge on it by hand." >&2
+                exit 1
+              fi
             fi
             if [ "$state" = MERGED ]; then
               echo "::warning::${pr_url} (${jump}) merged although this run refused to arm it. ci builds no image, so nothing green on that PR proved the new claude-code installs; check the release build."

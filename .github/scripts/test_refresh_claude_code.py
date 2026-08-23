@@ -863,16 +863,60 @@ def test_a_refused_bump_that_merged_anyway_is_not_an_ordinary_success(h):
     assert "40 patch releases at once" in out
 
 
-def test_a_pr_that_reads_armed_after_being_disarmed_fails_the_run(h):
-    """Nothing between the read-back and here arms a PR, so an ARMED answer at
-    this point is either a re-arm or a forge field this run cannot trust. Both
-    are refusals: the whole point of the catch-up guard is that 40 releases do
-    not reach the fleet unreviewed.
+def test_a_pr_that_reads_armed_after_the_push_is_disarmed_again(h):
+    """After the push, erroring is a REPORT, not a refusal.
+
+    The pre-push twin refuses to move the head and does. This one runs after the
+    head has already moved, so exiting non-zero here would leave a catch-up head
+    live under auto-merge and call that a guard - the run reds and the fleet
+    still gets 40 releases the moment ci goes green. Reachable two ways: the
+    pre-push read-back was stale, or something armed the PR in the window (a
+    human clicking "Enable auto-merge" on the PR yesterday's run told them to
+    merge by hand). Both are answered by issuing the removal again.
     """
+    h.push_branch("2.1.198")
+    r = h.run(
+        latest="2.1.241", FAKE_OPEN_PR_URL=PR_URL, FAKE_PR_STATE="NONE ARMED NONE"
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    disarm = [c for c in h.calls("pr-merge") if "--disable-auto" in c]
+    assert len(disarm) == 2, h.calls()
+
+
+def test_a_pr_still_armed_after_two_removals_fails_the_run(h):
     h.push_branch("2.1.198")
     r = h.run(latest="2.1.241", FAKE_OPEN_PR_URL=PR_URL, FAKE_PR_STATE="NONE ARMED")
     assert r.returncode != 0
-    assert "armed" in (r.stdout + r.stderr)
+    assert "still armed" in (r.stdout + r.stderr)
+
+
+def test_only_the_escalated_disarm_is_retried():
+    """The pre-push removal is issued unconditionally, so it is EXPECTED to fail
+    on every steady catch-up or veto day - the PR is unarmed and stays unarmed.
+    Under gh-lib's `retry` that is 5+10+15+20 = 50s of backoff in front of the
+    force-push, every morning, for a call whose failure is already declared
+    meaningless - the exact cost this block was moved above the push to avoid.
+    The read-back is the observable. The post-push removal IS retried: it is
+    issued only when a read already said ARMED, so a failure there is real.
+
+    Structural because the Part B double's `retry` is a passthrough, so no run
+    of this suite can tell a retried call from a bare one.
+    """
+    # Comments strip out first: both blocks discuss `--disable-auto` in prose,
+    # and so does each block's own ::warning::.
+    lines = [
+        ln for ln in step_body(REFRESH, BUMP_STEP).splitlines()
+        if not ln.strip().startswith("#")
+    ]
+    at = [
+        i for i, ln in enumerate(lines)
+        if "--disable-auto" in ln and re.match(r"(if ! )?gh pr merge\b", ln.lstrip())
+    ]
+    assert len(at) == 2, at
+    pre, post = at
+    # The previous line too: `retry` wraps across a line continuation.
+    assert 'retry "disarm' not in lines[pre - 1] + lines[pre]
+    assert 'retry "disarm' in lines[post - 1] + lines[post]
 
 
 def test_an_unarmed_catch_up_pr_with_no_open_pr_is_not_disarmed(h):
@@ -1018,6 +1062,24 @@ def test_a_closed_pr_survives_an_unrelated_commit_to_main(h):
     assert r.returncode == 0, r.stdout + r.stderr
     assert h.remote_sha() == before
     assert not any(ln.startswith("open_or_reuse_pr") for ln in h.lib_calls())
+
+
+def test_the_veto_message_does_not_advise_reopening_the_rejected_pr(h):
+    """Reopening the closed PR takes it out of `select(.state == "closed")`, so
+    the next run sees no veto at all and arms the byte-identical version the
+    human rejected - the delta was in budget the day it was opened, which is why
+    it was armed and why there was something to reject. Advising it is round 2's
+    own finding 1 one branch over: a remedy whose stated effect and real effect
+    differ.
+    """
+    before = h.push_branch(BUMPED)
+    h.plan("api-pr-history", [closed(BUMPED)])
+    r = h.run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert h.remote_sha() == before
+    out = r.stdout + r.stderr
+    assert ", or reopen #" not in out, "reopening is not a remedy; it erases the veto"
+    assert "would arm it" in out, "what reopening actually does has to be named"
 
 
 def test_a_veto_whose_version_cannot_be_read_stops_the_cron(h):
