@@ -54,6 +54,37 @@ jobs:
       - name: guard the chart's skills clone dir
         run: bash .github/ci/check-chart-skills-clone-dir.sh
 
+  # The PR-time half of the Dockerfile's test-guard stage (#193). That stage is
+  # hardened against going green by running nothing (TATARA_MCP_GUARD=required)
+  # but nothing runs it before merge: it is outside the runtime DAG, the only
+  # driver is build.sh's explicit --opt target=test-guard, `enable-image` below
+  # is false, and image-verify passes no --opt target= so it solves the default
+  # target regardless. Its Go tests skip without a baked cli, so on every PR
+  # TestAgentPromptToolNamesAreAdvertised is green by skip and the first real
+  # look happens at release.
+  #
+  # This reconciles the same hardcoded names against tatara-cli's published
+  # tool-manifest.json and tatara-agent-skills' .claude/agents listing, both at
+  # the refs this repo pins, over public tokenless HTTPS - no harbor credential,
+  # nothing buildkit touches, i.e. none of what a PR-triggered job cannot have.
+  # It is the compensating control in the pattern check-go-version-pins.sh set
+  # for the Go-pin half of the same stage, and it is STRICTLY WEAKER than that
+  # stage: the manifest has no profile data, so a tool granted to no profile
+  # passes here. test-guard stays.
+  #
+  # Kept OUT of pin-guard for the same reason chart-guard is: pin-guard stays a
+  # pure grep that fails first without installing a toolchain, and this needs Go.
+  name-guard:
+    needs: [pin-guard]
+    runs-on: tatara-claude-code-wrapper
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - name: guard agent-facing tool and subagent names
+        run: bash .github/ci/check-agent-facing-names.sh
+
   # Static gate on this repo's own CD machinery: the currency script and the
   # structural + run-for-real suite over refresh-claude-code.yml (#184). It
   # needs python and the checkout, nothing else, so it runs on a HOSTED runner

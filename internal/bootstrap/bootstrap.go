@@ -929,21 +929,33 @@ and your skill names the tools you actually have.
 // routes work to the typed subagents installed into .claude/agents/ (shipped
 // by tatara-agent-skills) so planning tokens stay on the main model and
 // model tiering is structural via each file's own frontmatter.
+//
+// The bullet list must name EVERY agent installAgents copies, and the roster is
+// deliberately carried by the bullets alone: it named four for as long as the
+// skills plugin shipped five, and the prose "Four typed subagents" was a second
+// copy of the count that could drift on its own. DelegationRoster parses these
+// bullets; TestDelegationRoster_MatchesSnapshot is the offline trip-wire and
+// .github/ci/check-agent-facing-names.sh reconciles them against the skills
+// tarball at the pinned TATARA_SKILLS_REF. promptguard cannot see this class -
+// its extractor requires an underscore, so a bare subagent name is never a
+// candidate token.
 const delegationDirective = `
 
 ---
 
 ## Delegate work to typed subagents
 
-Four typed subagents are available via the Agent tool, each pinned to a
-model tier via its own frontmatter: delegate to them instead of doing this
-work yourself.
+Typed subagents are available via the Agent tool, each pinned to a model
+tier via its own frontmatter: delegate to them instead of doing this work
+yourself.
 
 - **explorer**: read-only code search, locating where something lives in
   the codebase.
 - **tester**: run and write tests.
 - **builder**: multi-file implementation from a clear, already-decided plan.
 - **architect**: hard reasoning, design, and adversarial verification.
+- **writer**: prose editing of one named Markdown page from a spec you
+  supply; it does not decide what is true.
 
 Keep planning, design, review, and merge decisions on yourself. Delegate the
 mechanical legwork; do not delegate the thinking.

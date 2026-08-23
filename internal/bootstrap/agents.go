@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // installAgents copies typed subagent definitions (flat *.md files, one
@@ -12,13 +11,17 @@ import (
 // AgentsSrc directory into <workspace>/.claude/agents. This mirrors
 // installSkills's clone-then-copy path (same already-cloned skills-repo
 // checkout, same later-source-wins flatten semantics) but does not
-// profile-gate: the typed agents (explorer/tester/builder/architect) are a
-// shared dispatch palette used by implement's rigid skill and by any other
-// kind's Agent-tool subagent fan-out (brainstorm/incident/review alike, per
-// the task-kind redesign's "subagents are still first-class" mandate), not a
-// single profile's concern - and there are only four files, so the token
-// cost of always installing all of them is negligible next to the skills
-// corpus that profile-gating exists to bound.
+// profile-gate: the typed agents are a shared dispatch palette used by
+// implement's rigid skill and by any other kind's Agent-tool subagent fan-out
+// (brainstorm/incident/review alike, per the task-kind redesign's "subagents
+// are still first-class" mandate), not a single profile's concern - and it is
+// a handful of files, so the token cost of always installing all of them is
+// negligible next to the skills corpus that profile-gating exists to bound.
+//
+// This copies whatever the skills clone ships; delegationDirective is what
+// names them to the agent. Those two rosters are reconciled by
+// .github/ci/check-agent-facing-names.sh, so this comment deliberately carries
+// no list of its own - a third copy could only drift.
 func installAgents(p Params) error {
 	dst := filepath.Join(p.Workspace, ".claude", "agents")
 	if err := os.MkdirAll(dst, 0o755); err != nil {
@@ -50,16 +53,15 @@ func installAgents(p Params) error {
 // installAgentsFromSrc copies every top-level *.md file in src into dst.
 // Unlike installSkillsFromSrc, this does not recurse: agent definitions ship
 // as flat files at the plugin's .claude/agents/ root, not one-dir-per-item.
+// The listing comes from agentFiles, which AgentNames also uses, so the guard
+// that reconciles the roster enumerates exactly what this installs.
 func installAgentsFromSrc(src, dst string, p Params) (int, error) {
-	entries, err := os.ReadDir(src)
+	entries, err := agentFiles(src)
 	if err != nil {
-		return 0, fmt.Errorf("read dir %s: %w", src, err)
+		return 0, err
 	}
 	installed := 0
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
-			continue
-		}
 		info, err := e.Info()
 		if err != nil {
 			return installed, fmt.Errorf("stat %s: %w", e.Name(), err)

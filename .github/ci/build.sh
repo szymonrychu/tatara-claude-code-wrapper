@@ -6,9 +6,28 @@
 # cluster secrets: harbor push auth is a per-build docker config on THIS runner,
 # the private-repo clone token is a buildkit frontend secret. Replaces
 # kaniko-build.sh.
+#
+# usage: build.sh <repo> [guard|image|all]
+#
+# The two solves are separable so release.yml can put the GUARD ON THE OTHER
+# SIDE OF `cut tag` (#193). The tag is pushed to origin by cd-release before
+# build.sh ever ran, so a bump that drops a tool the prompt text names used to
+# fail AFTER the tag was public, leaving the dangling "tag with no image and no
+# chart" ci.yml's pin-guard comment describes. Splitting the modes MOVES the
+# guard solve; it does not add one, so solves per release are unchanged.
+#
+# Default `all` keeps `make`/manual/local invocations behaving exactly as before.
 set -euo pipefail
 
 REPO="${1:?repo name required}"
+MODE="${2:-all}"
+case "$MODE" in
+  guard | image | all) ;;
+  *)
+    echo "usage: $0 <repo> [guard|image|all]"
+    exit 2
+    ;;
+esac
 BUILDKITD_ADDR="tcp://buildkitd.arc-runners:1234"
 # BUILD_REF is the commit the image is built FROM (local git-describe VERSION,
 # the remote buildkit context, and the image :SHORT_SHA tag all key off it).
@@ -24,7 +43,14 @@ SHORT_SHA="${BUILD_REF:0:7}"
 # be trusted to pick the release tag itself: a re-run of a release that failed
 # after cutting its tag leaves two semver tags on the same commit, and describe
 # resolves to the LOWER one, publishing the image under the wrong version.
-VERSION="${VERSION:-$(git describe --tags --always --dirty)}"
+#
+# Deliberately NOT resolved in guard mode. That mode now runs BEFORE `cut tag`,
+# where git describe would resolve to the PREVIOUS release - a value nothing
+# reads, but one that would look authoritative in a log next to a version that
+# does not exist yet.
+if [ "$MODE" != "guard" ]; then
+  VERSION="${VERSION:-$(git describe --tags --always --dirty)}"
+fi
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # TATARA_CLI_VERSION pins the cli SHA baked into the image; keep in sync with
 # Dockerfile ARG default and Makefile default.  Use the short SHA published by
@@ -55,7 +81,8 @@ EOF
 
 CONTEXT="https://github.com/szymonrychu/${REPO}.git#${BUILD_REF}"
 
-# Build-guard FIRST (build-only, never pushed). The Dockerfile `test-guard`
+# Build-guard FIRST (build-only, never pushed), and in `guard` mode BEFORE the
+# tag is cut. The Dockerfile `test-guard`
 # stage runs the MCP-tools flowthrough test with the pinned tatara cli on PATH,
 # plus the prompt-text guard (#136) that checks every MCP tool name this repo
 # puts in front of an agent against that same live tools/list; if the baked cli
@@ -69,14 +96,21 @@ CONTEXT="https://github.com/szymonrychu/${REPO}.git#${BUILD_REF}"
 # caches the solved layers for the runtime build that follows. (There is no
 # `cacheonly` exporter registered on the buildkitd daemon, so `--output
 # type=cacheonly` fails with "exporter cacheonly could not be found".)
-echo "buildkit: running cli MCP-tools build-guard (target=test-guard)"
-buildctl --addr "$BUILDKITD_ADDR" build \
-  --frontend dockerfile.v0 \
-  --opt context="${CONTEXT}" \
-  --opt filename=Dockerfile \
-  --opt target=test-guard \
-  --opt build-arg:TATARA_CLI_VERSION="${TATARA_CLI_VERSION}" \
-  --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN
+if [ "$MODE" != "image" ]; then
+  echo "buildkit: running cli MCP-tools build-guard (target=test-guard)"
+  buildctl --addr "$BUILDKITD_ADDR" build \
+    --frontend dockerfile.v0 \
+    --opt context="${CONTEXT}" \
+    --opt filename=Dockerfile \
+    --opt target=test-guard \
+    --opt build-arg:TATARA_CLI_VERSION="${TATARA_CLI_VERSION}" \
+    --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN
+fi
+
+if [ "$MODE" = "guard" ]; then
+  echo "buildkit: guard-only mode; skipping the runtime image build"
+  exit 0
+fi
 
 # Remote git context (buildkitd clones the private repo, like kaniko did).
 # MUST be https:// (NOT git://): buildkit's GIT_AUTH_TOKEN basic-auth extraheader

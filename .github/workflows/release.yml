@@ -1,13 +1,26 @@
 name: release
 
-# Push-CD: after a green `ci` run on main, cut the semver tag the merged PR
-# declared, publish the image+chart at that version, then propagate the new
-# wrapper version into tatara-helmfile (the parent). Gated on a successful `ci`
-# run (lint/test/build/smoke); a failed ci run never reaches this workflow. The
-# cli MCP-tools build-guard runs in the `publish image` step below (build.sh
-# builds the Dockerfile test-guard stage first), so a cli/skills bump that drops
-# a required tool fails the publish and the cascade stalls before any tag/pin is
-# propagated -- the failure is surfaced, never swallowed.
+# Push-CD: after a green `ci` run on main, run the cli MCP-tools build-guard,
+# cut the semver tag the merged PR declared, publish the image+chart at that
+# version, then propagate the new wrapper version into tatara-helmfile (the
+# parent). Gated on a successful `ci` run (lint/test/build/smoke); a failed ci
+# run never reaches this workflow.
+#
+# STEP ORDER IS LOAD-BEARING (#193). The guard is its own step ABOVE `cut tag`,
+# not a phase of `publish image` below it. `cut tag` is cd-release mode: tag,
+# which ends in `git push origin refs/tags/$next` -- so while the guard ran
+# after it, a cli/skills bump that dropped a required tool failed the publish
+# with the tag ALREADY PUBLIC, leaving a semver tag with no image and no chart
+# behind it. That is the dangling release ci.yml's pin-guard comment describes
+# for a different input, and !187 records it happening on 2026-07-30. This
+# header claimed the cascade stalled "before any tag/pin is propagated"; that
+# was false for the tag until the reorder, and TestReleaseRunsTheBuildGuard-
+# BeforeCuttingTheTag now asserts the claim instead of restating it.
+#
+# This MOVES the guard solve rather than adding one: build.sh already built the
+# test-guard stage on every release, just later. Solves per release are
+# unchanged, and buildkitd's persistent Ceph layer cache is shared between the
+# two steps.
 on:
   workflow_run:
     workflows: [ci]
@@ -52,6 +65,24 @@ jobs:
           # URLs, and `publish chart` logs in with harbor creds.
           persist-credentials: false
 
+      - name: install buildctl
+        run: |
+          curl -sSfL "https://github.com/moby/buildkit/releases/download/v0.18.2/buildkit-v0.18.2.linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local bin/buildctl
+
+      # The guard, BEFORE the tag (#193 - see the header). Builds the Dockerfile
+      # test-guard stage only: the MCP-tools flowthrough test and the #136
+      # prompt-text guard, both against the pinned cli baked at
+      # TATARA_CLI_VERSION. Nothing is pushed. A failure here stops the release
+      # with nothing published and nothing to clean up by hand.
+      #
+      # No VERSION: the tag does not exist yet, and build.sh's guard mode
+      # deliberately does not resolve one.
+      - name: run cli MCP-tools build-guard
+        env:
+          BUILD_REF: ${{ github.event.workflow_run.head_sha }}
+        run: bash .github/ci/build.sh "${{ github.event.repository.name }}" guard
+
       # Read the merged PR's semver:* label, compute + push the next tag (vX.Y.Z).
       - name: cut tag
         id: tag
@@ -60,14 +91,8 @@ jobs:
           mode: tag
           token: ${{ secrets.TATARA_CD_TOKEN }}
 
-      - name: install buildctl
-        run: |
-          curl -sSfL "https://github.com/moby/buildkit/releases/download/v0.18.2/buildkit-v0.18.2.linux-amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local bin/buildctl
-
-      # Build+push the image at the new tag. build.sh first builds the Dockerfile
-      # test-guard stage (cli MCP-tools guard; fails the publish if a required
-      # tool went missing), then builds the runtime image. VERSION is passed
+      # Build+push the runtime image at the new tag; the guard above already ran
+      # and its solved layers are warm in buildkitd's cache. VERSION is passed
       # explicitly from the `cut tag` step output (and :SHORT_SHA is still
       # pushed for rollback/debug) - git describe cannot be trusted here since a
       # re-run of a release that failed after tagging leaves two semver tags on
@@ -75,12 +100,11 @@ jobs:
       # on workflow_run GITHUB_SHA points at the default-branch tip, which may
       # have advanced past this commit, so without the pin the context/SHORT_SHA
       # could diverge from the checked-out VERSION.
-      # buildkitd's persistent Ceph layer cache keeps the rebuild fast.
       - name: publish image
         env:
           BUILD_REF: ${{ github.event.workflow_run.head_sha }}
           VERSION: ${{ steps.tag.outputs.version }}
-        run: bash .github/ci/build.sh "${{ github.event.repository.name }}"
+        run: bash .github/ci/build.sh "${{ github.event.repository.name }}" image
 
       - uses: azure/setup-helm@v4
 

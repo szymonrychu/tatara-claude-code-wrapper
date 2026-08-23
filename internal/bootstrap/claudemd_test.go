@@ -66,8 +66,13 @@ func TestRender_DirectivePresentWithoutGlobalClaudeMd(t *testing.T) {
 }
 
 // task-kind redesign Decision 6: the main agent should delegate work to the
-// typed subagents (explorer/tester/builder/architect), keeping
-// planning/design/review/merge on itself.
+// typed subagents, keeping planning/design/review/merge on itself.
+//
+// The names are driven off DelegationRoster rather than hardcoded here. A
+// second hardcoded list is a second thing to drift, and this one asserted
+// Contains on four names for as long as the skills plugin shipped five - it
+// would have stayed green through the whole drift. What the roster must EQUAL
+// is asserted once, in roster_test.go.
 func TestRender_AppendsWorkerDelegationDirective(t *testing.T) {
 	home := t.TempDir()
 	ws := t.TempDir()
@@ -82,10 +87,12 @@ func TestRender_AppendsWorkerDelegationDirective(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join(home, ".claude", "CLAUDE.md"))
 	require.NoError(t, err)
 	got := string(b)
-	require.Contains(t, got, "explorer")
-	require.Contains(t, got, "tester")
-	require.Contains(t, got, "builder")
-	require.Contains(t, got, "architect")
+
+	roster, err := bootstrap.DelegationRoster()
+	require.NoError(t, err)
+	for _, name := range roster {
+		require.Contains(t, got, name)
+	}
 	require.Contains(t, got, "planning")
 }
 
