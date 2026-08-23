@@ -2,11 +2,32 @@ name: refresh-claude-code
 
 # Daily check for a newer @anthropic-ai/claude-code npm release. When npm
 # publishes a version above the pinned Dockerfile `ARG CLAUDE_CODE_VERSION`,
-# open a semver:patch PR bumping the pin and enable auto-merge. A green `ci`
-# run then cascades through `release`, which rebuilds+publishes the wrapper
-# image at the new claude version (the claude layer is isolated, so only it
-# rebuilds). Mirrors the bot-authored auto-merge-PR pattern from tatara-helmfile
-# cd-release: szymonrychu-bot identity, PAT-in-URL push, gh label + auto-merge.
+# rebuild the `deps/claude-code` branch on top of main, open or reuse a
+# semver:patch PR and arm auto-merge. A green `ci` run then cascades through
+# `release`, which rebuilds+publishes the wrapper image at the new claude
+# version (the claude layer is isolated, so only it rebuilds). Note that
+# `release` is the FIRST thing that builds the image - `ci` sets
+# enable-image: false - which is why the arming below is budgeted.
+#
+# This failed on all 27 runs from 2026-07-07 to 2026-08-23 (#184), leaving 27
+# orphan `deps/claude-code-*` branches on origin with zero PRs between them.
+# Run 32624497855 names both defects on one path:
+#
+#   1. `gh: command not found`. The ARC runner image for this repo has no gh.
+#      release.yml survives on the same runner only because cd-release's first
+#      composite step installs it ("Self-hosted ARC runner images lack gh").
+#      This workflow now goes through that same action, which also exports the
+#      forge helpers it was hand-rolled without.
+#   2. The dedup guard ran `gh pr list ... | grep -q .` as an `if` CONDITION,
+#      where bash suspends errexit, so that 127 was indistinguishable from "no
+#      PR is open" and the run pushed a branch anyway. It could never have
+#      matched in any case: the branch name embedded the version, so every day
+#      asked about a name that had never existed.
+#
+# Hence ONE stable branch and no "is some PR open" pre-guard at all. There are
+# exactly two skip conditions, and no failed read can imitate either: main's pin
+# already equals npm's latest, or a human closed the PR for THIS version without
+# merging it. The second one expires when any bump merges.
 on:
   schedule:
     - cron: "17 6 * * *"
@@ -26,52 +47,524 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # We push the bump branch with a PAT-in-URL below; the persisted
-          # default GITHUB_TOKEN header would otherwise override it (see the
-          # release workflow for the same reason).
+          # `authenticate_origin` clears the persisted extraheader anyway; not
+          # writing it in the first place is one fewer way for the read-only
+          # default GITHUB_TOKEN to win a request. Same reason as release.yml.
           persist-credentials: false
 
-      - name: check npm and open bump PR
+      # Installs gh (absent from this runner image) and exports
+      # $CD_RELEASE_LIB. Nothing else: mode=setup does no tag and no bump.
+      - name: gh CLI and the cd-release forge helpers
+        uses: szymonrychu/tatara-helmfile/.github/actions/cd-release@main
+        with:
+          mode: setup
+          token: ${{ secrets.TATARA_CD_TOKEN }}
+
+      - name: open or update the claude-code bump PR
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit
+          # shellcheck source=/dev/null
+          source "$CD_RELEASE_LIB"
 
-          # Dependency-light: read the npm registry latest tag with curl (no
-          # node/npm setup needed on the runner).
-          latest="$(curl -fsSL https://registry.npmjs.org/@anthropic-ai/claude-code/latest \
-            | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)"
-          current="$(sed -n 's/^ARG CLAUDE_CODE_VERSION=//p' Dockerfile | head -1)"
-          echo "current=$current latest=$latest"
-          if [ -z "$latest" ]; then
-            echo "::error::could not resolve npm latest for @anthropic-ai/claude-code" >&2
+          # workflow_dispatch accepts ANY ref and actions/checkout takes the
+          # dispatched one, so without this the `checkout -B` below branches off
+          # whatever was dispatched and the force-push replaces the canonical
+          # bump branch with it - then opens a labelled, armed PR whose diff is
+          # the whole feature branch. Dispatching this workflow from a task
+          # branch to test it is the obvious thing to do, and a stable branch
+          # name is what makes that land on the ref the cron depends on rather
+          # than on a throwaway.
+          if [ "${GITHUB_REF_NAME:-}" != main ]; then
+            echo "::error::refresh-claude-code only runs from main; this run is on '${GITHUB_REF_NAME:-<unset>}'." >&2
             exit 1
           fi
+
+          # ONE stable branch. A versioned name is a fresh name every day, so a
+          # run that fails leaves a branch nothing later reuses or cleans up,
+          # and the residue is one orphan per day forever.
+          branch="deps/claude-code"
+          label="semver:patch"
+          # Committed under, and therefore the only identity whose work on that
+          # branch this run is allowed to force-push over.
+          bot_name="szymonrychu-bot"
+          bot_email="szymonrychu-bot@users.noreply.github.com"
+
+          if ! payload="$(retry "npm dist-tags.latest" \
+              curl -fsSL https://registry.npmjs.org/@anthropic-ai/claude-code/latest)"; then
+            echo "::error::could not read the npm latest tag for @anthropic-ai/claude-code." >&2
+            exit 1
+          fi
+          # Matched in bash rather than piped through grep: under `pipefail` a
+          # no-match would abort the step with no diagnosis at all, and a silent
+          # exit is the one thing a failed read must never produce here.
+          if [[ "$payload" =~ \"version\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+            latest="${BASH_REMATCH[1]}"
+          else
+            echo "::error::could not parse a version out of the npm registry answer." >&2
+            exit 1
+          fi
+
+          # dist-tags.latest is a pointer and nothing guarantees it names a
+          # plain release. Pinning the fleet to a prerelease is not this
+          # workflow's job, and the currency check's version filter drops one
+          # too, so it would red with a diagnosis pointing at npm.
+          if ! [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::npm dist-tags.latest is '${latest}', which is not a plain X.Y.Z release; refusing to pin the fleet to it." >&2
+            exit 1
+          fi
+
+          current="$(sed -n 's/^ARG CLAUDE_CODE_VERSION=//p' Dockerfile | head -1)"
+          echo "current=$current latest=$latest"
           if [ "$current" = "$latest" ]; then
-            echo "already pinned to $latest; nothing to do"
+            echo "main already pins $latest; nothing to do"
             exit 0
           fi
 
-          branch="deps/claude-code-${latest}"
-          if gh pr list --repo "$REPO" --head "$branch" --state open \
-              --json number --jq '.[0].number' | grep -q .; then
-            echo "bump PR for $latest already open"
-            exit 0
+          # Arm auto-merge only for a bump the size of a normal day's.
+          #
+          # `ci` sets enable-image: false and builds no image, so a green run
+          # on a Dockerfile-only PR is NOT evidence that the new claude-code
+          # installs or boots - `release` is the first thing that builds it,
+          # and it cuts the semver tag BEFORE it builds, so a bad bump leaves
+          # a published tag with no image behind it (MEMORY.md 2026-07-30).
+          # That risk is acceptable for the one-or-two-release bump this cron
+          # emits daily and is not acceptable for a catch-up after an outage:
+          # #184's pre-mortem 1 is explicit that 39 releases at once must not
+          # reach every agent pod in the fleet unreviewed. Those land as a
+          # labelled, unarmed PR for a human.
+          # The DEFAULT is `no`, and only the in-budget branch raises it. Every
+          # other decision in this file is fail-closed by construction and this
+          # one was not: `arm=yes` as the default made anything that abandons
+          # this block early a silent grant. An arithmetic-expansion error under
+          # `set -e` + `inherit_errexit` does NOT exit the shell - it abandons
+          # the enclosing branch, execution resumes after the `fi`, rc stays 0 -
+          # so a bad `$(( ))` armed an unbounded jump on a green run with the
+          # bash error buried mid-log.
+          max_jump=5
+          arm=no
+          jump="a version this workflow cannot size"
+          if [ "${current%.*}" != "${latest%.*}" ]; then
+            jump="a minor or major change"
+          elif [[ "${current##*.}" =~ ^[0-9]+$ && "${latest##*.}" =~ ^[0-9]+$ ]]; then
+            # `10#` because `$(( ))` reads a leading zero as octal, and `08`
+            # passes the guard above: `$(( 241 - 08 ))` is "value too great for
+            # base", i.e. exactly the abandonment the default now absorbs.
+            #
+            # SIGNED, so the sign is tested first: npm re-pointing
+            # dist-tags.latest backwards after a bad line yields a negative
+            # delta, which is never `-gt max_jump`, and an unbounded rollback
+            # would have armed. "The size of a normal day's bump" is a distance
+            # AND a direction.
+            delta="$(( 10#${latest##*.} - 10#${current##*.} ))"
+            if [ "$delta" -lt 0 ]; then
+              jump="a downgrade of $(( -delta )) patch releases"
+            elif [ "$delta" -gt "$max_jump" ]; then
+              jump="${delta} patch releases at once"
+            else
+              arm=yes
+              jump=""
+            fi
           fi
 
-          git config user.name "szymonrychu-bot"
-          git config user.email "szymonrychu-bot@users.noreply.github.com"
+          # Closing a bump PR has to MEAN something. `_list_open_pr` filters
+          # --state open and `current` is read from main, which a close does not
+          # change, so nothing else here can see the rejection: a human who
+          # closes an armed bump because it wedged agent pods would get a fresh
+          # PR on the byte-identical head at 06:17 tomorrow, armed again.
+          #
+          # The fact read is the newest CLOSED PR on the branch - merged PRs are
+          # closed too, so this is "the last completed thing that happened to
+          # this branch". Merged means the cascade worked and the guard expires;
+          # closed-unmerged is a standing rejection. A failed read is not "nobody
+          # has rejected a bump".
+          #
+          # The jq stays a plain line-per-PR projection and the decision is made
+          # in bash: `gh --jq` is gojq, not the jq binary, and nothing in this
+          # repo's test suite can execute it, so the only part of this read that
+          # is actually covered is the part written in shell.
+          #
+          # The TITLE rides along because what a close rejects is the VERSION,
+          # not the tree. This workflow rewrites that title to "... to <X.Y.Z>"
+          # on every run, so it is the record of what was on the table.
+          if ! pr_history="$(retry "pr history ${REPO}#${branch}" \
+              gh api "repos/${REPO}/pulls?head=${REPO%%/*}:${branch}&state=all&per_page=100&sort=created&direction=desc" \
+              --jq '.[] | select(.state == "closed") | "\(.number) \(.merged_at // "-") \(.title)"')"; then
+            echo "::error::could not read the PR history for ${branch}; refusing to assume nobody has rejected a bump." >&2
+            exit 1
+          fi
+          vetoed_by=""
+          vetoed_version=""
+          # Parameter expansion, not `| head -1`: under `pipefail` a SIGPIPE'd
+          # producer aborts the step, and this one is the only reader of a list
+          # that grows with every bump PR ever opened.
+          newest="${pr_history%%$'\n'*}"
+          if [ -n "$newest" ]; then
+            newest_rest="${newest#* }"
+            if [ "${newest_rest%% *}" = "-" ]; then
+              vetoed_by="${newest%% *}"
+              if [[ "${newest_rest#* }" =~ ([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*$ ]]; then
+                vetoed_version="${BASH_REMATCH[1]}"
+              fi
+            fi
+          fi
+          if [ -n "$vetoed_by" ]; then
+            arm=no
+            # Appended, not overwritten: a run that is BOTH a catch-up and
+            # vetoed used to print only the veto, so the human it hands the
+            # merge to is never told the diff spans 40 upstream releases.
+            jump="${jump:+${jump}, and }#${vetoed_by} was closed without merging"
+          fi
+
+          # A standing rejection is scoped to the version it rejected. Gated on
+          # tree equality instead, it only held while main was frozen: main's
+          # tip plus the bump changes whenever ANYTHING lands on main, and this
+          # repo's main takes CD pin bumps regularly, so the byte-identical
+          # rejected bump came back as a fresh PR - one per commit to main.
+          #
+          # A title this cannot size vetoes everything until a bump merges: an
+          # unreadable rejection scope is the widest one, and the currency check
+          # reds within 3 days if that ever wedges the pin.
+          #
+          # Neither message offers "reopen it" as the remedy, and both say what
+          # reopening actually does. A reopened PR leaves `select(.state ==
+          # "closed")`, so the next run sees NO veto and arms the byte-identical
+          # version the human rejected - the delta was in budget the day it was
+          # opened, which is exactly why it was armed and why there was
+          # something to reject. Advising it would be a remedy whose stated
+          # effect and real effect differ, which is the defect class this whole
+          # change is about.
+          if [ -n "$vetoed_by" ]; then
+            if [ -z "$vetoed_version" ]; then
+              echo "::warning::#${vetoed_by} was closed without merging and its title names no version, so this run cannot tell what was rejected; not opening a ${latest} bump. Merging any bump clears this. Reopening #${vetoed_by} does not: it removes the rejection, and the next run would arm it."
+              exit 0
+            fi
+            if [ "$vetoed_version" = "$latest" ]; then
+              echo "::warning::#${vetoed_by} rejected ${vetoed_version} and npm has not moved since; not re-opening the identical bump. The next version npm publishes gets its own PR, unarmed, and merging any bump clears this. Reopening #${vetoed_by} does not: it removes the rejection, and the next run would arm it."
+              exit 0
+            fi
+          fi
+
+          authenticate_origin "$REPO"
+
+          git config user.name "$bot_name"
+          git config user.email "$bot_email"
           git checkout -B "$branch"
           sed -i "s/^ARG CLAUDE_CODE_VERSION=.*/ARG CLAUDE_CODE_VERSION=${latest}/" Dockerfile
           git add Dockerfile
           git commit -m "chore(deps): bump claude-code to ${latest}"
-          git push -f "https://x-access-token:${TOKEN}@github.com/${REPO}.git" "HEAD:${branch}"
 
-          gh label create semver:patch --repo "$REPO" --color 0e8a16 \
-            --description "tatara CD dependency bump" 2>/dev/null || true
-          url="$(gh pr create --repo "$REPO" --base main --head "$branch" \
-            --title "chore(deps): bump claude-code to ${latest}" \
-            --body "Automated: @anthropic-ai/claude-code ${current} -> ${latest}. A green ci run cascades to a rebuilt+published wrapper image at the new claude version.")"
-          # REST label add (repo scope only, unlike `gh pr edit --add-label`).
-          num="${url##*/}"
-          gh api -X POST "repos/$REPO/issues/$num/labels" -f "labels[]=semver:patch" >/dev/null
-          gh pr merge "$url" --repo "$REPO" --auto --squash
-          echo "opened + auto-merge enabled: $url"
+          # Whether to push is decided on the TREE, not on the commit: `git
+          # commit` mints a new sha for an identical tree, and force-pushing
+          # that every morning would restart the whole self-hosted ci matrix on
+          # the open PR forever. It fires only when NOTHING moved - neither the
+          # version nor main - because the left side is main's tip plus the
+          # bump; a commit landing on main between two runs rebases the branch,
+          # which is intended. An ls-remote that FAILED is not "the branch is
+          # absent" - only an empty SUCCESSFUL answer means there is nothing to
+          # compare against.
+          if ! remote_head="$(retry "git ls-remote $branch" \
+              git ls-remote --heads origin "refs/heads/${branch}")"; then
+            echo "::error::could not read refs/heads/${branch} from origin; refusing to force-push over a branch this run never saw." >&2
+            exit 1
+          fi
+          push=yes
+          if [ -n "$remote_head" ]; then
+            # Depth-1 checkout, so the branch tip has to be fetched explicitly.
+            # Depth TWO because the guard below diffs the tip against its parent;
+            # depth 1 makes the tip a shallow boundary with nothing to diff to.
+            if ! retry "git fetch $branch" git fetch --depth=2 origin \
+                "+refs/heads/${branch}:refs/remotes/origin/${branch}"; then
+              echo "::error::could not fetch ${branch} from origin." >&2
+              exit 1
+            fi
+
+            # Whose branch is this? The arm=no path below tells a human to
+            # "review and merge it by hand" on a branch with a fixed, well-known
+            # name, so one fixup commit there (a compat tweak the new
+            # claude-code needs) is a thing that happens - and the next
+            # `checkout -B` off main discards it and the force-push overwrites
+            # it, silently turning the PR back into a bump-only diff while it
+            # keeps its label and its review context. #184 pre-mortem 5 is this
+            # hazard one file over: a scheduled job must not destroy refs it did
+            # not create. The ls-remote guard above only covers a FAILED read,
+            # not a branch that legitimately moved.
+            #
+            # "main plus the bump" is asserted as bot-authored AND
+            # Dockerfile-only. Ancestry of the parent is deliberately not
+            # checked: it would need an unshallow fetch of the whole history
+            # every morning, and neither way the tip stops being this workflow's
+            # own work survives both of these.
+            if ! tip_email="$(git log -1 --format=%ae "refs/remotes/origin/${branch}")" ||
+               ! tip_files="$(git diff-tree --no-commit-id --name-only -r "refs/remotes/origin/${branch}")" ||
+               ! tip_merges="$(git rev-list --no-walk --count --merges "refs/remotes/origin/${branch}")"; then
+              echo "::error::could not inspect the tip of ${branch}." >&2
+              exit 1
+            fi
+            # The merge case is tested FIRST and named, because `git diff-tree
+            # -r` prints NOTHING and exits 0 on a merge commit: an "Update
+            # branch" click - the likeliest way this branch stops being main
+            # plus the bump - is bot-authored AND reports no files, so the
+            # file-list test diagnoses it as "changed nothing", which reads like
+            # an empty branch worth deleting.
+            why=""
+            if [ "$tip_merges" != 0 ]; then
+              why="its tip is a merge commit, which is what the \"Update branch\" button leaves behind"
+            elif [ "$tip_email" != "$bot_email" ]; then
+              why="its tip is authored by '${tip_email}', not ${bot_email}"
+            elif [ "$tip_files" != Dockerfile ]; then
+              why="its tip touches '${tip_files//$'\n'/ }', not the Dockerfile alone"
+            fi
+            # Deleting the branch is deliberately NOT offered. It closes the
+            # open PR unmerged, which the veto above reads as a standing
+            # rejection, so the obvious remedy silently stops this cron arming
+            # anything until a human merges a bump by hand - a message a reader
+            # acts on that means something else, which is #184's own shape.
+            if [ -n "$why" ]; then
+              echo "::error::origin/${branch} is not a bot-authored Dockerfile-only bump: ${why}. Refusing to force-push over work this run did not create. Merge the open PR to resume; deleting the branch instead closes the open PR unmerged, which this workflow reads as a standing rejection." >&2
+              exit 1
+            fi
+
+            # Read both trees into variables first. Inside an `if` condition
+            # bash suspends errexit, and `git rev-parse` prints its ARGUMENT
+            # on stdout when it cannot resolve it, so comparing two bare
+            # substitutions there would silently compare garbage - the same
+            # failure-becomes-a-value shape that produced 27 orphan branches.
+            if ! local_tree="$(git rev-parse "HEAD^{tree}")" ||
+               ! remote_tree="$(git rev-parse "refs/remotes/origin/${branch}^{tree}")"; then
+              echo "::error::could not resolve the trees to compare for ${branch}." >&2
+              exit 1
+            fi
+            if [ "$local_tree" = "$remote_tree" ]; then
+              echo "origin/${branch} already carries claude-code ${latest} on this base; not re-pushing"
+              push=no
+            fi
+          fi
+          # Disarm BEFORE the head moves, not after.
+          #
+          # `arm` is fully decided above, so there is no reason to put the
+          # force-push and four retry-wrapped forge calls (open_or_reuse_pr, the
+          # title PATCH, the label POST, the state read) between a catch-up head
+          # and the removal of an arm an EARLIER run put on that PR - up to ~50s
+          # of backoff each under a partial outage, with auto-merge live on the
+          # new head throughout. Refusing to move the head until the arm is gone
+          # closes that window rather than narrowing it.
+          #
+          # Issued unconditionally when a PR is open, NOT gated on a read saying
+          # ARMED. That is the same field the ARMED case below refuses to
+          # believe after a push, and believing an empty answer is the same
+          # staleness in the other direction - it would skip the disarm AND the
+          # read-back and move the head under a PR that is still armed.
+          # `--disable-auto` errors on a PR that was never armed, so ITS failure
+          # is a warning and the read-back is the observable.
+          if [ "$arm" = no ]; then
+            if ! armed_url="$(_list_open_pr "$REPO" "$branch")"; then
+              echo "::error::could not list open PRs for ${REPO}#${branch}; refusing to move the head without knowing whether one is armed." >&2
+              exit 1
+            fi
+            if [ -n "$armed_url" ]; then
+              # Deliberately NOT under `retry`. Issuing it unconditionally makes
+              # it EXPECTED to fail on every steady catch-up or veto day - the
+              # PR is unarmed and stays unarmed - and gh-lib retries 5 times with
+              # a growing sleep, so wrapping it would burn 5+10+15+20 = 50s of
+              # backoff in front of the force-push every morning for a failure
+              # already declared meaningless. That is the same cost this block
+              # was moved above the push to avoid. One attempt; the read-back is
+              # the observable, and a transient failure against a genuinely
+              # armed PR surfaces there as a refusal to move the head at all.
+              if ! gh pr merge "$armed_url" --repo "$REPO" --disable-auto >/dev/null; then
+                echo "::warning::gh pr merge --disable-auto failed on ${armed_url}, which is expected when it was never armed; the read-back decides." >&2
+              fi
+              if ! state="$(_pr_state "$REPO" "$armed_url")"; then
+                echo "::error::could not confirm auto-merge is off on ${armed_url}." >&2
+                exit 1
+              fi
+              if [ "$state" = ARMED ]; then
+                echo "::error::${armed_url} is still armed for auto-merge and this run refuses to arm it (${jump}); refusing to move its head, which would merge unreviewed." >&2
+                exit 1
+              fi
+              if [ "$state" = MERGED ]; then
+                # It won the race. Nothing here can undo that, but the log must
+                # not claim a disarm that never happened, and main now carries a
+                # bump this run refused to arm: `current` is stale, so anything
+                # pushed from here would be sized against the wrong base.
+                echo "::warning::${armed_url} (${jump}) merged while this run was disarming it; not pushing on a stale view of main."
+                exit 0
+              fi
+              echo "auto-merge is off on ${armed_url}"
+            fi
+          fi
+
+          if [ "$push" = yes ]; then
+            git push -f origin "HEAD:${branch}"
+          fi
+
+          # Everything below is what makes the pushed pin MERGE, so every step
+          # of it is status-checked: a pin behind a PR that was never opened,
+          # never retitled or never armed is the shape that cost 47 days here.
+          title="chore(deps): bump claude-code to ${latest}"
+          body="Automated: @anthropic-ai/claude-code ${current} -> ${latest}. Merging rebuilds and publishes the wrapper image at the new claude version via \`release\`, which is also the first thing that builds it: \`ci\` sets enable-image: false, so a green run here does not prove the new claude-code installs. Opened by .github/workflows/refresh-claude-code.yml."
+          if ! pr_url="$(open_or_reuse_pr "$REPO" "$branch" "$title" "$body")"; then
+            exit 1
+          fi
+          num="$(pr_number "$pr_url")"
+
+          # A REUSED PR still carries the previous run's version in its title,
+          # and the title is what the squash merge commits, so it is rewritten
+          # every time the head moves. REST rather than `gh pr edit`: that runs
+          # a GraphQL query whose `login` field demands read:org on a classic
+          # PAT, and the bot PAT is repo-only (gh-lib.sh:212).
+          if ! retry "patch ${REPO}#${num}" \
+              gh api -X PATCH "repos/${REPO}/pulls/${num}" \
+              -f "title=${title}" -f "body=${body}" >/dev/null; then
+            echo "::error::could not rewrite the title/body of ${pr_url}; the squash commit would name the wrong version." >&2
+            exit 1
+          fi
+
+          # Labelled here, not only inside arm_pr, because a PR this run
+          # deliberately leaves UNARMED still has to carry it: ci cuts the
+          # release tag from that label, so a human merging an unlabelled
+          # catch-up publishes an image nothing ever tags. arm_pr posts it
+          # again below; the REST call is idempotent.
+          if ! retry "label ${REPO}#${num}" \
+              gh api -X POST "repos/${REPO}/issues/${num}/labels" \
+              -f "labels[]=${label}" >/dev/null; then
+            echo "::error::could not label ${pr_url}; ci cuts the release tag from that label." >&2
+            exit 1
+          fi
+
+          # Read the state BEFORE arming or refusing to. `gh pr merge --auto`
+          # refuses a PR with nothing left pending, and a green-but-unarmed PR
+          # is precisely what a run that died between the push and the arm
+          # leaves behind, i.e. the state this redesign exists to recover from.
+          # arm_pr's own rescue covers only the MERGED case (gh-lib.sh:220-232).
+          if ! state="$(_pr_state "$REPO" "$pr_url")"; then
+            echo "::error::could not read the state of ${pr_url}." >&2
+            exit 1
+          fi
+
+          # Read BEFORE the MERGED short-circuit below. A bump this run refused
+          # to arm that merged anyway - between the disarm above and this read -
+          # is either a hand-merge or pre-mortem 1 firing, and the run cannot
+          # tell them apart; reporting it as an ordinary green success hides the
+          # one of those two that matters.
+          if [ "$arm" = no ]; then
+            if [ "$state" = ARMED ]; then
+              # The head has ALREADY moved by here, so erroring out would be a
+              # report rather than a refusal: the run reds and the catch-up sits
+              # on origin under a live auto-merge, landing on the fleet the
+              # moment ci goes green. The pre-push twin refuses and can; this
+              # one has to remove the arm.
+              #
+              # Two ways to reach it, and the removal answers both: the pre-push
+              # read-back was stale, or something armed the PR in the window -
+              # a human clicking "Enable auto-merge" on the PR that yesterday's
+              # warning told them to merge by hand is the obvious one. RETRIED,
+              # unlike the pre-push removal, because a read already said ARMED,
+              # so a failure here is real rather than the expected no-op.
+              if ! retry "disarm ${REPO}#${num}" \
+                  gh pr merge "$pr_url" --repo "$REPO" --disable-auto >/dev/null; then
+                echo "::warning::gh pr merge --disable-auto failed on ${pr_url}; the read-back decides." >&2
+              fi
+              if ! state="$(_pr_state "$REPO" "$pr_url")"; then
+                echo "::error::could not confirm auto-merge is off on ${pr_url}." >&2
+                exit 1
+              fi
+              if [ "$state" = ARMED ]; then
+                echo "::error::${pr_url} is still armed for auto-merge after two removals, and this run refuses to arm it (${jump}); it would merge unreviewed. Disable auto-merge on it by hand." >&2
+                exit 1
+              fi
+            fi
+            if [ "$state" = MERGED ]; then
+              echo "::warning::${pr_url} (${jump}) merged although this run refused to arm it. ci builds no image, so nothing green on that PR proved the new claude-code installs; check the release build."
+              exit 0
+            fi
+            echo "::warning::${pr_url} bumps ${current} to ${latest} (${jump}); auto-merge is off and NOT being armed. ci builds no image, so a green run on this PR is not evidence that the new claude-code installs or boots. Review and merge it by hand."
+            exit 0
+          fi
+
+          if [ "$state" = MERGED ]; then
+            echo "${pr_url} is already merged; nothing to arm"
+            exit 0
+          fi
+
+          case "$state" in
+            ARMED)
+              # Only trustworthy when this run did NOT move the head. GitHub
+              # disables auto-merge when the head branch is force-pushed, and
+              # this field is not synchronously consistent with a ref update
+              # seconds old - believing a stale ARMED would leave a green PR
+              # that never merges, which is the shape being fixed here.
+              if [ "$push" = no ]; then
+                echo "${pr_url} is already armed"
+                exit 0
+              fi
+              echo "${pr_url} read back ARMED, but this run force-pushed its head; re-arming"
+              ;;
+          esac
+
+          if arm_pr "$REPO" "$pr_url" "$label"; then
+            exit 0
+          fi
+
+          # Auto-merge refused it. The fallback exists for ONE state: a PR left
+          # open, green and unarmed by a run that died between the push and the
+          # arm. That state necessarily has an unchanged tree, so it is gated on
+          # `push=no` - a PR this run just created or just moved has checks
+          # pending, `--auto` is the correct mechanism for it, and merging it
+          # outright would be merging something no run has ever seen go green.
+          # `push=no` is not sufficient on its own - a standing rejection also
+          # leaves the tree unchanged - but that state exited above, and a
+          # vetoed run never reaches here because it also sets arm=no.
+          if [ "$push" = yes ]; then
+            echo "::error::could not arm auto-merge on ${pr_url}, whose head this run just pushed." >&2
+            exit 1
+          fi
+
+          # Even then, only when the forge says the PR is mergeable now AND the
+          # semver label reads back: arm_pr returns the same status for a failed
+          # label POST as for a failed arm, so it is re-read rather than assumed.
+          if ! mergeable="$(retry "read mergeStateStatus ${REPO}#${num}" \
+              gh pr view "$pr_url" --repo "$REPO" --json mergeStateStatus --jq '.mergeStateStatus')"; then
+            echo "::error::could not read the merge state of ${pr_url} after auto-merge refused it." >&2
+            exit 1
+          fi
+          # CLEAN is the only value that means "mergeable and every required
+          # check passed". UNSTABLE (a check failed but is not required) and
+          # UNKNOWN (the forge is still recomputing) are both refusals here.
+          if [ "$mergeable" != CLEAN ]; then
+            echo "::error::auto-merge is not armed on ${pr_url} and it is not mergeable now (mergeStateStatus=${mergeable})." >&2
+            exit 1
+          fi
+          if ! labels="$(retry "read labels ${REPO}#${num}" \
+              gh api "repos/${REPO}/issues/${num}" --jq '[.labels[].name] | join(",")')"; then
+            echo "::error::could not read the labels of ${pr_url}." >&2
+            exit 1
+          fi
+          case ",${labels}," in
+            *",${label},"*) ;;
+            *)
+              echo "::error::${pr_url} is mergeable but carries no ${label}; ci cuts the release tag from that label, so merging it here would publish an untagged image." >&2
+              exit 1
+              ;;
+          esac
+          if ! retry "merge ${REPO}#${num}" gh pr merge "$pr_url" --repo "$REPO" --squash; then
+            # The one NON-IDEMPOTENT verb under `retry` here: every other call
+            # is a read, a full-replace PATCH or a set-add POST. The squash can
+            # land server-side while the client times out, and attempts 2-5 then
+            # each get "not mergeable" - a red run reporting a stranded pin
+            # about a pin that shipped, on the one workflow whose red is
+            # supposed to mean exactly that. Same re-read gh-lib.sh:171-181
+            # does after a failed `gh pr create`.
+            if ! state="$(_pr_state "$REPO" "$pr_url")"; then
+              echo "::error::could not merge ${pr_url}, and could not read back whether the squash landed anyway." >&2
+              exit 1
+            fi
+            if [ "$state" != MERGED ]; then
+              echo "::error::could not merge ${pr_url}." >&2
+              exit 1
+            fi
+            echo "gh pr merge reported a failure but ${pr_url} is merged; the squash landed server-side"
+            exit 0
+          fi
+          echo "auto-merge refused a clean PR; merged ${pr_url} directly"
