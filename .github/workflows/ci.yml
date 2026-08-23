@@ -56,7 +56,12 @@ jobs:
 
   ci:
     needs: [pin-guard]
-    uses: szymonrychu/tatara-operator/.github/workflows/ci-shared.yml@v1.36.1
+    # CD-MANAGED PIN. tatara-operator's release.yml `fanout-ci-shared` job
+    # rewrites this line on every release that changes ci-shared.yml, and its
+    # scheduled `ci-shared-currency` check reds when it falls behind
+    # (tatara-operator#640). Do not hand-edit it: a hand bump is overwritten by
+    # the next release while the real fault stays open.
+    uses: szymonrychu/tatara-operator/.github/workflows/ci-shared.yml@v3.10.0
     with:
       runner-label: tatara-claude-code-wrapper
       smoke-binary: ./bin/wrapper
