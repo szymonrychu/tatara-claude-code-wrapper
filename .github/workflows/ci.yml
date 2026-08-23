@@ -73,11 +73,12 @@ jobs:
       # fixed once.
       enable-image: false
       # Dockerfile:57 is `FROM harbor.szymonrichert.pl/containers/tatara-cli:
-      # ${TATARA_CLI_VERSION}`. image-verify passes no `--opt target=`, so
-      # buildkit solves the whole graph and always reaches it. Measured on this
-      # repo's first ever run of that job (PR #186 at v3.10.0): 401
-      # Unauthorized on the manifest HEAD, and no project on that Harbor serves
-      # anonymous pull.
+      # ${TATARA_CLI_VERSION}`. image-verify passes no `--opt target=`, so it
+      # builds the final stage and everything that stage transitively needs -
+      # and the final stage has `COPY --from=tatara-cli`, so this one is always
+      # reached. Measured on this repo's first ever run of that job (PR #186 at
+      # v3.10.0): 401 Unauthorized on the manifest HEAD, and no project on that
+      # Harbor serves anonymous pull.
       #
       # The shared job cannot simply be handed the credential. The only Harbor
       # credentials in that workflow are the PUSH ones, and on pull_request the
@@ -85,7 +86,8 @@ jobs:
       # push-capable credential onto a runner whose job graph a PR can edit.
       # tatara-operator's internal/cicontract/doc.go forbids registry
       # credentials on the PR path outright, and merge_gate_test.go fails on
-      # any HARBOR_* env in a non-publishing job.
+      # a step-level HARBOR_* env in any job that builds the Dockerfile and is
+      # not push-only.
       #
       # NOT a local decision. The matching entry is
       # cicontract.ImageVerifyExempt in tatara-operator, and the scheduled
