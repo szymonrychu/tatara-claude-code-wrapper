@@ -415,6 +415,22 @@ class Harness:
         shutil.rmtree(self.work)
         self._git(self.tmp, "clone", "--depth=1", self.origin_url, str(self.work))
 
+    def repin(self, version):
+        """Move main's OWN pin, and re-clone as the runner does each morning.
+
+        `latest` is regex-validated against ^X.Y.Z$ before the sizing block, so
+        a patch field the block cannot size in base 10 can only ever arrive from
+        the Dockerfile.
+        """
+        if version == PINNED:
+            return
+        side = self.tmp / f"repin-{version}"
+        self._git(self.tmp, "clone", self.origin_url, str(side))
+        self._commit(side, dockerfile(version), f"chore: pin claude-code to {version}")
+        self._git(side, "push", "origin", "main")
+        shutil.rmtree(self.work)
+        self._git(self.tmp, "clone", "--depth=1", self.origin_url, str(self.work))
+
     def click_update_branch(self):
         """The "Update branch" button: a merge of main into the bump branch.
 
@@ -747,6 +763,49 @@ def test_a_bump_inside_the_jump_budget_is_armed(h):
     r = h.run(latest="2.1.206")
     assert r.returncode == 0, r.stdout + r.stderr
     assert any(ln.startswith("arm_pr") for ln in h.lib_calls())
+
+
+def test_the_jump_budget_defaults_to_refusing_the_arm():
+    """The block was fail-OPEN: `arm=yes` was the default and every guard only
+    ever lowered it, so anything that abandoned the block early kept the arm. An
+    arithmetic-expansion error under `set -e` + `inherit_errexit` does NOT exit
+    the shell - it abandons the enclosing branch - which made a bad `$(( ))` a
+    silent grant of the one permission this file exists to withhold.
+
+    The default is the structural half of the fix; `10#` below only closes the
+    one input that reached it. Every other decision in this file is fail-closed
+    by construction and this is now too.
+    """
+    body = [
+        ln.strip() for ln in step_body(REFRESH, BUMP_STEP).splitlines()
+        if not ln.strip().startswith("#")
+    ]
+    assigns = [ln for ln in body if re.fullmatch(r"arm=(yes|no)", ln)]
+    assert assigns[0] == "arm=no", assigns
+    assert assigns.count("arm=yes") == 1, assigns
+
+
+@pytest.mark.parametrize(
+    "pin,armed,reason",
+    [
+        ("2.1.239", True, ""),
+        ("2.1.201", False, "40 patch releases at once"),
+        ("2.1.250", False, "a downgrade of 9 patch releases"),
+        # `$(( 241 - 08 ))` is "value too great for base": `$(( ))` reads a
+        # leading zero as octal. It passes the ^[0-9]+$ guard, so without `10#`
+        # this abandoned the block and armed a 233-release jump on a green run.
+        ("2.1.08", False, "233 patch releases at once"),
+        # The `else` arm: a patch field that is not a number at all.
+        ("2.1.x", False, "a version this workflow cannot size"),
+    ],
+)
+def test_the_jump_budget_sizes_every_shape_of_pin(h, pin, armed, reason):
+    h.repin(pin)
+    r = h.run(latest="2.1.241")
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout + r.stderr
+    assert any(ln.startswith("arm_pr") for ln in h.lib_calls()) is armed, out
+    assert reason in out, out
 
 
 def test_a_prerelease_latest_is_refused_outright(h):

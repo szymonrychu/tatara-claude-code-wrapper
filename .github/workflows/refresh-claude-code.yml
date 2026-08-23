@@ -133,29 +133,38 @@ jobs:
           # #184's pre-mortem 1 is explicit that 39 releases at once must not
           # reach every agent pod in the fleet unreviewed. Those land as a
           # labelled, unarmed PR for a human.
+          # The DEFAULT is `no`, and only the in-budget branch raises it. Every
+          # other decision in this file is fail-closed by construction and this
+          # one was not: `arm=yes` as the default made anything that abandons
+          # this block early a silent grant. An arithmetic-expansion error under
+          # `set -e` + `inherit_errexit` does NOT exit the shell - it abandons
+          # the enclosing branch, execution resumes after the `fi`, rc stays 0 -
+          # so a bad `$(( ))` armed an unbounded jump on a green run with the
+          # bash error buried mid-log.
           max_jump=5
-          arm=yes
-          jump=""
+          arm=no
+          jump="a version this workflow cannot size"
           if [ "${current%.*}" != "${latest%.*}" ]; then
-            arm=no
             jump="a minor or major change"
           elif [[ "${current##*.}" =~ ^[0-9]+$ && "${latest##*.}" =~ ^[0-9]+$ ]]; then
+            # `10#` because `$(( ))` reads a leading zero as octal, and `08`
+            # passes the guard above: `$(( 241 - 08 ))` is "value too great for
+            # base", i.e. exactly the abandonment the default now absorbs.
+            #
             # SIGNED, so the sign is tested first: npm re-pointing
             # dist-tags.latest backwards after a bad line yields a negative
             # delta, which is never `-gt max_jump`, and an unbounded rollback
             # would have armed. "The size of a normal day's bump" is a distance
             # AND a direction.
-            delta="$(( ${latest##*.} - ${current##*.} ))"
+            delta="$(( 10#${latest##*.} - 10#${current##*.} ))"
             if [ "$delta" -lt 0 ]; then
-              arm=no
               jump="a downgrade of $(( -delta )) patch releases"
             elif [ "$delta" -gt "$max_jump" ]; then
-              arm=no
               jump="${delta} patch releases at once"
+            else
+              arm=yes
+              jump=""
             fi
-          else
-            arm=no
-            jump="a version this workflow cannot size"
           fi
 
           # Closing a bump PR has to MEAN something. `_list_open_pr` filters
