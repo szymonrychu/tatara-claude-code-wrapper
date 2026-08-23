@@ -1,0 +1,117 @@
+name: claude-code-currency
+
+# Scheduled staleness check on the Dockerfile's `ARG CLAUDE_CODE_VERSION`
+# (#184). Modelled on tatara-helmfile's skills-currency.yaml, one dependency
+# over, and here for the same reason: refresh-claude-code is the only thing
+# that moves this pin, and when it died nothing said so for 47 days. The run
+# WAS red the whole time - it just said "a workflow failed", which is not a
+# statement anyone can act on, and which a reader cannot tell from a flake.
+#
+# Deliberately NOT on pull_request: staleness is a fleet condition, never a
+# property of the PR in front of you. A gate that is legitimately red while a
+# bump is in flight gets weakened to a warning and then deleted.
+#
+# Hosted runner, no cluster, no secrets: the npm registry is public and the
+# check is stdlib python against a checkout.
+
+on:
+  schedule:
+    # 09:17 UTC, three hours after refresh-claude-code's 06:17. Scheduled
+    # BEFORE it, this would red on exactly the lag that run is about to clear.
+    - cron: "17 9 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  currency:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # For the issue channel below. GitHub routes scheduled-run failure mail
+      # to whoever last touched the cron file - here, the bot. Without a
+      # channel this check reproduces #184 with an extra step in it.
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: CLAUDE_CODE_VERSION currency against the npm registry
+        id: check
+        run: |
+          set -o pipefail
+          python .github/scripts/check_claude_code_currency.py 2>&1 \
+            | tee "${RUNNER_TEMP}/currency.log"
+
+      # `failure()`, NOT gated on steps.check.conclusion: a setup-python 500 or
+      # a checkout rate-limit skips `check`, and gating on its conclusion would
+      # file nothing while the run still goes red - a fail-OPEN channel around
+      # a script whose whole contract is fail-closed. The run URL in the body
+      # is what tells infra flake from real staleness.
+      #
+      # Dedup is an exact open-title match, not `gh issue search`: that index
+      # is eventually consistent, so a daily job would race it and file
+      # duplicates. A red run with the issue already open adds nothing, and no
+      # daily comment either - a channel that generates noise gets muted.
+      #
+      # Deliberately NO `tatara` trigger label: an agent Task minted off this
+      # issue would close it by hand-bumping the Dockerfile ARG, which is the
+      # hand-management the bump cron exists to remove.
+      - name: File the staleness issue
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: 'CLAUDE_CODE_VERSION currency check is red'
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+          existing="$(gh issue list --state open --limit 200 --json number,title \
+            --jq "[.[] | select(.title == \"${TITLE}\")] | .[0].number // empty")"
+          if [ -n "$existing" ]; then
+            echo "already tracked in #${existing}; not filing a duplicate"
+            exit 0
+          fi
+          {
+            echo "The scheduled \`claude-code-currency\` run failed."
+            echo
+            echo '```'
+            cat "${RUNNER_TEMP}/currency.log" 2>/dev/null \
+              || echo "(check_claude_code_currency.py did not run; an earlier step failed)"
+            echo '```'
+            echo
+            echo "Do NOT close this by hand-editing \`ARG CLAUDE_CODE_VERSION\` in the"
+            echo "Dockerfile. That pin is CD-managed by \`.github/workflows/refresh-claude-code.yml\`:"
+            echo "a hand bump is overwritten by the next cron run while the real fault stays open."
+            echo "Start at the most recent \`refresh-claude-code\` run and at the open"
+            echo "\`deps/claude-code\` PR."
+            echo
+            echo "Run: ${RUN_URL}"
+          } > "${RUNNER_TEMP}/issue.md"
+          gh issue create --title "$TITLE" --body-file "${RUNNER_TEMP}/issue.md"
+
+      # Close the loop, so an open issue always means "still stale". Without
+      # this the channel decays into a permanently-open issue nobody rereads.
+      #
+      # continue-on-error: bookkeeping must never red the check it bookkeeps
+      # for. A transient `gh` error here would otherwise turn a GREEN currency
+      # run red, with the step above already skipped so nothing explains it.
+      - name: Close the staleness issue once current
+        if: ${{ success() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: 'CLAUDE_CODE_VERSION currency check is red'
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+          existing="$(gh issue list --state open --limit 200 --json number,title \
+            --jq "[.[] | select(.title == \"${TITLE}\")] | .[0].number // empty")"
+          if [ -z "$existing" ]; then
+            exit 0
+          fi
+          gh issue close "$existing" \
+            --comment "Currency check is green again; closed by the scheduled run."

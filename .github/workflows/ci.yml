@@ -63,6 +63,24 @@ jobs:
       - name: guard the chart's skills clone dir
         run: bash .github/ci/check-chart-skills-clone-dir.sh
 
+  # Static gate on this repo's own CD machinery: the currency script and the
+  # structural + run-for-real suite over refresh-claude-code.yml (#184). It
+  # needs python and the checkout, nothing else, so it runs on a HOSTED runner
+  # and deliberately carries no `needs:` - queueing it behind the ARC runner
+  # would make a pure static check wait on cluster capacity it never uses.
+  workflow-machinery:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pytest
+      - name: unit tests (.github)
+        run: python -m pytest .github -q
+
   ci:
     needs: [pin-guard]
     # CD-MANAGED PIN. tatara-operator's release.yml `fanout-ci-shared` job
