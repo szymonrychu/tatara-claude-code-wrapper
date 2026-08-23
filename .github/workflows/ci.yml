@@ -38,6 +38,15 @@ jobs:
       - name: guard TATARA_SKILLS_REF's single build-time source
         run: bash .github/ci/check-skills-pin-single-source.sh
 
+      # tatara-operator#556: a Dockerfile GO_VERSION behind go.mod's `go`
+      # directive fails `go mod download` outright once an image is actually
+      # built. enable-image-verify is false for this repo (Dockerfile:57
+      # pulls a private Harbor image the PR path cannot carry credentials
+      # for), so nothing else on the PR path builds the Dockerfile at all -
+      # this is the local, offline stand-in for that one class of defect.
+      - name: guard Dockerfile/go.mod/.mise.toml go version pins
+        run: bash .github/ci/check-go-version-pins.sh
+
   # Kept OUT of pin-guard so that job stays a pure grep that fails first without
   # installing a toolchain; this one needs helm to render. `ci / chart-validate`
   # is off for this repo and only does `helm lint` + `helm template >/dev/null`
@@ -95,6 +104,12 @@ jobs:
       # without one. Until a pull-only credential or an anonymously pullable
       # base image exists, this repo's Dockerfile is first compiled in
       # release.yml. tatara-operator#640.
+      #
+      # Compensating control: pin-guard's check-go-version-pins.sh covers the
+      # tatara-operator#556 Go-pin class locally (Dockerfile GO_VERSION vs
+      # go.mod/.mise.toml), but the runtime stage - npm/renovate's engine
+      # range, the mise python pin, the -race cgo guard - stays uncovered on
+      # the PR path.
       enable-image-verify: false
     secrets: inherit
 
