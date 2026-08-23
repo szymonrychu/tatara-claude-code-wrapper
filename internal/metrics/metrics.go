@@ -251,5 +251,43 @@ func New(reg prometheus.Registerer) *Metrics {
 		m.ProbesTotal, m.ProbeAnswerSeconds, m.ProbeOutcomesTotal,
 		m.InterruptsTotal, m.TurnStallSuspected,
 		m.SkillsInstalled, m.SkillsCloneFailures, m.AgentsInstalled)
+	preSeed(m)
 	return m
+}
+
+// preSeed materialises the children of every CounterVec whose first increment
+// happens at turn end or at shutdown, so the family exports at 0 from
+// registration exactly as the plain Counters beside it already do.
+//
+// A CounterVec child does not exist until its first Inc(), so a terminal-only
+// vec produces a series with a SINGLE sample - and rate()/increase() need two.
+// That is why every ccw_ family Prometheus holds today is either a plain
+// Counter or a Vec written at boot, and why ccw_turns_total and
+// ccw_commit_push_total were dark while the alerts reading them sat green.
+//
+// Only CLOSED label sets are seeded, enumerated from the literal call sites and
+// not by pattern. ccw_outcome_reprompt_total{tool,result} and
+// ccw_turn_tokens_total{type,model,kind,repo,project} are open sets and are
+// deliberately NOT seeded: inventing their series is a cardinality bug wearing
+// the fix's clothes. The other closed-label vecs (ccw_probes_total,
+// ccw_safety_push_total, ccw_interrupts_total, ...) are written early enough
+// that they already have series, so seeding them would be cardinality for no
+// signal. A value that later escapes one of these lists still works - it just
+// appears on first Inc, as everything does today.
+func preSeed(m *Metrics) {
+	seed := map[*prometheus.CounterVec][]string{
+		// session.go:1093,1132,1632,1713 + interrupt.go:177
+		m.TurnsTotal: {"complete", "failed", "interrupted"},
+		// cmd/wrapper/app.go:302,310
+		m.CommitPushTotal: {"ok", "fail"},
+		// webhook.go:94,136,147,151
+		m.WebhookDelivery: {"ok", "dropped"},
+		// transcript.ProbeOutcome* consts, via session.go:1322
+		m.ProbeOutcomesTotal: {"answered", "delivered_unanswered", "never_delivered"},
+	}
+	for vec, values := range seed {
+		for _, v := range values {
+			vec.WithLabelValues(v)
+		}
+	}
 }

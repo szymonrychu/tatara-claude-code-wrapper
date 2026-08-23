@@ -148,36 +148,95 @@ func TestPushFiltersRuntimeFamilies(t *testing.T) {
 	require.Contains(t, names, "go_goroutines", "runtime collectors stay on the registry for /metrics")
 }
 
-func TestShutdownDeletesSeries(t *testing.T) {
+// TestShutdownPushesFinalValueAndNeverDeletes is the whole of B1 on the client
+// side. Every counter written at turn end or at shutdown (TurnsTotal,
+// CommitPushTotal, WebhookDelivery, ProbeOutcomesTotal) is incremented AFTER
+// the last loop tick, so unless Shutdown itself pushes, the run's terminal
+// values never leave the pod - the loop ticks every 15s and a teardown finishes
+// well inside one tick.
+//
+// The DELETE is gone with it: it removed the run's whole series set from the
+// receiver the instant the pod exited, so the final value was observable only
+// if a scrape happened to land in the sub-second gap. The receiver TTL is the
+// eviction path now.
+func TestShutdownPushesFinalValueAndNeverDeletes(t *testing.T) {
 	var (
 		mu      sync.Mutex
 		deleted bool
-		delQ    string
+		bodies  []string
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.ReadAll(r.Body)
-		if r.Method == http.MethodDelete {
-			mu.Lock()
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		switch r.Method {
+		case http.MethodDelete:
 			deleted = true
-			delQ = r.URL.RawQuery
-			mu.Unlock()
+		case http.MethodPost:
+			bodies = append(bodies, string(b))
 		}
+		mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
 
+	reg := prometheus.NewRegistry()
+	terminal := prometheus.NewCounter(prometheus.CounterOpts{Name: "ccw_commit_push_total", Help: "h"})
+	reg.MustRegister(terminal)
+
 	p := pushclient.New(pushclient.Config{
 		URL:      srv.URL + "/internal/metrics/push",
 		RunID:    "run-9",
-		Interval: time.Hour,
-	}, testRegistry(t), discardLog())
+		Interval: time.Hour, // only the immediate push and the final push fire
+	}, reg, discardLog())
 	p.Start()
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(bodies) >= 1
+	}, time.Second, 5*time.Millisecond)
+
+	// The terminal write: what a turn finaliser or probes.Finalize() does after
+	// the last tick has already gone out.
+	terminal.Add(7)
 	p.Shutdown(context.Background())
 
 	mu.Lock()
 	defer mu.Unlock()
-	require.True(t, deleted, "expected a DELETE on shutdown")
-	require.Contains(t, delQ, "run_id=run-9")
+	require.False(t, deleted, "shutdown must not DELETE the run's series")
+	require.GreaterOrEqual(t, len(bodies), 2, "shutdown must issue a final push")
+	require.Contains(t, bodies[len(bodies)-1], "ccw_commit_push_total 7",
+		"the final push must carry the terminal value, got: %s", bodies[len(bodies)-1])
+}
+
+// TestShutdownPushesWithExhaustedContext pins the deadline half of B1. The
+// final push runs LAST in app.shutdown, after sess.Shutdown, on main.go's
+// single 10s budget - so by the time it is reached the parent context may be
+// long dead. A final push that inherits it reproduces exactly the silence B1
+// exists to remove, so it must carry its own deadline.
+func TestShutdownPushesWithExhaustedContext(t *testing.T) {
+	cap := &capture{}
+	srv := httptest.NewServer(cap.handler())
+	defer srv.Close()
+
+	p := pushclient.New(pushclient.Config{
+		URL:      srv.URL + "/internal/metrics/push",
+		RunID:    "run-dead-ctx",
+		Interval: time.Hour,
+	}, testRegistry(t), discardLog())
+	p.Start()
+	require.Eventually(t, func() bool {
+		cap.mu.Lock()
+		defer cap.mu.Unlock()
+		return cap.hits >= 1
+	}, time.Second, 5*time.Millisecond)
+
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+	p.Shutdown(dead)
+
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	require.GreaterOrEqual(t, cap.hits, 2, "final push must not inherit an exhausted shutdown context")
 }
 
 // TestMetricPushTotal_OkIncremented verifies that a successful push increments
@@ -263,7 +322,8 @@ func TestMetricPushTotal_TransportFailIncremented(t *testing.T) {
 // TestPushHonorsPerPushDeadline verifies that a push goroutine never stalls
 // beyond Interval: the loop context derived from pushWithTimeout is bounded by
 // Interval so a stalled push returns promptly when the deadline fires (audit
-// finding 2). A short Shutdown context ensures the delete call also returns fast.
+// finding 2). Shutdown's own final push is capped at Interval for the same
+// reason, so a hung receiver cannot stretch teardown either.
 func TestPushHonorsPerPushDeadline(t *testing.T) {
 	// Server that hangs until the client disconnects.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -5,8 +5,15 @@
 //
 // Each run is keyed by a unique run_id (plus pod and job labels) so concurrent
 // and successive runs never clobber each other's series. On graceful shutdown
-// the client best-effort DELETEs its series; the operator-side TTL is the
-// backstop for a hard-killed pod.
+// the client issues one FINAL push and then stops: the operator-side TTL is the
+// only eviction path, for a clean exit and a hard-killed pod alike.
+//
+// It used to DELETE its series on shutdown instead. That made the receiver drop
+// the run immediately, so a value written during teardown - which is every
+// terminal counter the wrapper has - survived only if a scrape landed in the
+// sub-second gap between the last push and the DELETE. Letting the TTL age the
+// run out gives Prometheus the whole TTL window to see the final value, at the
+// cost of one finished run's series lingering for that long.
 package pushclient
 
 import (
@@ -114,15 +121,32 @@ func (p *Pusher) pushWithTimeout() {
 	p.pushOnce(ctx)
 }
 
-// Shutdown stops the loop and best-effort deletes this run's series so they are
-// gone immediately rather than waiting for the operator TTL.
+// finalPushTimeout caps the shutdown push. The final push carries its OWN
+// deadline rather than the caller's: main.go gives the WHOLE of app.shutdown
+// 10s and the session teardown ahead of it can spend all of it, so a push that
+// inherited ctx would be dead on arrival exactly when there is most to report.
+// The bound is the same per-push budget a tick gets (Interval), capped here so
+// a stalled receiver delays process exit by seconds, not by a push interval.
+const finalPushTimeout = 3 * time.Second
+
+// Shutdown stops the loop and issues one final push so the counters written
+// during teardown - probes.Finalize()'s outcomes, the turn finalisers'
+// commit/push and turn results, the webhook sender's delivery results - leave
+// the pod. The loop ticks every Interval (15s by default) and a teardown
+// completes well inside one tick, so without this push those values are
+// unobservable by construction rather than merely unlucky.
+//
+// It does NOT delete the run's series; the receiver TTL is the eviction path.
 func (p *Pusher) Shutdown(ctx context.Context) {
 	if !p.Enabled() {
 		return
 	}
 	p.cancel()
 	p.wg.Wait()
-	p.delete(ctx)
+	d := min(p.cfg.Interval, finalPushTimeout)
+	final, cancel := context.WithTimeout(context.WithoutCancel(ctx), d)
+	defer cancel()
+	p.pushOnce(final)
 }
 
 func (p *Pusher) pushOnce(ctx context.Context) {
@@ -162,19 +186,6 @@ func (p *Pusher) pushOnce(ctx context.Context) {
 	if p.m != nil {
 		p.m.MetricPushTotal.WithLabelValues("ok").Inc()
 	}
-}
-
-func (p *Pusher) delete(ctx context.Context) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, p.endpoint(), nil)
-	if err != nil {
-		return
-	}
-	resp, err := p.client.Do(req)
-	if err != nil {
-		p.log.Warn("pushclient: delete failed", "err", err, "run_id", p.cfg.RunID)
-		return
-	}
-	_ = resp.Body.Close()
 }
 
 // endpoint returns the push URL with the identity query parameters appended.

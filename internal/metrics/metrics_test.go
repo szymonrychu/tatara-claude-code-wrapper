@@ -36,6 +36,62 @@ func TestNew_RegistersAllCollectors(t *testing.T) {
 	}
 }
 
+// TestNew_PreSeedsTerminalCounterVecs asserts that the four CounterVecs whose
+// FIRST increment happens at turn end or at shutdown export their full child
+// set at 0 from registration, with nothing observed.
+//
+// A CounterVec child does not exist until its first Inc(), so a vec first
+// written terminally produces a series with a single sample - and rate() needs
+// two. Every ccw_ family Prometheus actually holds is one that is either a
+// plain Counter (exports at 0 at registration) or a Vec written at boot; not
+// one terminal-only Vec has a series. Pre-seeding gives them the same
+// registration-time existence the plain Counters beside them already have.
+//
+// Only CLOSED label sets are seeded. ccw_outcome_reprompt_total{tool,result}
+// and ccw_turn_tokens_total{type,model,kind,repo,project} are deliberately
+// absent from this table: seeding an open label set invents series.
+func TestNew_PreSeedsTerminalCounterVecs(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	require.NotNil(t, metrics.New(reg))
+
+	cases := []struct {
+		family string
+		label  string
+		values []string
+	}{
+		{"ccw_turns_total", "result", []string{"complete", "failed", "interrupted"}},
+		{"ccw_commit_push_total", "result", []string{"fail", "ok"}},
+		{"ccw_webhook_delivery_total", "result", []string{"dropped", "ok"}},
+		{"ccw_probe_outcomes_total", "outcome", []string{"answered", "delivered_unanswered", "never_delivered"}},
+	}
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	byName := map[string]*dto.MetricFamily{}
+	for _, mf := range mfs {
+		byName[mf.GetName()] = mf
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.family, func(t *testing.T) {
+			mf := byName[tc.family]
+			require.NotNil(t, mf, "family %s has no series at registration", tc.family)
+			got := map[string]float64{}
+			for _, metric := range mf.GetMetric() {
+				lbls := metric.GetLabel()
+				require.Len(t, lbls, 1)
+				require.Equal(t, tc.label, lbls[0].GetName())
+				got[lbls[0].GetValue()] = metric.GetCounter().GetValue()
+			}
+			want := map[string]float64{}
+			for _, v := range tc.values {
+				want[v] = 0
+			}
+			require.Equal(t, want, got)
+		})
+	}
+}
+
 // TestMetrics_InternalIssueTotal_Registered asserts the new wrapper metric is
 // registered and carries the expected {category,severity} label pair.
 func TestMetrics_InternalIssueTotal_Registered(t *testing.T) {

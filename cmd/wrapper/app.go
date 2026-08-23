@@ -391,10 +391,16 @@ func (a *app) run() error {
 	return <-errCh
 }
 
+// shutdown tears the pod down in dependency order and pushes metrics LAST.
+//
+// The push client used to be shut down first, which made every counter this
+// sequence writes unobservable by construction: sess.Shutdown closes out an
+// unanswered probe (ProbeOutcomesTotal), the turnWG drain runs the turn
+// finalisers (CommitPushTotal, TurnsTotal) and sender.Shutdown settles the
+// deliveries (WebhookDelivery). All of it landed on a registry nobody was
+// pushing any more, and on a run the receiver had already been told to drop.
+// pusher.Shutdown issues a final push, so it has to run after every writer.
 func (a *app) shutdown(ctx context.Context) error {
-	// Stop pushing and remove this run's series before the rest tears down, so
-	// the operator drops them immediately rather than waiting for the TTL.
-	a.pusher.Shutdown(ctx)
 	// Stop the mid-turn safety net before the turn finalisers drain, so its
 	// pushes never race the finaliser's own commit+push on the same branch.
 	if a.safety != nil {
@@ -423,7 +429,12 @@ func (a *app) shutdown(ctx context.Context) error {
 	a.sender.Shutdown(drainCtx)
 	cancel()
 	_ = a.internal.Shutdown(ctx)
-	return a.pub.Shutdown(ctx)
+	err := a.pub.Shutdown(ctx)
+	// Last: every writer above has run, so this final push is the only one that
+	// carries the run's terminal counter values off the pod. It carries its own
+	// deadline, because ctx may already be spent by the time we get here.
+	a.pusher.Shutdown(ctx)
+	return err
 }
 
 // fireLifecycleHook runs a conversation/turn lifecycle hook best-effort in the
